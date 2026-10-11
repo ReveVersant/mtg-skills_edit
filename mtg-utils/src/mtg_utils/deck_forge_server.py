@@ -21,22 +21,41 @@ from pathlib import Path
 import click
 from fastapi import FastAPI
 
-from mtg_utils._deck_forge.app import VERSION, build_app, busy_reporter
+from mtg_utils._deck_forge.app import (
+    ANY_HOST,
+    LOOPBACK_HOSTS,
+    VERSION,
+    build_app,
+    busy_reporter,
+)
 from mtg_utils._deck_forge.production import default_state, warm_at_launch
 
 __all__ = ["VERSION", "create_app", "main"]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
 
 
-def create_app(frontend_dist: Path | None = None) -> FastAPI:
+def allowed_hosts_for(bind: str) -> frozenset[str]:
+    """The Host names the hub answers to when bound to ``bind``: loopback plus
+    the bind address itself, or any Host for a wildcard bind (whose LAN names
+    can't be known here)."""
+    if bind in _WILDCARD_BINDS:
+        return frozenset({ANY_HOST})
+    return LOOPBACK_HOSTS | {bind.lower()}
+
+
+def create_app(
+    frontend_dist: Path | None = None,
+    allowed_hosts: frozenset[str] | None = None,
+) -> FastAPI:
     """Build the production app (real bulk data when available), and start the
     launch warm (the signals index, then the commander-discovery caches) in the
     background so a first launch's one-time passes run with a progress meter in
     the page rather than inside the first request."""
     state = default_state()
-    app = build_app(state, frontend_dist=frontend_dist)
+    app = build_app(state, frontend_dist=frontend_dist, allowed_hosts=allowed_hosts)
     warm_at_launch(state, busy_reporter(state))
     return app
 
@@ -68,7 +87,14 @@ def main(
     import uvicorn  # deferred import so `--help` stays fast and import-light
 
     dist = frontend_dist or (Path.cwd() / "frontend" / "dist")
-    app = create_app(frontend_dist=dist)
+    if host.lower() not in LOOPBACK_HOSTS:
+        click.echo(
+            f"Warning: deck-forge has no login; binding to {host} lets anyone "
+            "who can reach this machine on that address edit your builds and "
+            "send requests to your Claude session.",
+            err=True,
+        )
+    app = create_app(frontend_dist=dist, allowed_hosts=allowed_hosts_for(host))
     if open_browser:
         webbrowser.open(f"http://{host}:{port}/")
     uvicorn.run(app, host=host, port=port, log_level="info")

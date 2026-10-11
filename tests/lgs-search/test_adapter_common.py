@@ -125,6 +125,16 @@ class TestProfileDir:
         assert d == tmp_path / "lgs-profiles" / "tgp"
         assert d.exists()
 
+    def test_owner_only(self, tmp_path, monkeypatch):
+        # The profile holds live session cookies: no other account may read it,
+        # and a profile made world-readable earlier tightens on next use.
+        monkeypatch.setenv("MTG_SKILLS_CACHE_DIR", str(tmp_path))
+        stale = tmp_path / "lgs-profiles" / "tgp"
+        stale.mkdir(parents=True, mode=0o755)
+        d = profile_dir_for("tgp")
+        assert d.stat().st_mode & 0o777 == 0o700
+        assert d.parent.stat().st_mode & 0o777 == 0o700
+
 
 class TestErrors:
     def test_selector_error(self):

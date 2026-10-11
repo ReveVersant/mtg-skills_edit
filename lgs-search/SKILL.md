@@ -54,6 +54,11 @@ lgs-search login --store tcgplayer
 lgs-search login --store manapool
 ```
 
+A saved profile holds that store's live session cookies, which work like
+the password until the session expires. The profile dirs are owner-only
+(0700). To forget the sessions after shopping, run `lgs-search logout`
+(every store) or `lgs-search logout --store <store>`.
+
 If you skip the explicit logins, the orchestrator will pop a headed
 window the first time it detects "not logged in" — slightly more
 disruptive but functionally equivalent.

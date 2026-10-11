@@ -739,7 +739,7 @@ def _build_lgs_carts_and_handoff(
 
 import click  # noqa: E402
 
-from mtg_utils._stores._common import profile_dir_for  # noqa: E402
+from mtg_utils._stores._common import profile_dir_for, profiles_root  # noqa: E402
 
 
 @click.group(invoke_without_command=True)
@@ -798,6 +798,30 @@ def login(store: str) -> None:
     profile = profile_dir_for(store)
     click.echo(f"Opening {adapter.display_name} login. Close the window when done.")
     adapter.open_login(profile)
+
+
+@main.command()
+@click.option(
+    "--store",
+    default=None,
+    type=click.Choice([*LGS_STORES, *MARKETPLACE_STORES]),
+    help="Forget one Storefront's session (default: every store).",
+)
+def logout(store: str | None) -> None:
+    """Delete saved store sessions (the persistent browser profiles).
+
+    The store still thinks the session is live until it expires; this only
+    removes the local copy, so nothing on this machine can reuse it."""
+    import shutil
+
+    stores = [store] if store else [*LGS_STORES, *MARKETPLACE_STORES]
+    for name in stores:
+        profile = profiles_root() / name
+        if profile.exists():
+            shutil.rmtree(profile)
+            click.echo(f"[{name}] saved session deleted.")
+        else:
+            click.echo(f"[{name}] no saved session.")
 
 
 # ---------------------------------------------------------------------------

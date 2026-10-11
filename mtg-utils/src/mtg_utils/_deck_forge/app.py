@@ -13,8 +13,9 @@ from __future__ import annotations
 import functools
 import json
 import threading
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 from fastapi import BackgroundTasks, FastAPI, Request, Response
@@ -22,6 +23,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mtg_utils._arena_meta import meta as arena_meta
 from mtg_utils._arena_meta import untapped
@@ -37,6 +40,12 @@ from mtg_utils.parse_deck import parse_deck_text
 from mtg_utils.theme_presets import list_presets
 
 VERSION = "0.1.0"
+
+# The Host names the hub answers to on its default loopback bind; see
+# ``_guard_rejection``. ``ANY_HOST`` is for a wildcard bind (``--host 0.0.0.0``).
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+ANY_HOST = "*"
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 _PLACEHOLDER_INDEX = """<!doctype html>
 <html lang="en">
@@ -272,9 +281,68 @@ def _no_bulk() -> JSONResponse:
     )
 
 
-def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAPI:
-    """Build the FastAPI app from an injected ``ForgeState``."""
+def _guard_rejection(
+    method: str, host_header: str, origin: str | None, hosts: frozenset[str]
+) -> str | None:
+    """Why the local-only guard turns a request away, or None to let it in.
+
+    The Host check stops DNS rebinding: a page whose own domain now resolves
+    to 127.0.0.1 is same-origin with the hub as far as the browser knows, so
+    without it the page could read every response and post to the agent
+    bridge. The Origin check stops a plain cross-site POST. A request with no
+    Origin (the session agent's ``requests`` calls, curl) is not a browser's
+    cross-site request and passes."""
+    host = urlsplit(f"//{host_header}").hostname
+    any_host = ANY_HOST in hosts
+    if not any_host and host not in hosts:
+        return f"deck-forge does not answer to Host {host_header!r}"
+    if origin is None or method in _SAFE_METHODS:
+        return None
+    trusted = {host} if any_host else hosts
+    if urlsplit(origin).hostname not in trusted:
+        return f"cross-site request from {origin!r} rejected"
+    return None
+
+
+class _LocalOnly:
+    """Pure-ASGI wrapper for ``_guard_rejection`` (no BaseHTTPMiddleware, so
+    the SSE stream and background tasks pass through untouched)."""
+
+    def __init__(self, app: ASGIApp, hosts: frozenset[str]) -> None:
+        self.app = app
+        self.hosts = hosts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = Headers(scope=scope)
+            reason = _guard_rejection(
+                scope["method"],
+                headers.get("host", ""),
+                headers.get("origin"),
+                self.hosts,
+            )
+            if reason is not None:
+                await JSONResponse({"error": reason}, status_code=403)(
+                    scope, receive, send
+                )
+                return
+        await self.app(scope, receive, send)
+
+
+def build_app(
+    state: ForgeState,
+    *,
+    frontend_dist: Path | None = None,
+    allowed_hosts: Collection[str] | None = None,
+) -> FastAPI:
+    """Build the FastAPI app from an injected ``ForgeState``.
+
+    ``allowed_hosts`` is the set of Host names the hub answers to (default
+    ``LOOPBACK_HOSTS``, read at call time); ``{ANY_HOST}`` answers to any
+    Host but still requires a browser's Origin to match it."""
     app = FastAPI(title="deck-forge", version=VERSION)
+    hosts = frozenset(LOOPBACK_HOSTS if allowed_hosts is None else allowed_hosts)
+    app.add_middleware(_LocalOnly, hosts=hosts)
 
     @app.exception_handler(DeckRuleError)
     async def _deck_rule_error(_request: Request, exc: DeckRuleError) -> JSONResponse:

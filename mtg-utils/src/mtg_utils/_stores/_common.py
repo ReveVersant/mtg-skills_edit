@@ -230,9 +230,20 @@ class MarketplaceAdapter(StoreSession, Protocol):
     ) -> OptimizedCart: ...
 
 
+def profiles_root() -> Path:
+    return cache_root() / "lgs-profiles"
+
+
 def profile_dir_for(store: str) -> Path:
-    p = cache_root() / "lgs-profiles" / store
+    """The store's persistent Playwright profile. It holds the logged-in
+    session cookies, which are as good as the password until they expire,
+    so the root and the store dir are owner-only (0700). The chmod runs on
+    every call so a profile made before this rule tightens on next use."""
+    root = profiles_root()
+    p = root / store
     p.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    p.chmod(0o700)
     return p
 
 

@@ -40,6 +40,25 @@ def test_login_subcommand_help():
     assert "--store" in result.output
 
 
+def test_logout_deletes_one_store_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTG_SKILLS_CACHE_DIR", str(tmp_path))
+    for store in ("tgp", "manapool"):
+        (tmp_path / "lgs-profiles" / store / "Default").mkdir(parents=True)
+    result = CliRunner().invoke(main, ["logout", "--store", "tgp"])
+    assert result.exit_code == 0
+    assert not (tmp_path / "lgs-profiles" / "tgp").exists()
+    assert (tmp_path / "lgs-profiles" / "manapool").exists()
+
+
+def test_logout_without_store_deletes_every_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTG_SKILLS_CACHE_DIR", str(tmp_path))
+    for store in ("tgp", "atomic_empire", "tcgplayer", "manapool"):
+        (tmp_path / "lgs-profiles" / store).mkdir(parents=True)
+    result = CliRunner().invoke(main, ["logout"])
+    assert result.exit_code == 0
+    assert not any((tmp_path / "lgs-profiles").iterdir())
+
+
 def test_no_input_errors_with_exit_2():
     runner = CliRunner()
     result = runner.invoke(main, [])

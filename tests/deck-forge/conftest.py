@@ -19,6 +19,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _answer_to_testclient_host(monkeypatch):
+    """``TestClient`` sends ``Host: testserver``; let the local-only guard
+    answer to it alongside the loopback names, so every app the suite builds
+    keeps the guard on (``test_local_only.py`` exercises it)."""
+    from mtg_utils._deck_forge import app
+
+    monkeypatch.setattr(app, "LOOPBACK_HOSTS", app.LOOPBACK_HOSTS | {"testserver"})
+
+
+@pytest.fixture(autouse=True)
 def _block_card_data_download(monkeypatch):
     from mtg_utils import _phase
 
