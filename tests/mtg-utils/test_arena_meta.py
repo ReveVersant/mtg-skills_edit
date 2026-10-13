@@ -598,3 +598,29 @@ def test_report_serves_the_mythic_floor_and_marks_thin_mythic_samples(snap):
     assert "mythic 60.0% (100)" in render_text(report)
     alpha["mythic"] = {**alpha["mythic"], "matches": 40}
     assert "(40, thin)" in render_text(report)
+
+
+def test_secure_profile_makes_the_signin_owner_only(tmp_path):
+    from mtg_utils._arena_meta.untapped import secure_profile
+
+    parent = tmp_path / "untapped"
+    profile = parent / "profile"
+    (profile / "Default").mkdir(parents=True)
+    cookies = profile / "Default" / "Cookies"
+    cookies.write_text("session")
+    for path in (parent, profile, profile / "Default"):
+        path.chmod(0o755)
+    cookies.chmod(0o644)
+
+    secure_profile(profile)
+
+    assert (parent.stat().st_mode & 0o777) == 0o700
+    assert (profile.stat().st_mode & 0o777) == 0o700
+    assert ((profile / "Default").stat().st_mode & 0o777) == 0o700
+    assert (cookies.stat().st_mode & 0o777) == 0o600
+
+
+def test_secure_profile_tolerates_a_missing_profile(tmp_path):
+    from mtg_utils._arena_meta.untapped import secure_profile
+
+    secure_profile(tmp_path / "nope" / "profile")  # no raise

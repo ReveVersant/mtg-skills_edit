@@ -79,6 +79,26 @@ def profile_dir() -> Path:
     return cache_root() / "untapped" / "profile"
 
 
+def secure_profile(profile: Path | None = None) -> None:
+    """Make the saved Untapped sign-in readable by this user only.
+
+    The profile holds session cookies, so anyone who can read it can act as the
+    signed-in account. Directories become 0700 and files lose group/other bits
+    (the parent ``untapped/`` directory too, so the profile can't be reached
+    through it). Run on creation, after sign-in, and on every use, so a profile
+    made by an older version or with a loose umask is tightened. Best-effort: a
+    filesystem without POSIX modes (Windows) is left to its own ACLs."""
+    profile = profile or profile_dir()
+    try:
+        profile.parent.chmod(0o700)
+        for path in (profile, *profile.rglob("*")):
+            if path.is_symlink():
+                continue
+            path.chmod(0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
+
+
 def _playwright() -> PlaywrightContextManager:
     try:
         from playwright.sync_api import sync_playwright
@@ -91,7 +111,8 @@ def login() -> None:
     """Open a visible browser on Untapped with the persistent profile; the user
     signs in and closes the window. Blocks until it is closed."""
     profile = profile_dir()
-    profile.mkdir(parents=True, exist_ok=True)
+    profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+    secure_profile(profile)
     with _playwright() as p:
         try:
             ctx = p.chromium.launch_persistent_context(str(profile), headless=False)
@@ -104,6 +125,7 @@ def login() -> None:
         while ctx.pages:
             ctx.pages[0].wait_for_event("close", timeout=0)
         ctx.close()  # a clean close writes the session cookies to the profile
+    secure_profile(profile)  # the cookies just written: owner-only
 
 
 def is_ranked_event(event: str) -> bool:
@@ -159,6 +181,7 @@ class _Session:
         profile = profile_dir()
         if not profile.exists():
             raise SignInRequiredError
+        secure_profile(profile)
         self._pw = _playwright().start()
         try:
             self._ctx = self._pw.chromium.launch_persistent_context(

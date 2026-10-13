@@ -274,3 +274,31 @@ Ranked by leverage. #1 satisfies most of your requirements by itself.
 Net: with the storefront subsystem removed and the cache dir locked down, this fork has **no path to
 your accounts, payment details, or identity**, and performs **no automated purchasing** — matching
 your "extremely safe" bar.
+
+---
+
+## Addendum — review of the upstream merge (2026-10-13)
+
+**Scope:** the 131 upstream commits merged from `dan-blanchard/mtg-skills` (`b08cafd..33af327`,
+~193 changed files under `mtg-utils/src`). Method: diff-wide search for new network hosts and
+risky calls (`subprocess`, `pickle`, `eval`/`exec`, `shell=True`, `verify=False`, archive
+extraction, persistent browser profiles), then a read of each hit. This was a targeted review of
+what the merge introduced, not a second full read of the whole codebase.
+
+**Overall:** no new automated-purchasing or store-account surface; the storefront code stays
+removed. One new credential-at-rest surface (below) was found and locked down.
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| N1 | `arena-meta --login` saves an Untapped.gg sign-in (session cookies) in a Playwright profile at `<cache>/untapped/profile`. Anyone who can read it can act as that Untapped account. | Medium (read-only stats site, no payment) | **Fixed** — `untapped.secure_profile()` makes the profile and its parent directory owner-only (0700 dirs / 0600 files) on creation, after sign-in, and on every use, so an older or loosely-created profile is tightened too. Tested. |
+| N2 | New outbound hosts: `api.mtga.untapped.gg`, `mtgajson.untapped.gg`, `mtga.untapped.gg` (arena-meta, limited-stats). Payload is query parameters only (event / set); no deck or personal data is sent. | Info | Accepted |
+| N3 | deck-forge gained upstream's `_LocalOnly` guard: Host allow-list (stops DNS rebinding, which the fork's earlier Origin-only check did not) plus Origin check on state-changing requests; wildcard binds answer any Host but still check Origin. | Improvement | The fork's duplicate same-origin middleware was **removed**; the `--allow-remote` bind refusal is kept. |
+| N4 | New `pickle.load` sites (`_mtgjson/rulings_index`, `_analysis/signals_index`, `phase_bump`) read local, git-ignored sidecars the tool wrote itself. | Low | Same posture as existing M3: fine on a single-user machine; never loaded from the network. |
+| N5 | phase-rs card-data and `known-tokens` downloads are verified against the release manifest's sha256 before use (`_phase.py`). | Info | Good. The `cargo build` path (`playtest-install-phase`) is unchanged — existing L1. |
+| N6 | New 2HG tooling (`thread_extract`, `guide_card_hovers`, `twohg_scan`) parses local saved HTML and writes only to a user-given output path; no archive extraction, no `eval`. `guide-card-hovers` downloads Scryfall card images and the 2HG template page loads Google Fonts when opened. | Low | Accepted; publishing a page is an explicit user step. |
+
+**Not found:** `shell=True`, `verify=False`, `os.system`, `eval`/`exec` on external data, archive
+extraction, or any new code that logs into or mutates a retail account.
+
+**Still open (unchanged, by choice):** M3 pickle caches, L1 phase `cargo build` hash check,
+the future Australian LGS search (spec only, `docs/FUTURE-LGS-SEARCH.md`).
