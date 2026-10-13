@@ -1,11 +1,11 @@
-"""M5 tests: build store (autosave/library), session load, exports."""
+"""M5 tests: build store (autosave/library), session load."""
 
 from fastapi.testclient import TestClient
 
 from mtg_utils._deck_forge.app import build_app
-from mtg_utils._deck_forge.exporters import export_arena, export_as
 from mtg_utils._deck_forge.persistence import BuildStore
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.testkit import test_card
 
 DECK = {
     "format": "commander",
@@ -15,6 +15,7 @@ DECK = {
     "cards": [{"name": "Forest", "quantity": 8}, {"name": "Sol Ring", "quantity": 1}],
     "sideboard": [],
     "companion": [],
+    "pool": [],
 }
 
 
@@ -43,18 +44,6 @@ def test_session_round_trips_through_deck_dict():
     assert session.to_deck_dict() == DECK
 
 
-def test_export_arena_has_section_headers():
-    text = export_arena(DECK)
-    assert "Commander" in text
-    assert "1 Atraxa" in text
-    assert "Deck" in text
-    assert "8 Forest" in text
-
-
-def test_export_as_unknown_format_returns_none():
-    assert export_as(DECK, "bogus") is None
-
-
 def _client(tmp_path):
     state = ForgeState(
         by_name={},
@@ -68,7 +57,7 @@ def _client(tmp_path):
 
 def test_autosave_persists_on_add(tmp_path):
     state = ForgeState(
-        by_name={"Forest": {"name": "Forest", "type_line": "Basic Land — Forest"}},
+        by_name={"Forest": test_card("Forest")},
         search_fn=lambda **_: [],
         session=DeckSession("commander"),
         store=BuildStore(tmp_path),

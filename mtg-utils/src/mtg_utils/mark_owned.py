@@ -16,14 +16,23 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import click
 
 from mtg_utils._name_index import alias_keys
 from mtg_utils._sidecar import atomic_write_json
-from mtg_utils.deck import collect_card_entries
-from mtg_utils.names import build_name_alias_map
+from mtg_utils.card_pool import CardPool
+from mtg_utils.deck import collect_card_entries, deck_entries
+from mtg_utils.formats import FORMATS, Coverage, Format, get_format, resolve_deck_medium
+from mtg_utils.names import build_name_alias_map, normalize_card_name
+from mtg_utils.ownership import (
+    covered_count,
+    printing_index,
+    printing_rows,
+    special_requests,
+)
 
 
 def _collect_entries(
@@ -169,13 +178,30 @@ def owned_quantity(
     alias_lookup: dict[str, str],
 ) -> int | None:
     """Owned copies of ``deck_name`` against a precomputed :func:`owned_lookup`, or
-    ``None`` when un-owned. Mirrors ``_mark_owned_with_count``'s per-card resolution
+    ``None`` when un-owned. Mirrors ``_intersect``'s per-card resolution
     (DFC / Arena aliasing; quantity-0 wishlist rows count as un-owned)."""
     primary = _match_collection_key(deck_name, alias_lookup)
     if primary is None:
         return None
     qty = entries[primary][1]
     return qty if qty >= 1 else None
+
+
+def load_collection(path: Path) -> dict:
+    """A collection file as a parsed deck: parsed-deck JSON, or a CSV export
+    (Untapped.gg, Moxfield) when the file isn't JSON."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        from mtg_utils.parse_deck import parse_csv
+
+        parsed = parse_csv(text)
+        return {
+            "commanders": parsed.get("commanders", []),
+            "cards": parsed.get("cards", []),
+            "sideboard": parsed.get("sideboard", []),
+        }
 
 
 def mark_owned(
@@ -205,8 +231,39 @@ def mark_owned(
       alone; see ``_build_alias_lookup`` for the semantics.
     - Output is sorted by lowercased deck name for deterministic diffs.
     """
-    result, _ = _mark_owned_with_count(deck, collection, name_aliases=name_aliases)
-    return result
+    return _intersect(deck, collection, name_aliases=name_aliases)
+
+
+def coverage_summary(
+    marked: dict,
+    printing_at: Callable[[str, str, str], Mapping | None] | None = None,
+) -> tuple[int, int]:
+    """The "N of M owned" readout for a deck :func:`mark_owned` filled in: of its
+    distinct cards that aren't free (basic lands), how many its ``owned_cards`` cover
+    by ``Format.coverage`` in the deck's own medium — 17 Hare Apparent with one owned
+    is not covered; on Arena, four are. ``printing_at`` (``CardPool.printing_at``)
+    lets a pinned special basic printing be judged."""
+    fmt = get_format(marked["format"]) if marked.get("format") in FORMATS else None
+    medium = resolve_deck_medium(fmt, marked)
+    owned_cards = marked.get("owned_cards") or []
+    owned = {normalize_card_name(r["name"]): r["quantity"] for r in owned_cards}
+    specials = special_requests(
+        marked, printing_index({"cards": owned_cards}), printing_at
+    )
+    coverages: dict[str, Coverage] = {}
+    for entry in deck_entries(marked):
+        name = entry["name"]
+        if name in coverages:
+            continue
+        special = specials.get(name)
+        coverages[name] = Format.coverage(
+            medium,
+            name,
+            int(entry.get("quantity", 1) or 1),
+            owned.get(normalize_card_name(name), 0),
+            requested_owned=special.held if special else None,
+        )
+    return covered_count(coverages.values())
 
 
 @click.command()
@@ -267,36 +324,19 @@ def main(
         click.echo(f"mark-owned: invalid deck JSON — {exc}", err=True)
         sys.exit(1)
 
-    # Accept either parsed-deck JSON or CSV (e.g., Untapped.gg export)
-    # for the collection. Auto-detect by trying JSON first; if that fails,
-    # try CSV parsing.
-    collection_text = collection_path.read_text(encoding="utf-8")
-    try:
-        collection = json.loads(collection_text)
-    except json.JSONDecodeError:
-        from mtg_utils.parse_deck import parse_csv
-
-        parsed = parse_csv(collection_text)
-        collection = {
-            "commanders": parsed.get("commanders", []),
-            "cards": parsed.get("cards", []),
-            "sideboard": parsed.get("sideboard", []),
-        }
-        if not collection["cards"]:
-            click.echo(
-                "mark-owned: WARNING — collection file is not valid JSON "
-                "and CSV parsing found 0 cards. Check that the file is an "
-                "Untapped.gg CSV export or a parsed-deck JSON.",
-                err=True,
-            )
+    collection = load_collection(collection_path)
+    if not collection.get("cards"):
+        click.echo(
+            "mark-owned: WARNING — the collection has 0 cards. Check that the "
+            "file is an Untapped.gg CSV export or a parsed-deck JSON.",
+            err=True,
+        )
 
     name_aliases = None
     if bulk_data:
         name_aliases = build_name_alias_map(Path(bulk_data))
 
-    result, deck_unique = _mark_owned_with_count(
-        deck, collection, name_aliases=name_aliases
-    )
+    result = mark_owned(deck, collection, name_aliases=name_aliases)
     target = output_path.resolve() if output_path else deck_path
     # Atomic write via tempfile + rename so an interrupted run never leaves
     # the user's parsed deck JSON half-overwritten — the default mode IS
@@ -304,37 +344,42 @@ def main(
     # would be a bad trade.
     atomic_write_json(target, result)
 
-    owned_count = len(result["owned_cards"])
+    pool = CardPool.load(Path(bulk_data)) if bulk_data else None
+    owned_count, deck_total = coverage_summary(
+        result, pool.printing_at if pool else None
+    )
     click.echo(
-        f"mark-owned: {owned_count} of {deck_unique} "
-        f"unique deck cards owned -> {target}"
+        f"mark-owned: {owned_count} of {deck_total} "
+        f"unique deck cards owned (basic lands are free) -> {target}"
     )
 
 
-def _mark_owned_with_count(
+def _intersect(
     deck: dict,
     collection: dict,
     *,
     name_aliases: dict[str, str] | None = None,
-) -> tuple[dict, int]:
-    """``mark_owned()`` plus the deck's unique-card count, without re-walking.
-
-    The CLI summary needs both the result and the denominator ``N of M``;
-    computing them together avoids walking the deck twice. This is also
-    the single place that implements the intersection — ``mark_owned``
-    is a thin wrapper that drops the count.
+) -> dict:
+    """The single place that implements the intersection — ``mark_owned`` is a thin
+    wrapper over it.
     """
     collection_entries = _collect_entries(collection, sum_duplicates=True)
-    deck_entries = _collect_entries(deck, sum_duplicates=False)
+    printings = printing_index(collection)
+    deck_rows = _collect_entries(deck, sum_duplicates=False)
     coll_lookup = _build_alias_lookup(collection_entries, name_aliases=name_aliases)
     owned: list[dict] = []
-    for deck_key in sorted(deck_entries, key=lambda k: deck_entries[k][0].lower()):
-        coll_primary_key = _match_collection_key(deck_entries[deck_key][0], coll_lookup)
+    for deck_key in sorted(deck_rows, key=lambda k: deck_rows[k][0].lower()):
+        coll_primary_key = _match_collection_key(deck_rows[deck_key][0], coll_lookup)
         if coll_primary_key is None:
             continue
         _coll_name, coll_qty = collection_entries[coll_primary_key]
         if coll_qty < 1:
             continue
-        original_name, _deck_qty = deck_entries[deck_key]
-        owned.append({"name": original_name, "quantity": coll_qty})
-    return {**deck, "owned_cards": owned}, len(deck_entries)
+        original_name, _deck_qty = deck_rows[deck_key]
+        row: dict = {"name": original_name, "quantity": coll_qty}
+        # The collection's per-printing detail rides along, so a deck entry asking
+        # for a specific printing (a full-art or foil basic) is judged against it.
+        if detail := printings.get(coll_primary_key):
+            row["printings"] = printing_rows(detail)
+        owned.append(row)
+    return {**deck, "owned_cards": owned}

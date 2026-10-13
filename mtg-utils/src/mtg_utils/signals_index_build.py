@@ -1,6 +1,6 @@
 """Console-script entry for ``build-signals-index`` (task #90).
 
-A tiny prebuild hook over ``_deck_forge.signals_index.load_signals_index`` —
+A tiny prebuild hook over ``_analysis.signals_index.load_signals_index`` —
 every real production call site already builds the sidecar lazily on first
 whole-pool touch (``card_search --preset``, deck-forge's commander-discovery
 novelty sweep), so this CLI exists purely to pay that one-time ~2-4 min cost
@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     idents sidecar for the default bulk file (``bulk_loader.default_bulk_path``)."""
     import argparse
 
-    from mtg_utils._deck_forge.signals_index import load_signals_index
+    from mtg_utils._analysis.signals_index import load_signals_index
     from mtg_utils.bulk_loader import default_bulk_path
 
     parser = argparse.ArgumentParser(

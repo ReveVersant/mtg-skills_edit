@@ -5,65 +5,21 @@ legality.
 
 The list is curated by FUNCTION, not EDHREC popularity (the project never ranks by
 popularity), and every name was verified to resolve against the real Scryfall bulk with
-the expected color identity during authoring. Tests here use synthetic records (no real
-network / bulk — same constraint as the rest of the suite).
+the expected color identity during authoring. The real staples here come from the
+committed card snapshot by name (ADR-0056); only prices are overlaid. The commanders
+are fictional machinery.
 """
 
-from mtg_utils._deck_forge import engine, staples
+from mtg_utils._analysis import staples
+from mtg_utils._deck_forge import engine
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.formats import FORMATS
+from mtg_utils.testkit import test_card
 
-SOL_RING = {
-    "name": "Sol Ring",
-    "type_line": "Artifact",
-    "cmc": 1.0,
-    "color_identity": [],
-    "oracle_text": "{T}: Add {C}{C}.",
-    "prices": {"usd": "2.00"},
-    "legalities": {
-        "commander": "legal",
-        "standardbrawl": "not_legal",
-        "brawl": "banned",
-    },
-}
-CULTIVATE = {
-    "name": "Cultivate",
-    "type_line": "Sorcery",
-    "cmc": 3.0,
-    "color_identity": ["G"],
-    "oracle_text": "Search your library for up to two basic land cards, reveal those cards, put one onto the battlefield tapped and the other into your hand, then shuffle.",
-    "prices": {"usd": "0.25"},
-    "legalities": {
-        "commander": "legal",
-        "standardbrawl": "not_legal",
-        "brawl": "legal",
-    },
-}
-COUNTERSPELL = {
-    "name": "Counterspell",
-    "type_line": "Instant",
-    "cmc": 2.0,
-    "color_identity": ["U"],
-    "oracle_text": "Counter target spell.",
-    "prices": {"usd": "1.00"},
-    "legalities": {
-        "commander": "legal",
-        "standardbrawl": "not_legal",
-        "brawl": "legal",
-    },
-}
-COMMAND_TOWER = {
-    "name": "Command Tower",
-    "type_line": "Land",
-    "cmc": 0.0,
-    "color_identity": [],
-    "oracle_text": "{T}: Add one mana of any color in your commander's color identity.",
-    "prices": {"usd": "0.50"},
-    "legalities": {
-        "commander": "legal",
-        "standardbrawl": "not_legal",
-        "brawl": "legal",
-    },
-}
+SOL_RING = {**test_card("Sol Ring"), "prices": {"usd": "2.00"}}
+CULTIVATE = {**test_card("Cultivate"), "prices": {"usd": "0.25"}}
+COUNTERSPELL = {**test_card("Counterspell"), "prices": {"usd": "1.00"}}
+COMMAND_TOWER = {**test_card("Command Tower"), "prices": {"usd": "0.50"}}
 INDEX = {c["name"]: c for c in (SOL_RING, CULTIVATE, COUNTERSPELL, COMMAND_TOWER)}
 
 
@@ -125,13 +81,13 @@ class TestStaplesData:
 class TestColorIdentityFilter:
     def test_colorless_staple_fits_any_deck(self):
         # Sol Ring (colorless) appears in a mono-white deck.
-        out = staples.staples_for("W", INDEX, legality_key="commander")
+        out = staples.staples_for("W", INDEX, fmt=FORMATS["commander"])
         assert SOL_RING in out
 
     def test_colored_staple_only_in_matching_identity(self):
         # Cultivate (G) is offered to a green deck, not to a mono-blue deck.
-        green = staples.staples_for("G", INDEX, legality_key="commander")
-        blue = staples.staples_for("U", INDEX, legality_key="commander")
+        green = staples.staples_for("G", INDEX, fmt=FORMATS["commander"])
+        blue = staples.staples_for("U", INDEX, fmt=FORMATS["commander"])
         assert CULTIVATE in green
         assert CULTIVATE not in blue
         assert COUNTERSPELL in blue
@@ -139,8 +95,8 @@ class TestColorIdentityFilter:
     def test_command_tower_gated_to_multicolor(self):
         # Command Tower (any-color fixing LAND) is dead in a mono-color deck — a
         # strictly-worse basic — so it's withheld there but offered to 2+ color decks.
-        mono = staples.staples_for("W", INDEX, legality_key="commander")
-        multi = staples.staples_for("WU", INDEX, legality_key="commander")
+        mono = staples.staples_for("W", INDEX, fmt=FORMATS["commander"])
+        multi = staples.staples_for("WU", INDEX, fmt=FORMATS["commander"])
         assert COMMAND_TOWER not in mono
         assert COMMAND_TOWER in multi
         # Sol Ring (a mana ROCK) stays universal — useful even in mono.
@@ -150,14 +106,14 @@ class TestColorIdentityFilter:
 class TestFormatLegalityFilter:
     def test_sol_ring_excluded_in_brawl(self):
         # Sol Ring is the #1 commander staple but BANNED in Brawl (standardbrawl).
-        commander = staples.staples_for("WUBRG", INDEX, legality_key="commander")
-        brawl = staples.staples_for("WUBRG", INDEX, legality_key="standardbrawl")
+        commander = staples.staples_for("WUBRG", INDEX, fmt=FORMATS["commander"])
+        brawl = staples.staples_for("WUBRG", INDEX, fmt=FORMATS["brawl"])
         assert SOL_RING in commander
         assert SOL_RING not in brawl
 
     def test_legal_staple_kept_for_format(self):
         # Cultivate is legal in Historic Brawl (legality key "brawl").
-        out = staples.staples_for("G", INDEX, legality_key="brawl")
+        out = staples.staples_for("G", INDEX, fmt=FORMATS["historic_brawl"])
         assert CULTIVATE in out
 
 

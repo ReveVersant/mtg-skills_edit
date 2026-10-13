@@ -16,16 +16,21 @@
     connected,
     agentAttached,
     manaModalOpen,
+    sizeIsMinimum,
+    sideboardSize,
+    deckSizeDefault,
+    poolBounded,
+    isDigital,
   } from "../lib/store.js";
   import {
     landState,
     priceOf,
-    FORMAT_TARGET,
     SYMBOL_ORDER,
     COLOR_LABEL,
     WC_TIERS,
     bucketCurve,
     CURVE_BUCKETS,
+    copiesShort,
   } from "../lib/mana.js";
   import Mana from "./Mana.svelte";
   import Budgets from "./Budgets.svelte";
@@ -33,8 +38,16 @@
   import Warnings from "./Warnings.svelte";
 
   $: ls = landState($mana);
-  // Effective deck-size target (60 or 100 for paper Historic Brawl), else format default.
-  $: target = $deck.deck_size ?? FORMAT_TARGET[$deck.format] ?? 100;
+  // Effective deck-size target (a Commander-family choice or a constructed target),
+  // else the served format default. A constructed size is a FLOOR (CR 100.2a): the
+  // pill says "min" and reads short until the deck reaches it.
+  $: target = $deck.deck_size ?? $deckSizeDefault;
+  $: total = $stats?.total_cards ?? 0;
+  $: short = $sizeIsMinimum && total < target;
+  $: sideboardCount = ($deck.sideboard || []).reduce(
+    (sum, c) => sum + (c.quantity || 1),
+    0,
+  );
   // Arena wildcard tiers (mythic→common), shown for digital builds in place of USD.
   $: wcTotal = $wildcards
     ? Object.values($wildcards).reduce((a, b) => a + b, 0)
@@ -49,15 +62,13 @@
     (sum, c) => sum + (priceOf(c) ?? 0) * (c.quantity || 1),
     0,
   );
-  // How much of the estimate is cards you DON'T already own (the spend to acquire the
-  // deck). Only meaningful when a Collection is loaded for the active slot; basics are
-  // excluded (assumed owned, matching the owned readout). Owned-ness is the derived flag.
+  // How much of the estimate is copies you DON'T already own (the spend to acquire the
+  // deck). Only meaningful when a Collection is loaded for the active slot. Each row's
+  // served shortfall (copiesShort) already applies the ownership rule, basics included.
   $: collectionLoaded =
     $collection && ($collection.slots?.[$collection.active_slot] || 0) > 0;
-  const isBasic = (c) => /\bBasic Land\b/.test(c.type_line || "");
   $: unownedTotal = [...$deck.commanders, ...$deck.cards].reduce(
-    (sum, c) =>
-      c.owned || isBasic(c) ? sum : sum + (priceOf(c) ?? 0) * (c.quantity || 1),
+    (sum, c) => sum + (priceOf(c) ?? 0) * (copiesShort(c) ?? 0),
     0,
   );
   // Slot budgets met / tracked, for the compact chip (full bars live in the popover).
@@ -78,11 +89,23 @@
 <footer class="bar">
   <!-- ── summary ─────────────────────────────────────────────── -->
   <div class="zone summary">
-    <div class="stat">
-      <b>{$stats?.total_cards ?? 0}</b><span class="o">/{target}</span><em
-        >cards</em
+    <div class="stat" class:short>
+      <b>{total}</b><span class="o">/{target}</span><em
+        >{$sizeIsMinimum ? "cards · min" : "cards"}</em
       >
     </div>
+    {#if $sideboardSize > 0}
+      <div
+        class="stat"
+        title={Number.isFinite($sideboardSize)
+          ? `Sideboard (CR 100.4a: at most ${$sideboardSize})`
+          : "The unused pool"}
+      >
+        <b>{sideboardCount}</b>{#if Number.isFinite($sideboardSize)}<span
+            class="o">/{$sideboardSize}</span
+          >{/if}<em>{$poolBounded ? "unused" : "side"}</em>
+      </div>
+    {/if}
     <div class="stat"><b>{$stats?.avg_cmc ?? 0}</b><em>avg</em></div>
     <div class="stat">
       <b>{$stats?.creature_count ?? 0}</b><em>creatures</em>
@@ -98,7 +121,9 @@
         {/each}
       </div>
     {/if}
-    {#if $deck.medium === "digital"}
+    {#if $poolBounded}
+      <!-- an opened pool is owned outright: nothing to craft or buy -->
+    {:else if $isDigital}
       <div
         class="stat wc"
         title="Arena wildcards needed for cards you don't own (basics are free)"
@@ -122,7 +147,7 @@
         {#if collectionLoaded}
           <span
             class="unowned"
-            title="Estimated cost of cards not in your {$collection.active_slot} collection (basics excluded)"
+            title="Estimated cost of the copies your {$collection.active_slot} collection doesn't cover (basic lands are free unless you picked a special printing)"
             >(${unownedTotal.toFixed(0)} unowned)</span
           >
         {/if}
@@ -215,6 +240,10 @@
 </footer>
 
 <style>
+  .stat.short b {
+    color: var(--warn);
+  }
+
   .bar {
     position: relative;
     z-index: 6;

@@ -12,23 +12,33 @@ import requests
 from mtg_utils._http import USER_AGENT
 from mtg_utils._name_index import NameIndex
 from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
-from mtg_utils.card_classify import extract_price
-from mtg_utils.format_config import FORMAT_CONFIGS
-from mtg_utils.format_config import is_arena_format as _is_arena_format
+from mtg_utils.card_classify import extract_price, finish_price
+from mtg_utils.card_pool import CardPool, NoBulkError
+from mtg_utils.deck import OWNED_ZONES, deck_entries
+from mtg_utils.deck_cli import bulk_data_option
 from mtg_utils.fx import aud_per_usd, usd_to_aud
+from mtg_utils.formats import (
+    DIGITAL,
+    FORMATS,
+    PAPER,
+    Format,
+    get_format,
+    resolve_deck_medium,
+)
+from mtg_utils.names import normalize_card_name
+from mtg_utils.ownership import printing_index, special_requests
 from mtg_utils.scryfall_lookup import (
     RATE_LIMIT_DELAY,
     SCRYFALL_NAMED_URL,
-    _load_bulk_index,
-    build_rarity_index,
     lookup_single,
 )
 
 _extract_price = extract_price
 
 
-def _normalize_owned_cards(entries: list) -> dict[str, int]:
-    """Return ``lowercased_name -> owned_quantity`` from an ``owned_cards`` list.
+def owned_quantities(entries: list) -> dict[str, int]:
+    """Return ``normalized name -> owned_quantity`` from an ``owned_cards`` list
+    (``names.normalize_card_name``, the ownership path's one folding).
 
     ``owned_cards`` is a list of ``{"name": str, "quantity": int}`` dicts,
     matching the shape of the sibling ``cards`` and ``commanders`` fields
@@ -54,9 +64,14 @@ def _normalize_owned_cards(entries: list) -> dict[str, int]:
             qty = 1
         if qty < 1:
             continue
-        key = name.lower()
+        key = normalize_card_name(name)
         owned[key] = owned.get(key, 0) + qty
     return owned
+
+
+#: The zones price-check costs: every zone a builder must own, plus a cube's
+#: commander pool.
+_PRICED_ZONES = (*OWNED_ZONES, "commander_pool")
 
 
 def _extract_deck_entries(names_or_deck: list | dict) -> list[tuple[str, int]]:
@@ -75,7 +90,7 @@ def _extract_deck_entries(names_or_deck: list | dict) -> list[tuple[str, int]]:
     ``deck_qty`` / ``owned_qty`` numbers across both tools.
 
     Rows with ``quantity < 1`` are dropped (consistent with the
-    ``owned_cards`` treatment in ``_normalize_owned_cards``).
+    ``owned_cards`` treatment in ``owned_quantities``).
 
     - Plain list of strings → each yields ``(name, 1)``.
     - List of ``{name, quantity}`` dicts → quantity honored; duplicates
@@ -112,19 +127,15 @@ def _extract_deck_entries(names_or_deck: list | dict) -> list[tuple[str, int]]:
                 _add(name, qty)
         return pairs
 
-    # Parsed deck JSON — walk mainboard, commanders, and sideboard
-    for section in ("commanders", "cards", "sideboard"):
-        for entry in names_or_deck.get(section, []) or []:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            if not isinstance(name, str):
-                continue
-            try:
-                qty = int(entry.get("quantity", 1))
-            except (TypeError, ValueError):
-                qty = 1
-            _add(name, qty)
+    # Parsed deck JSON — the zones a builder must own (the companion included: a
+    # card you must own like any sideboard card); a cube JSON's commander pool
+    # (parse_cube's ``commander_pool``, same entry shape) prices too.
+    for entry in deck_entries(names_or_deck, _PRICED_ZONES):
+        try:
+            qty = int(entry.get("quantity", 1))
+        except (TypeError, ValueError):
+            qty = 1
+        _add(entry["name"], qty)
     return pairs
 
 
@@ -144,26 +155,17 @@ def _api_price_lookup(name: str) -> float | None:
         session.close()
 
 
-def _check_arena_wildcards(
-    deck_entries: list[tuple[str, int]],
+def arena_wildcard_cost(
+    entries: list[tuple[str, int]],
     owned_map: dict[str, int],
     rarity_index: NameIndex,
 ) -> dict:
     """Build wildcard-based price result for Arena formats.
 
-    Applies two quantity-aware rules that the USD path also uses:
-
-    1. **Playset shortfall.** For each deck slot, charge for
-       ``max(deck_qty - effective_owned, 0)`` copies. A Commander deck
-       running 17 Hare Apparent with 4 in the collection costs 13
-       wildcards, not 0.
-    2. **Arena 4-cap substitution.** Arena treats ownership of 4+
-       copies of a standard playset-capped card as infinite (you can
-       never legally need a 5th in a non-singleton format). This
-       substitution is suppressed for cards with an oracle exemption
-       (``exempt_from_4cap`` in the rarity index) — a deck can
-       legitimately want 17 Hare Apparent, so owning 4 does not grant
-       the remaining 13.
+    Each slot costs the copies Arena's ownership rule leaves short
+    (``Format.copies_short``): a deck running 10 Persistent Petitioners with 2 owned
+    costs 8 wildcards, but 4 owned Hare Apparent fill all 17 slots of a Hare deck, and
+    the six basic lands are free whatever printing the deck names.
 
     Cards absent from the Arena rarity index are reported in the
     separate ``illegal_or_missing`` list and contribute zero wildcards
@@ -176,16 +178,16 @@ def _check_arena_wildcards(
     owned_count = 0
     illegal_or_missing: list[dict] = []
 
-    for name, deck_qty in deck_entries:
-        key = name.lower()
-        owned_qty = owned_map.get(key, 0)
-        entry = rarity_index.get(key)
+    for name, deck_qty in entries:
+        owned_qty = owned_map.get(normalize_card_name(name), 0)
+        entry = rarity_index.get(name)
+        need = Format.copies_short(DIGITAL, name, deck_qty, owned_qty)
 
         if entry is None:
             # Not in the format-filtered Arena rarity index — illegal or
             # not on Arena. Still flag the owned count for transparency,
             # but don't charge wildcards (we can't know the rarity).
-            if owned_qty >= deck_qty:
+            if need == 0:
                 owned_count += 1
             illegal_or_missing.append(
                 {"name": name, "reason": "not_in_arena_rarity_index"},
@@ -194,7 +196,7 @@ def _check_arena_wildcards(
                 {
                     "name": name,
                     "rarity": None,
-                    "owned": owned_qty >= deck_qty,
+                    "owned": need == 0,
                     "deck_quantity": deck_qty,
                     "owned_quantity": owned_qty,
                     "legal": False,
@@ -203,16 +205,6 @@ def _check_arena_wildcards(
             continue
 
         rarity = entry["rarity"]
-        exempt = entry.get("exempt_from_4cap", False)
-
-        # Arena 4-cap: owning 4+ of a standard playset-capped card is
-        # effectively infinite supply. Exempt cards (any-number / up-to-N)
-        # get no such substitution — owned count is literal.
-        if not exempt and owned_qty >= 4:
-            effective_owned = max(owned_qty, deck_qty)
-        else:
-            effective_owned = owned_qty
-        need = max(deck_qty - effective_owned, 0)
 
         if need == 0:
             owned_count += 1
@@ -239,43 +231,24 @@ def _check_arena_wildcards(
     }
 
 
-def arena_wildcard_cost(
-    deck: list | dict,
-    rarity_index: NameIndex,
-    *,
-    owned_cards: list | None = None,
-) -> dict:
-    """Wildcard cost for an Arena deck against a PREBUILT rarity index.
-
-    Splits the index-building (expensive — walks all of bulk) from the per-deck costing
-    so a caller that re-costs on every edit (deck-forge's live footer) can build the
-    index once and reuse it. Returns the same shape as the Arena branch of
-    ``check_prices``: ``{cards, wildcard_cost, owned_cards_count, illegal_or_missing}``.
-    ``owned_cards`` (a ``{name, quantity}`` list) subtracts copies already owned; when
-    omitted it falls back to the deck's own ``owned_cards`` field.
-    """
-    deck_entries = _extract_deck_entries(deck)
-    if owned_cards is None and isinstance(deck, dict):
-        owned_cards = deck.get("owned_cards", [])
-    owned_map = _normalize_owned_cards(owned_cards or [])
-    return _check_arena_wildcards(deck_entries, owned_map, rarity_index)
-
-
 def check_prices(
     names_or_deck: list[str] | dict,
     *,
     bulk_path: Path | None = None,
     budget: float | None = None,
     format: str | None = None,  # noqa: A002
+    medium: str | None = None,
 ) -> dict:
     """Check prices for a list of card names or a parsed deck JSON.
 
-    For Arena formats (brawl, historic_brawl), reports wildcard costs
-    (rarity) instead of USD prices when bulk_path is provided.
+    The medium decides the cost mode (ADR-0052): Arena (digital) reports wildcard
+    costs by rarity when bulk_path is provided; paper reports USD. ``medium``
+    overrides the deck JSON's own ``medium``; with neither, the format's default
+    applies (Arena-only formats are digital; Standard and Pioneer default to paper).
 
     Result fields (USD mode):
 
-    - ``total_cost``: sum of ``unit_price * max(deck_qty - owned_qty, 0)``
+    - ``total_cost``: sum of ``unit_price * copies_needed`` (``Format.copies_short``)
       across all slots. The amount the user actually needs to spend to
       complete the deck from their current collection.
     - ``total_value``: sum of ``unit_price * deck_qty`` across all slots.
@@ -288,7 +261,7 @@ def check_prices(
     - ``owned_cards_count``: count of slots whose ``owned_qty`` fully
       covers ``deck_qty`` ("no copies needed"). Not a copy count.
     """
-    deck_entries = _extract_deck_entries(names_or_deck)
+    entries = _extract_deck_entries(names_or_deck)
 
     # Detect format from deck JSON if not explicitly provided
     if format is None and isinstance(names_or_deck, dict):
@@ -299,44 +272,66 @@ def check_prices(
     # ``cards``/``commanders`` fields — so callers can populate it by
     # analogy with the rest of the deck structure. ``mark-owned`` is
     # the canonical way to populate it from a parsed collection.
+    owned_cards: list = []
     owned_map: dict[str, int] = {}
     if isinstance(names_or_deck, dict):
-        owned_map = _normalize_owned_cards(names_or_deck.get("owned_cards", []))
+        owned_cards = names_or_deck.get("owned_cards", []) or []
+        owned_map = owned_quantities(owned_cards)
 
-    # Arena wildcard mode
-    is_arena = format is not None and _is_arena_format(format) and bulk_path is not None
-    if is_arena:
-        config = FORMAT_CONFIGS[format]
-        rarity_index = build_rarity_index(
-            bulk_path,
-            config["legality_key"],
-            arena_only=True,
-            # Competitive Brawl shares the ``brawl`` key but legalizes its bans and
-            # enforces its own list by name — same overrides legality-audit applies.
-            ignore_key_bans=config.get("ignores_legality_key_bans", False),
-            banned_cards=config.get("banned_cards"),
+    fmt = get_format(format) if format is not None else None
+    medium = resolve_deck_medium(fmt, names_or_deck, medium)
+    if (
+        fmt is not None
+        and Format.cost_mode(medium) == "wildcards"
+        and bulk_path is not None
+    ):
+        rarity_index = CardPool.load(bulk_path).rarity_index(fmt, arena_only=True)
+        return arena_wildcard_cost(entries, owned_map, rarity_index)
+
+    # USD price mode: each slot charges the copies the paper ownership rule leaves
+    # short (``Format.copies_short``) — 17 Hare Apparent with 4 owned buys 13; basic
+    # lands are owned unless the deck asks for a special printing of one.
+    pool = CardPool.load(bulk_path) if bulk_path else None
+    bulk_index = pool.by_name if pool else None
+    specials = (
+        special_requests(
+            names_or_deck,
+            printing_index({"cards": owned_cards}),
+            pool.printing_at if pool else None,
+            _PRICED_ZONES,
         )
-        return _check_arena_wildcards(deck_entries, owned_map, rarity_index)
-
-    # USD price mode. Paper has no Arena-style 4-cap substitution, so the
-    # math is simply: for each deck slot, charge ``max(deck_qty - owned_qty, 0)``
-    # copies at the unit price. A deck running 17 Hare Apparent with 4
-    # owned is charged for 13.
-    bulk_index = _load_bulk_index(bulk_path) if bulk_path else None
-    rate_aud = aud_per_usd()  # resolve the USD->AUD rate once for the whole report
+        if isinstance(names_or_deck, dict)
+        else {}
+    )
+    rate_aud = aud_per_usd()  # resolve the USD->AUD rate once for the report
     cards_out: list[dict] = []
     total_cost = 0.0
     total_value = 0.0
     owned_count = 0
 
-    for name, deck_qty in deck_entries:
+    for name, deck_qty in entries:
         card = lookup_single(name, bulk_index=bulk_index)
         price = _extract_price(card)
         if price is None and card is not None:
             price = _api_price_lookup(name)
+        special = specials.get(name)
+        note = None
+        if special is not None:
+            # A special basic printing costs what THAT printing costs, in its finish.
+            requested_price = finish_price(special.printing or card, special.finish)
+            if requested_price is not None:
+                price = requested_price
+            else:
+                note = "requested printing has no listed price; priced at the cheapest"
 
-        owned_qty = owned_map.get(name.lower(), 0)
-        need = max(deck_qty - owned_qty, 0)
+        owned_qty = owned_map.get(normalize_card_name(name), 0)
+        need = Format.copies_short(
+            medium,
+            name,
+            deck_qty,
+            owned_qty,
+            requested_owned=special.held if special else None,
+        )
         fully_owned = need == 0
         if fully_owned:
             owned_count += 1
@@ -355,6 +350,7 @@ def check_prices(
                 "owned_quantity": owned_qty,
                 "copies_needed": need,
                 "running_total": round(total_cost, 2),
+                **({"price_note": note} if note else {}),
             }
         )
 
@@ -433,12 +429,13 @@ def render_text_report(result: dict) -> str:
     )
     for entry in cards:
         price = entry.get("price_usd") or 0.0
+        name = entry.get("name", "?")
+        marker = " (owned)" if entry.get("owned") else ""
+        # Format the full "$N.NN" atom first, then right-align it so the
+        # dollar sign sits flush against the digits (no inner padding).
         price_aud = entry.get("price_aud")
         if price_aud is None:
             price_aud = usd_to_aud(price, rate=rate) or 0.0
-        name = entry.get("name", "?")
-        marker = " (owned)" if entry.get("owned") else ""
-        # Right-align each currency atom so the symbols sit flush against digits.
         usd_str = f"US${price:.2f}"
         aud_str = f"A${price_aud:.2f}"
         lines.append(f"  {usd_str:>9}  {aud_str:>9}  {name}{marker}")
@@ -462,25 +459,34 @@ def _default_output_path(
     content: str,
     budget: float | None,
     card_format: str | None,
+    medium: str | None,
     bulk_data: Path | None,
 ) -> Path:
-    return sha_keyed_path("price-check", content, budget, card_format, bulk_data)
+    return sha_keyed_path(
+        "price-check", content, budget, card_format, medium, bulk_data
+    )
 
 
 @click.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--budget", type=float, default=None, help="Budget in USD.")
-@click.option(
-    "--bulk-data",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-)
+@bulk_data_option
 @click.option(
     "--format",
     "card_format",
-    type=click.Choice(sorted(FORMAT_CONFIGS.keys())),
+    type=click.Choice(sorted(FORMATS)),
     default=None,
-    help="Game format. Arena formats use wildcard pricing.",
+    help="Game format. Its medium decides the pricing (see --medium).",
+)
+@click.option(
+    "--medium",
+    type=click.Choice([PAPER, DIGITAL]),
+    default=None,
+    help=(
+        "digital = Arena wildcards, paper = USD. Default: the deck JSON's medium, "
+        "else the format's (Arena-only formats are digital; Standard and Pioneer "
+        "default to paper)."
+    ),
 )
 @click.option(
     "--output",
@@ -494,15 +500,46 @@ def main(
     budget: float | None,
     bulk_data: Path | None,
     card_format: str | None,
+    medium: str | None,
     output_path: Path | None,
 ) -> None:
-    """Check card prices against a budget."""
+    """Check card prices against a budget. PATH is a name list, a parsed deck JSON
+    or a cube JSON (so this CLI prices names itself rather than acquiring a deck)."""
     content = path.read_text(encoding="utf-8")
     raw = json.loads(content)
-    result = check_prices(raw, bulk_path=bulk_data, budget=budget, format=card_format)
+    # The format ``check_prices`` will use: the flag, else the deck JSON's own.
+    effective_format = card_format or (
+        raw.get("format") if isinstance(raw, dict) else None
+    )
+    fmt = FORMATS.get(effective_format) if effective_format else None
+    effective_medium = resolve_deck_medium(fmt, raw, medium)
+    try:
+        bulk_path: Path | None = CardPool.resolve_path(bulk_data)
+    except NoBulkError as exc:
+        if fmt is not None and Format.cost_mode(effective_medium) == "wildcards":
+            # Wildcard costing reads the bulk's rarity index; there is no per-card
+            # fallback for it, and a silent USD report would read as wildcards.
+            raise click.ClickException(
+                f"Arena wildcard pricing for {effective_format} needs the local "
+                f"bulk: {exc}"
+            ) from exc
+        # The one CLI that keeps a no-bulk mode: every name is priced against
+        # Scryfall's per-card endpoint (ADR-0005's carve-out) — say so, since that is
+        # one request per distinct name.
+        bulk_path = None
+        click.echo(
+            "WARNING: no card-data bulk found — pricing every name against Scryfall's "
+            "API; run download-mtgjson to price from the local bulk.",
+            err=True,
+        )
+    result = check_prices(
+        raw, bulk_path=bulk_path, budget=budget, format=card_format, medium=medium
+    )
 
     if output_path is None:
-        output_path = _default_output_path(content, budget, card_format, bulk_data)
+        output_path = _default_output_path(
+            content, budget, card_format, effective_medium, bulk_path
+        )
     else:
         output_path = output_path.resolve()
     atomic_write_json(output_path, result)

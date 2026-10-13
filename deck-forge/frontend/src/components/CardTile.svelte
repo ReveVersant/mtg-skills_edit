@@ -14,7 +14,13 @@
   import { displayName } from "../lib/cards.js";
   import { askForge } from "../lib/agent.js";
   import { hoverPreview } from "../lib/hover.js";
-  import { isDigital, agentAttached } from "../lib/store.js";
+  import {
+    isDigital,
+    agentAttached,
+    hasCommander,
+    sideboardSize,
+    poolBounded,
+  } from "../lib/store.js";
   import Mana from "./Mana.svelte";
   import ManaCost from "./ManaCost.svelte";
   import OracleText from "./OracleText.svelte";
@@ -36,6 +42,12 @@
   $: canCommand = card.can_be_commander === true;
   $: hasSynergy = score && score.synergy_fit > 0;
   $: served = score?.served ?? [];
+  // The share of the meta archetype's ladder lists that run the card (ADR-0059):
+  // served only on a digital build with a meta read, where it breaks synergy ties.
+  $: metaPct =
+    score?.meta_share > 0 ? Math.round(score.meta_share * 100) : null;
+  $: metaTitle =
+    metaPct && `In ${metaPct}% of your meta archetype's ladder lists`;
   // First line of oracle text (dense only) — newlines flattened to a bullet so a
   // multi-paragraph card reads as one line; CSS ellipsis shows "as much as fits".
   $: oracle = (card.oracle_text || "").replace(/\s*\n+\s*/g, " • ").trim();
@@ -85,17 +97,26 @@
         <div class="metaline" title={served.join(", ")}>
           {#if hasSynergy}
             <span class="spark">✦ {score.synergy_fit}</span>
-            {#each served.slice(0, 3) as s, i (i)}<span class="served">{s}</span
-              >{/each}
           {/if}
+          {#if metaPct}
+            <span class="metashare" title={metaTitle}>meta {metaPct}%</span>
+          {/if}
+          <!-- served is empty without synergy (synergy_fit counts it) -->
+          {#each served.slice(0, 3) as s, i (i)}<span class="served">{s}</span
+            >{/each}
           <span class="typetail">{card.type_line}</span>
         </div>
         {#if oracle}
           <div class="oracle"><OracleText text={oracle} size="0.82rem" /></div>
         {/if}
-      {:else if hasSynergy}
+      {:else if hasSynergy || metaPct}
         <div class="synergy" title={served.join(", ")}>
-          <span class="spark">✦ {score.synergy_fit}</span>
+          {#if hasSynergy}
+            <span class="spark">✦ {score.synergy_fit}</span>
+          {/if}
+          {#if metaPct}
+            <span class="metashare" title={metaTitle}>meta {metaPct}%</span>
+          {/if}
           {#each served.slice(0, 2) as s, i (i)}<span class="served">{s}</span
             >{/each}
         </div>
@@ -118,14 +139,23 @@
           class="btn btn-ember add"
           on:click={() => onadd(card.name, "cards")}>+ Add</button
         >
-        <button
-          class="btn star"
-          title={canCommand
-            ? "Set as commander"
-            : "Not commander-eligible in this format"}
-          disabled={!canCommand}
-          on:click={() => onadd(card.name, "commanders")}>★</button
-        >
+        {#if $sideboardSize > 0 && !$poolBounded}
+          <button
+            class="btn star"
+            title="Add to the sideboard"
+            on:click={() => onadd(card.name, "sideboard")}>SB</button
+          >
+        {/if}
+        {#if $hasCommander}
+          <button
+            class="btn star"
+            title={canCommand
+              ? "Set as commander"
+              : "Not commander-eligible in this format"}
+            disabled={!canCommand}
+            on:click={() => onadd(card.name, "commanders")}>★</button
+          >
+        {/if}
         <button
           class="btn star"
           title={$agentAttached
@@ -267,6 +297,15 @@
     font-size: 0.72rem;
     color: var(--brass-bright);
     flex-shrink: 0;
+  }
+  /* The meta archetype's share (ADR-0059): a tiebreak under synergy, so it sits
+     beside the spark in the same brass, smaller. */
+  .metashare {
+    font-size: 0.62rem;
+    color: var(--brass-bright);
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
   }
   /* Pre-release marker. Deliberately cooler than the ember/gold used for synergy so it
      reads as a status flag, not a recommendation. */

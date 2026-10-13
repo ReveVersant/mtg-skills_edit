@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from mtg_utils._deck_forge.signals import extract_signals
+from mtg_utils._analysis.signals import extract_signals
 from mtg_utils.card_ir import Filter
 from mtg_utils.testkit import test_card, test_card_ir, test_signals
 
@@ -55,6 +55,7 @@ _REAL_CASES: dict[str, str] = {
     "blood_matters": "Wedding Security",
     "boast_makers": "Arni Brokenbrow",
     "boast_matters": "Birgi, God of Storytelling",
+    "board_protection": "Avacyn, Angel of Hope",
     "bounce_tempo": "Boomerang",
     "cant_block_grant": "Breeches, Eager Pillager",
     "card_draw_engine": "Phyrexian Arena",
@@ -257,6 +258,7 @@ _REAL_CASES: dict[str, str] = {
     "mana_amplifier": "Mana Reflection",
     "mass_bounce": "Evacuation",
     "mass_death_payoff": "Khabál Ghoul",
+    "mass_land_denial": "Armageddon",
     "mass_removal": "Wrath of God",
     "meld_pair": "Bruna, the Fading Light",
     "mill_makers": "Stitcher's Supplier",
@@ -295,6 +297,7 @@ _REAL_CASES: dict[str, str] = {
     "per_target_payoff": "Hinata, Dawn-Crowned",
     "permanent_etb": "Amareth, the Lustrous",
     "phasing_makers": "The War Doctor",
+    "pillowfort": "Ghostly Prison",
     "play_from_top": "Future Sight",
     "plus_one_makers": "Avenger of Zendikar",
     "plus_one_matters": "Mycoloth",
@@ -330,6 +333,7 @@ _REAL_CASES: dict[str, str] = {
     "self_counter_grow": "Adaptive Snapjaw",
     "self_death_payoff": "Kokusho, the Evening Star",
     "self_pump": "Shivan Dragon",
+    "self_recurring": "Bloodghast",
     "shield_counter_makers": "Boon of Safety",
     "snow_matters": "Diamond Faerie",
     "has_soulbond": "Flowering Lumberknot",
@@ -433,7 +437,7 @@ _REAL_CASES: dict[str, str] = {
 def test_every_case_key_is_served():
     """Every proven key must be in the served-key manifest — a case for a key the
     extractor cannot emit is a stale row, not coverage."""
-    from mtg_utils._deck_forge.lanes import SERVED_SIGNAL_KEYS
+    from mtg_utils._analysis.lanes import SERVED_SIGNAL_KEYS
 
     unserved = sorted(set(_REAL_CASES) - set(SERVED_SIGNAL_KEYS))
     assert not unserved, f"_REAL_CASES rows for unserved keys: {unserved}"
@@ -611,12 +615,11 @@ def test_blood_matters_fires_from_a_sacrificed_trigger_subject():
     assert "blood_matters" in keys
 
 
-def test_blood_makers_fires_from_a_recovered_choice_list_maker():
+def test_blood_makers_fires_from_a_choice_list_maker():
     """Token-subtype maker (choice list): Transmutation Font "create your choice of
     a Blood token, a Clue token, or a Food token" — the typed Token nodes live on
-    ChooseOneOf BRANCHES the concept decoration doesn't descend; served by the
-    gap-gated choice_list_token_maker_{blood,clue,food} bridges
-    (bridge_ledger.BRIDGES) until the overlay decorates branch effects."""
+    the controller's ChooseOneOf BRANCHES, which the shared effect walk reads (the
+    choice_list_token_maker_* bridges retired with that)."""
     keys = {s.key for s in test_signals("Transmutation Font")}
     assert "blood_makers" in keys
     assert "clue_makers" in keys
@@ -636,8 +639,8 @@ def test_blood_makers_fires_from_a_recovered_granted_ability_maker():
 def test_blood_makers_fires_from_a_create_x_unimplemented_residue():
     """Token-subtype maker (create-X residue): Odric, Blood-Cursed "create X Blood
     tokens, where X is the number of abilities ..." parks WHOLE as phase
-    Unimplemented('create'); recovery decorates make_token with an EMPTY subject —
-    the choice_list_token_maker_blood bridge's second match arm serves it."""
+    Unimplemented('create'); since phase v0.104.0 the make_token recovery arm of
+    _resource_token_makers reads "Blood" off the recovered clause."""
     keys = {s.key for s in test_signals("Odric, Blood-Cursed")}
     assert "blood_makers" in keys
 
@@ -1000,7 +1003,7 @@ def test_group_hug_draw_recovered_folded_each_player_scope_grothama():
 
 
 # ── lf_ramp (2026-07-13 signal-key convention change) ──────────────────────
-# Land-fetch-to-battlefield is RAMP, not tutor (mirrors card_classify.is_ramp;
+# Land-fetch-to-battlefield is RAMP, not tutor (the template's ramp convention;
 # CR 701.23/701.23a for the search action, CR 305.6 for the basics, CR 205.3i
 # for the full land-type vocabulary). Pinned against real snapshot records on
 # the production extract path (testkit.test_signals), per clause/mode:
@@ -1052,7 +1055,7 @@ def test_every_emitted_key_is_manifest_served():
     import json
     from pathlib import Path
 
-    from mtg_utils._deck_forge.lanes import SERVED_SIGNAL_KEYS
+    from mtg_utils._analysis.lanes import SERVED_SIGNAL_KEYS
     from mtg_utils.testkit import snapshot_path
 
     names = list(json.loads(Path(snapshot_path()).read_text())["cards"])

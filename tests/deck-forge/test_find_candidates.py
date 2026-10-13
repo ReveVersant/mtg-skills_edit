@@ -13,6 +13,7 @@ import re
 
 from mtg_utils._deck_forge import engine
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.testkit import test_card
 
 # A tiny searchable catalog. "Both" serves both the sacrifice and token lanes.
 CATALOG = [
@@ -121,14 +122,7 @@ def test_focused_avenue_credits_its_own_candidates():
     """A card surfaced BY the focused lane scores for it (synergy_fit >= 1 and the
     avenue label is in `served`) — otherwise it reads as an irrelevant zero-fit hit.
     Migrated from the deleted test_explore_credits_candidates_for_the_explored_avenue."""
-    manland = {
-        "name": "Treetop Village",
-        "type_line": "Land",
-        "cmc": 0.0,
-        "color_identity": ["G"],
-        "oracle_text": "This land enters tapped.\n{T}: Add {G}.\n{1}{G}: This land becomes a 3/3 green Ape creature with trample until end of turn. It's still a land. (It can deal excess combat damage to the player or planeswalker it's attacking.)",
-        "prices": {"usd": "0.50"},
-    }
+    manland = {**test_card("Treetop Village"), "prices": {"usd": "0.50"}}
     av = _avenue(
         "agent:1", "Creature-lands", "becomes a [^.]*creature", card_type="Land"
     )
@@ -179,6 +173,27 @@ def test_paper_only_propagates_to_search_for_commander():
     assert search.calls[-1]["paper_only"] is True
 
 
+def test_the_find_pool_follows_the_build_not_the_filter_format():
+    """ADR-0052: the candidate pool is the BUILD's — its format under its medium
+    (``Format.paper_only``). A format FILTER narrows legality; it never moves a paper
+    table onto Arena printings, or an Arena build onto paper ones."""
+
+    def pool(session_format, medium, filter_format):
+        search = _recording_search(CATALOG)
+        state = _state(search_fn=search)
+        engine.set_format(state, session_format)
+        engine.set_medium(state, medium)
+        engine.find_candidates(
+            state, engine.FindParams(type="Creature", format=filter_format)
+        )
+        return search.calls[-1]["paper_only"]
+
+    assert pool("historic_brawl", "paper", "historic_brawl") is True
+    assert pool("historic_brawl", "digital", "historic_brawl") is False
+    assert pool("historic_brawl", "paper", "commander") is True
+    assert pool("historic_brawl", "digital", "commander") is False
+
+
 # ── paging math over CandidatePage ────────────────────────────────────────────
 
 
@@ -212,33 +227,9 @@ def test_slice_paging_windows_the_ranked_pool():
 
 # ── staples lane (migrated from the deleted TestStaplesExploreEndpoint) ────────
 
-SOL_RING = {
-    "name": "Sol Ring",
-    "type_line": "Artifact",
-    "cmc": 1.0,
-    "color_identity": [],
-    "oracle_text": "{T}: Add {C}{C}.",
-    "prices": {"usd": "2.00"},
-    "legalities": {"commander": "legal"},
-}
-CULTIVATE = {
-    "name": "Cultivate",
-    "type_line": "Sorcery",
-    "cmc": 3.0,
-    "color_identity": ["G"],
-    "oracle_text": "Search your library for up to two basic land cards, reveal those cards, put one onto the battlefield tapped and the other into your hand, then shuffle.",
-    "prices": {"usd": "0.25"},
-    "legalities": {"commander": "legal"},
-}
-COUNTERSPELL = {
-    "name": "Counterspell",
-    "type_line": "Instant",
-    "cmc": 2.0,
-    "color_identity": ["U"],
-    "oracle_text": "Counter target spell.",
-    "prices": {"usd": "1.00"},
-    "legalities": {"commander": "legal"},
-}
+SOL_RING = {**test_card("Sol Ring"), "prices": {"usd": "2.00"}}
+CULTIVATE = {**test_card("Cultivate"), "prices": {"usd": "0.25"}}
+COUNTERSPELL = {**test_card("Counterspell"), "prices": {"usd": "1.00"}}
 GRUUL_COMMANDER = {
     "name": "Test Gruul Commander",
     "type_line": "Legendary Creature — Beast",

@@ -1,4 +1,4 @@
-"""Production wiring: build a ``ForgeState`` backed by real Scryfall bulk data.
+"""Production wiring: build a ``ForgeState`` from the one ``CardPool`` (ADR-0046).
 
 If no bulk data is on disk, the state degrades to an agent-less, search-disabled
 mode (``bulk_available=False``) so the hub still starts and the search endpoint can
@@ -8,111 +8,88 @@ fail loudly with a "run download-mtgjson" message rather than silently returning
 from __future__ import annotations
 
 import functools
-import os
+import json
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from mtg_utils import card_search, combo_search, mark_owned
+from mtg_utils import card_search, combo_search, mark_owned, ownership, theme_presets
 from mtg_utils._deck_forge import collection
 from mtg_utils._deck_forge.collection import CollectionStore
 from mtg_utils._deck_forge.persistence import BuildStore
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
-from mtg_utils._name_index import NameIndex, build_name_index, keep_cheaper
-from mtg_utils.bulk_loader import default_bulk_path, load_bulk_cards
-from mtg_utils.card_search import SKIP_LAYOUTS
+from mtg_utils._http import cache_root
+from mtg_utils.card_pool import CardPool, NoBulkError
 from mtg_utils.hydrated_deck import HydratedDeck
-from mtg_utils.names import build_name_alias_map
+
+#: The combo lookups this process has already made, by deck content — a Tune
+#: re-run on an unchanged deck (a rejected add, a changed budget) is a live
+#: Commander Spellbook call otherwise. Bounded; the oldest entry goes first.
+_COMBO_MEMO: dict[str, dict] = {}
+_COMBO_MEMO_SIZE = 16
+
+
+def warm_at_launch(
+    state: ForgeState, reporter: Callable[[str, str, int, int], None]
+) -> threading.Thread | None:
+    """Launch-time process wiring for the hub's long jobs: install ``reporter`` as
+    ``state.report_busy`` and as the signals-index build's process hook
+    (``signals_index.set_progress_hook`` — the deck-forge process has one state to
+    report into), then run the warm chain in a daemon thread — the signals-index
+    seed (the one-time build, or the sidecar load), then the commander-discovery
+    caches for the active Collection slot — so both happen while the builder reads
+    the page instead of inside their first Find or Commanders request. A request
+    that needs the index meanwhile waits on the same build
+    (``theme_presets._SEED_LOCK``). No bulk: nothing to warm. Returns the thread
+    (None without bulk) so a caller can join it."""
+    from mtg_utils._analysis import signals_index
+    from mtg_utils._deck_forge import discovery, engine
+
+    state.report_busy = reporter
+    signals_index.set_progress_hook(
+        functools.partial(
+            reporter, engine.SIGNALS_INDEX_JOB, engine.SIGNALS_INDEX_LABEL
+        )
+    )
+    if not state.bulk_available or state.bulk_path is None:
+        return None
+
+    def chain() -> None:
+        # Best effort, never fatal: a failure here costs the first request its
+        # head start, nothing more — say so and carry on to the next step.
+        try:
+            theme_presets.seed_signal_key_index(state.bulk_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"deck-forge: signals-index warm failed: {exc}", file=sys.stderr)
+        try:
+            discovery.warm(state, state.active_slot, fmt=state.session.format)
+        except Exception as exc:  # noqa: BLE001
+            print(f"deck-forge: discovery warm failed: {exc}", file=sys.stderr)
+
+    thread = threading.Thread(target=chain, name="deck-forge-warm", daemon=True)
+    thread.start()
+    return thread
 
 
 def _combos(deck: dict, by_name: Mapping[str, dict]) -> dict:
     # Build a HydratedDeck so combo_search can validate template requirements
     # (e.g. "a Persist Creature") against the deck — without records, near-miss
     # detection falls back to counting named cards only and over-reports near-misses.
-    return combo_search.combo_search(HydratedDeck.from_parsed(deck, by_name))
-
-
-def build_object_resolver(cards: list[dict]) -> Callable[[str], dict | None]:
-    """A name → card lookup for *folded objects* (ADR-0025): the Dungeon cards a
-    commander ventures into and the Emblem-typed objects it brings in (the Ring,
-    "The Ring // The Ring Tempts You"). These are deliberately excluded from
-    `build_by_name` (you can't add one to a deck), so signal-extraction folding needs
-    this separate raw-bulk lookup. Keyed by full name AND DFC front-face name, so a
-    rules-fixed fold can resolve "The Ring" / "Undercity". Tiny (~dozen objects)."""
-    # Meld results are addable legendary creatures (also in `by_name`), but the folder
-    # only gets THIS resolver, so index them here too — identified by appearing as a
-    # `meld_result` component in some card's all_parts (Bruna → Brisela).
-    meld_results = {
-        p.get("name")
-        for c in cards
-        if isinstance(c, dict)
-        for p in (c.get("all_parts") or [])
-        if p.get("component") == "meld_result" and p.get("name")
-    }
-    objects: dict[str, dict] = {}
-    for c in cards:
-        if not isinstance(c, dict):
-            continue
-        tl = (c.get("type_line") or "").lower()
-        name = c.get("name") or ""
-        if not name or (
-            "dungeon" not in tl and "emblem" not in tl and name not in meld_results
-        ):
-            continue
-        objects.setdefault(name, c)
-        objects.setdefault(name.split(" // ")[0], c)  # front-face: The Ring, Undercity
-    return objects.get
-
-
-def build_printings_index(
-    cards: list[dict],
-) -> tuple[dict[str, list[dict]], dict[str, dict]]:
-    """Index EVERY legal printing for the printing picker: ``oracle_id → [records]``
-    (newest set first) plus ``printing id → record``. Unlike ``build_by_name`` (which
-    folds to the cheapest printing), this keeps them all so a card's alternate sets/arts
-    are enumerable. Same prefilter as ``build_by_name`` (drop token/memorabilia/skip
-    layouts) so the picker only ever offers addable printings."""
-    by_oracle: dict[str, list[dict]] = {}
-    by_id: dict[str, dict] = {}
-    for card in cards:
-        if not isinstance(card, dict):
-            continue
-        if card.get("layout") in SKIP_LAYOUTS or card.get("set_type") in (
-            "token",
-            "memorabilia",
-        ):
-            continue
-        oracle_id, printing_id = card.get("oracle_id"), card.get("id")
-        if not oracle_id or not printing_id:
-            continue
-        by_oracle.setdefault(oracle_id, []).append(card)
-        by_id[printing_id] = card
-    for prints in by_oracle.values():
-        prints.sort(key=lambda r: r.get("released_at") or "", reverse=True)
-    return by_oracle, by_id
-
-
-def build_by_name(cards: list[dict]) -> NameIndex:
-    """Index real cards by name (NFKD-folded, every DFC face + Arena alias, via the
-    shared name-index core), deduped to the cheapest printing — so a searchable card is
-    always addable and hydrates with matching art/price. Folding makes lookups
-    case- and diacritic-robust, so this no longer needs proper-case keys to match
-    search output (which an earlier hand-rolled version did)."""
-    return build_name_index(
-        cards,
-        reduce=keep_cheaper,
-        prefilter=lambda card: (
-            card.get("layout") not in SKIP_LAYOUTS
-            and card.get("set_type") not in ("token", "memorabilia")
-        ),
-    )
+    key = json.dumps(deck, sort_keys=True, default=str)
+    hit = _COMBO_MEMO.get(key)
+    if hit is not None:
+        return hit
+    result = combo_search.combo_search(HydratedDeck.from_parsed(deck, by_name))
+    if len(_COMBO_MEMO) >= _COMBO_MEMO_SIZE:
+        del _COMBO_MEMO[next(iter(_COMBO_MEMO))]
+    _COMBO_MEMO[key] = result
+    return result
 
 
 def _deck_forge_dir() -> Path:
-    base = os.environ.get("MTG_SKILLS_CACHE_DIR")
-    root = Path(base) if base else Path.home() / ".cache" / "mtg-skills"
-    return root / "deck-forge"
+    return cache_root() / "deck-forge"
 
 
 def _builds_dir() -> Path:
@@ -170,7 +147,7 @@ def _ensure_sidecar(
     (stale on-disk version) exactly like the sidecar loader it wraps; a clean
     load means nothing to do. A build failure (no phase card-data reachable)
     warns loudly and returns ``False`` — NON-BLOCKING, never a hard crash."""
-    from mtg_utils._deck_forge.lanes import SERVED_SIGNAL_KEYS
+    from mtg_utils._analysis.lanes import SERVED_SIGNAL_KEYS
 
     try:
         loader()  # present + current version → nothing to do (idempotent)
@@ -254,7 +231,6 @@ def default_state(fmt: str = "commander") -> ForgeState:
     store = BuildStore(_builds_dir())
     session, build_id, build_name = resume_or_new(store, fmt)
     collection_store = CollectionStore(_deck_forge_dir() / "collection.json")
-    bulk_path = default_bulk_path()
     by_name: Mapping[str, dict] = {}
     search = _no_search
     available = False
@@ -265,20 +241,28 @@ def default_state(fmt: str = "commander") -> ForgeState:
     # flavor_name aliases (ADR-0018). Empty without bulk → DFC-only matching (fine).
     name_aliases: dict[str, str] = {}
     unreleased_ids: frozenset[str] = frozenset()
-    if bulk_path is not None and bulk_path.exists():
-        cards = load_bulk_cards(bulk_path)
-        by_name = build_by_name(cards)
-        object_resolver = build_object_resolver(cards)
-        printings_by_oracle, printing_by_id = build_printings_index(cards)
+    bulk_path: Path | None = None
+    try:
+        # ONE owner of the bulk and every index over it (ADR-0046); the state's
+        # fields below are its projections, so app.py / engine.py read as before.
+        pool = CardPool.load()
+    except NoBulkError:
+        pool = None
+    if pool is not None and pool.path is not None:
+        bulk_path = pool.path
+        by_name = pool.by_name
+        object_resolver = pool.resolve_object
+        printings_by_oracle = pool.printings_by_oracle
+        printing_by_id = pool.printing_by_id
         # Shares card_search's (path, mtime) memo, so the Find surface's first
         # include-unreleased request doesn't pay a second whole-bulk pass.
-        unreleased_ids = card_search.unreleased_ids_for(bulk_path, cards)
+        unreleased_ids = pool.unreleased_ids
 
         # partial keeps search_cards's typed keyword signature (a `**kwargs:
         # object` wrapper would widen every arg to `object` and fail the checker).
         search = functools.partial(card_search.search_cards, bulk_path)
 
-        name_aliases = build_name_alias_map(bulk_path)
+        name_aliases = pool.name_aliases
         available = True
 
     collections, collection_index = _load_collections(collection_store, name_aliases)
@@ -286,7 +270,7 @@ def default_state(fmt: str = "commander") -> ForgeState:
     # collection.json saved before printing-awareness — simply contribute nothing,
     # so old files load as name-only ownership with no printing marks.
     collection_printings = {
-        slot: collection.printing_index(pile) for slot, pile in collections.items()
+        slot: ownership.printing_index(pile) for slot, pile in collections.items()
     }
 
     return ForgeState(

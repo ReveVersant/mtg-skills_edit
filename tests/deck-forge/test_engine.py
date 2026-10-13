@@ -5,35 +5,21 @@ partner-slot scoping, the snapshot composition) are now testable through a plain
 ``ForgeState`` instead of only through ``TestClient(build_app(state)).get(...)``.
 """
 
-from pathlib import Path
-
 from mtg_utils._deck_forge import engine
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.testkit import test_card
 
-ISHAI = {
-    "name": "Ishai, Ojutai Dragonspeaker",
-    "type_line": "Legendary Creature — Bird Monk",
-    "cmc": 2.0,
-    "color_identity": ["W", "U"],
-    "oracle_text": "Flying\nWhenever an opponent casts a spell, put a +1/+1 counter on Ishai.\nPartner (You can have two commanders if both have partner.)",
-    "legalities": {"commander": "legal"},
-}
-ATRAXA = {
-    "name": "Atraxa, Praetors' Voice",
-    "type_line": "Legendary Creature — Phyrexian Angel Horror",
-    "cmc": 4.0,
-    "color_identity": ["W", "U", "B", "G"],
-    "oracle_text": "Flying, vigilance, deathtouch, lifelink\nAt the beginning of your end step, proliferate. (Choose any number of permanents and/or players, then give each another counter of each kind already there.)",
-    "legalities": {"commander": "legal"},
-}
-FOREST = {
-    "name": "Forest",
-    "type_line": "Basic Land — Forest",
-    "cmc": 0.0,
-    "color_identity": ["G"],
-    "oracle_text": "({T}: Add {G}.)",
-}
-INDEX = {c["name"]: c for c in (ISHAI, ATRAXA, FOREST)}
+
+def _index() -> dict:
+    # Fetched per state, not at import: test_card re-seeds a card's trees, and a
+    # suite-wide cache clear between import and test would otherwise leave the
+    # partner read (phase's Partner keyword) with no trees.
+    cards = (
+        test_card("Ishai, Ojutai Dragonspeaker"),
+        test_card("Atraxa, Praetors' Voice"),
+        test_card("Forest"),
+    )
+    return {c["name"]: c for c in cards}
 
 
 def _state(commanders=(), cards=()):
@@ -42,7 +28,7 @@ def _state(commanders=(), cards=()):
         session.add(c, 1, zone="commanders")
     for name, qty in cards:
         session.add(name, qty)
-    return ForgeState(by_name=INDEX, search_fn=lambda **_: [], session=session)
+    return ForgeState(by_name=_index(), search_fn=lambda **_: [], session=session)
 
 
 def test_hydrate_joins_session_to_records():
@@ -111,9 +97,7 @@ def test_snapshot_composes_expected_keys():
 def test_legality_warnings_flags_too_many_cards():
     # commander target is 100; 1 commander + 100 mainboard copies = 101 > 100.
     st = _state(commanders=["Atraxa, Praetors' Voice"], cards=[("Forest", 100)])
-    warns = engine.legality_warnings(
-        engine.hydrate_session(st), max_cards=st.session.deck_size
-    )
+    warns = engine.legality_warnings(engine.hydrate_session(st))
     cats = {w["category"] for w in warns}
     assert "deck_maximum" in cats
     assert any("101" in w["message"] for w in warns)
@@ -126,9 +110,7 @@ def test_legality_warnings_flags_unimported_cards():
         commanders=["Atraxa, Praetors' Voice"],
         cards=[("Definitely Not A Real Card", 1)],
     )
-    warns = engine.legality_warnings(
-        engine.hydrate_session(st), max_cards=st.session.deck_size
-    )
+    warns = engine.legality_warnings(engine.hydrate_session(st))
     cats = {w["category"] for w in warns}
     assert "unimported" in cats
     assert any("Definitely Not A Real Card" in w["message"] for w in warns)
@@ -136,9 +118,7 @@ def test_legality_warnings_flags_unimported_cards():
 
 def test_legality_warnings_clean_deck_has_no_size_or_import_warnings():
     st = _state(commanders=["Atraxa, Praetors' Voice"], cards=[("Forest", 10)])
-    warns = engine.legality_warnings(
-        engine.hydrate_session(st), max_cards=st.session.deck_size
-    )
+    warns = engine.legality_warnings(engine.hydrate_session(st))
     cats = {w["category"] for w in warns}
     assert "deck_maximum" not in cats
     assert "unimported" not in cats
@@ -157,77 +137,11 @@ def test_explore_filters_respects_avenue_color_identity():
     assert fallback["color_identity"] == "G"
 
 
-# ── task #90: _signal_freq reads the persisted whole-pool signals index ──────
-
-
-def _commander_state(bulk_path=None):
-    commander_rec = {
-        "name": "Fake Commander",
-        "type_line": "Legendary Creature — Human",
-        "cmc": 2.0,
-        "color_identity": ["G"],
-        "oracle_text": "",
-        "legalities": {"commander": "legal"},
-        "oracle_id": "oid-fake-cmd",
-    }
-    return ForgeState(
-        by_name={"Fake Commander": commander_rec},
-        search_fn=lambda **_: [],
-        session=DeckSession("commander"),
-        bulk_path=bulk_path,
+def test_explore_filters_carry_the_partner_predicate():
+    # The partner avenue's search is a partner predicate, forwarded to card_search.
+    filters = engine.explore_filters(
+        {"color_identity": "WUBRG", "partner_of": [["plain", ""]]},
+        color_identity="G",
+        fmt="commander",
     )
-
-
-def test_signal_freq_reads_persisted_index_without_live_compute(monkeypatch):
-    st = _commander_state(bulk_path=Path("/fake/AllPrintings.json"))
-    fake_index = {"oid-fake-cmd": ("ramp|you|",)}
-    monkeypatch.setattr(
-        "mtg_utils._deck_forge.signals_index.load_signals_index",
-        lambda path: fake_index if path == st.bulk_path else None,
-    )
-
-    def boom(_rec, *_args, **_kwargs):
-        raise AssertionError("must not live-compute when the sidecar covers this oid")
-
-    monkeypatch.setattr("mtg_utils._deck_forge.engine.extract_signals", boom)
-
-    freq, total = engine._signal_freq(st)
-    assert total == 1
-    assert freq == {("ramp", ""): 1}
-
-
-def test_signal_freq_falls_back_to_live_compute_without_a_sidecar(monkeypatch):
-    st = _commander_state(bulk_path=None)  # no bulk -> load_signals_index(None) -> None
-
-    def fake_extract(rec, *_args, **_kwargs):
-        from mtg_utils._deck_forge.signals import Signal
-
-        return [Signal("ramp", "you", "", "", rec.get("name", ""), "high")]
-
-    # engine.py imports extract_signals by name at module load (bound into
-    # engine's own namespace via `_signals`), so the patch target is engine's
-    # imported name, not signals.py's — unlike signals_index.py's lazy import.
-    monkeypatch.setattr("mtg_utils._deck_forge.engine.extract_signals", fake_extract)
-
-    freq, total = engine._signal_freq(st)
-    assert total == 1
-    assert freq == {("ramp", ""): 1}
-
-
-def test_signal_freq_caches_per_format_on_state(monkeypatch):
-    st = _commander_state(bulk_path=None)
-    calls = []
-
-    def fake_extract(rec, *_args, **_kwargs):
-        from mtg_utils._deck_forge.signals import Signal
-
-        calls.append(rec["name"])
-        return [Signal("ramp", "you", "", "", rec.get("name", ""), "high")]
-
-    # engine.py imports extract_signals by name at module load (bound into
-    # engine's own namespace via `_signals`), so the patch target is engine's
-    # imported name, not signals.py's — unlike signals_index.py's lazy import.
-    monkeypatch.setattr("mtg_utils._deck_forge.engine.extract_signals", fake_extract)
-    engine._signal_freq(st)
-    engine._signal_freq(st)
-    assert calls == ["Fake Commander"]  # second call served from state cache
+    assert filters["partner_of"] == [["plain", ""]]

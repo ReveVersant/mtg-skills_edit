@@ -5,17 +5,24 @@
   // Type/CMC/Price chips facet the returned list client-side (instant, no round-trip).
   import { onMount } from "svelte";
   import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
   import {
-    applySnapshot,
     deck,
     avenues,
     isDigital,
     partnerOpen,
+    hasCommander,
+    deckColors,
+    poolBounded,
+    pool,
+    metaArchetype,
   } from "../lib/store.js";
   import { facetOk } from "../lib/filter.js";
+  import { heldCopies, canHoldAnother } from "../lib/cards.js";
   import CardTile from "./CardTile.svelte";
   import Mana from "./Mana.svelte";
   import FilterWidget from "./FilterWidget.svelte";
+  import PresetPicker from "./PresetPicker.svelte";
 
   const PIPS = ["W", "U", "B", "R", "G", "C"];
   const PAGE = 60;
@@ -49,8 +56,6 @@
   let includeUnreleased = false;
   let allPresets = [];
   let selectedPresets = new Set();
-  let presetsOpen = false;
-  let presetFilter = ""; // narrows the 138-preset list inside the dropdown (client-side)
   let advanced = false;
 
   // client-side facets (narrow the returned list without a round-trip)
@@ -104,6 +109,9 @@
       presets: [...selectedPresets],
       is_commander: commandersOnly,
       include_unreleased: includeUnreleased,
+      // ADR-0059: the archetype Tune reads; its card share breaks synergy ties on a
+      // digital build.
+      meta_archetype: $metaArchetype || null,
       limit: PAGE,
       offset: off,
     };
@@ -112,6 +120,7 @@
   async function run() {
     loading = true;
     error = "";
+    addError = ""; // a refusal from the previous result set is stale now
     ran = true;
     const r = await api.find(payload(0));
     loading = false;
@@ -138,20 +147,27 @@
     }
   }
 
+  // A refused add (a copy limit, a zone the format lacks) carries the hub's rule
+  // text; show it rather than letting the click do nothing.
+  let addError = "";
   async function add(cardName, zone) {
-    const r = await api.add(cardName, zone, 1);
-    if (r.ok) applySnapshot(r.data);
+    addError = await tryAdd(cardName, zone);
   }
 
   // A5: with an active commander, lock the pips to its color identity — you can't run an
   // off-identity card. Colorless ({C}) is always legal (empty identity ⊆ any). The lock
   // lifts when a partner slot is open (a 2nd commander can widen identity) or when you're
-  // explicitly searching the commander pool (commandersOnly) for that partner.
+  // explicitly searching the commander pool (commandersOnly) for that partner. A
+  // format with no command zone has no identity rule: the pips never lock (the
+  // deck's colors are a caption, a splash is the builder's call).
   $: identityColors = new Set(
     ($deck.commanders || []).flatMap((c) => c.color_identity || []),
   );
   $: colorLocked =
-    ($deck.commanders || []).length > 0 && !$partnerOpen && !commandersOnly;
+    $hasCommander &&
+    ($deck.commanders || []).length > 0 &&
+    !$partnerOpen &&
+    !commandersOnly;
   function colorAllowed(c) {
     return !colorLocked || c === "C" || identityColors.has(c);
   }
@@ -174,10 +190,6 @@
     colors.has(c) ? colors.delete(c) : colors.add(c);
     colors = new Set(colors);
   }
-  function togglePreset(n) {
-    selectedPresets.has(n) ? selectedPresets.delete(n) : selectedPresets.add(n);
-    selectedPresets = new Set(selectedPresets);
-  }
   function clearName() {
     name = "";
     nameInput?.focus();
@@ -197,31 +209,18 @@
     facetRarity = "";
     facetOwned = false;
   }
-  // The 138-preset list, narrowed live by the in-dropdown filter (matches name OR
-  // description, so "sacrifice" surfaces edict/exploit presets by their blurb too).
-  $: filteredPresets = presetFilter.trim()
-    ? allPresets.filter((p) => {
-        const q = presetFilter.toLowerCase();
-        return (
-          p.name.toLowerCase().includes(q) ||
-          (p.description || "").toLowerCase().includes(q)
-        );
-      })
-    : allPresets;
 
-  // Singleton: drop a card the instant it's added, plus apply the client facets.
-  $: inDeck = new Set(
-    [...$deck.commanders, ...$deck.cards, ...$deck.sideboard].map(
-      (c) => c.name,
-    ),
-  );
+  // Drop a card once the deck holds every copy it may (a singleton's one, a 4-of's
+  // four, a basic's never — the row's served copy limit, the hub's own Find rule),
+  // plus the client facets.
+  $: copies = heldCopies($deck);
   // Apply the shared client facets (lib/filter.js). The facet values are read into the
   // inline object HERE (not closed over) ON PURPOSE: Svelte's dependency analysis
   // traverses the inline arrow in the reactive statement, so referencing the facets here
   // makes `visible` recompute on every facet toggle (not only on Find/add).
   $: visible = results.filter(
     (c) =>
-      !inDeck.has(c.name) &&
+      canHoldAnother(c, copies.get(c.name) || 0) &&
       facetOk(
         c,
         {
@@ -284,6 +283,23 @@
           title="Exact colors — match this color identity exactly, no broader pools"
           on:click={() => (exactColors = !exactColors)}>⊜ Exact</button
         >
+        {#if $poolBounded}
+          <span
+            class="deckcolors"
+            title="A sealed / draft build searches only its opened pool"
+            >pool: {$pool?.size ?? 0} cards</span
+          >
+        {/if}
+        {#if !$hasCommander && $deckColors}
+          <span
+            class="deckcolors"
+            title="The colors your deck casts — lane searches are scoped to them; a splash is your call"
+            >deck: {#each [...$deckColors] as c (c)}<Mana
+                sym={c}
+                size="0.9rem"
+              />{/each}</span
+          >
+        {/if}
       </div>
       <button class="btn btn-ember go" type="submit" disabled={loading}>
         {loading ? "…" : "⚒ Find"}
@@ -303,68 +319,13 @@
         >
         <div class="field">
           <span class="lbl">Theme presets</span>
-          {#if selectedPresets.size}
-            <div class="selchips">
-              {#each [...selectedPresets] as n (n)}
-                <button
-                  type="button"
-                  class="selchip"
-                  title="Remove {n}"
-                  on:click={() => togglePreset(n)}>{n} <em>✕</em></button
-                >
-              {/each}
-              <button
-                type="button"
-                class="clearpresets"
-                on:click={() => (selectedPresets = new Set())}>clear all</button
-              >
-            </div>
-          {/if}
-          <div class="presets">
-            <button
-              class="dropbtn"
-              type="button"
-              on:click={() => (presetsOpen = !presetsOpen)}
-            >
-              {selectedPresets.size
-                ? `${selectedPresets.size} selected — add more`
-                : "Choose theme presets"} ▾
-            </button>
-            {#if presetsOpen}
-              <div class="dropdown">
-                <input
-                  class="presearch"
-                  type="search"
-                  placeholder="Filter {allPresets.length} presets…"
-                  bind:value={presetFilter}
-                />
-                <div class="optlist">
-                  {#each filteredPresets as p (p.name)}
-                    <label class="opt" class:sel={selectedPresets.has(p.name)}>
-                      <input
-                        type="checkbox"
-                        checked={selectedPresets.has(p.name)}
-                        on:change={() => togglePreset(p.name)}
-                      />
-                      <span class="opt-text">
-                        <span class="opt-name">{p.name}</span>
-                        <span class="opt-desc">{p.description}</span>
-                      </span>
-                    </label>
-                  {/each}
-                  {#if !filteredPresets.length}
-                    <div class="opt-empty">
-                      No preset matches “{presetFilter}”.
-                    </div>
-                  {/if}
-                </div>
-              </div>
-            {/if}
-          </div>
+          <PresetPicker presets={allPresets} bind:selected={selectedPresets} />
         </div>
-        <label class="check">
-          <input type="checkbox" bind:checked={commandersOnly} /> commanders only
-        </label>
+        {#if $hasCommander}
+          <label class="check">
+            <input type="checkbox" bind:checked={commandersOnly} /> commanders only
+          </label>
+        {/if}
         <!-- Re-runs on change (unlike the refining controls, which wait for submit):
              this widens the pool, so the effect is invisible until the list refreshes. -->
         <label
@@ -388,6 +349,10 @@
       >
       {#each focused as a (a.id)}<span class="ftag">{a.label}</span>{/each}
     </div>
+  {/if}
+
+  {#if addError}
+    <div class="adderr">{addError}</div>
   {/if}
 
   {#if results.length}
@@ -463,6 +428,20 @@
 </div>
 
 <style>
+  .adderr {
+    color: var(--fail);
+    font-size: 0.8rem;
+    margin: 0.3rem 0;
+  }
+  .deckcolors {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    margin-left: 0.4rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
   .find {
     padding: 1rem;
     height: 100%;
@@ -650,137 +629,6 @@
   }
   .lbl {
     font-size: 0.7rem;
-  }
-  /* selected presets surface as removable chips, visible without opening the list */
-  .selchips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-    text-transform: none;
-    letter-spacing: 0;
-  }
-  .selchip {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    font-size: 0.74rem;
-    color: var(--brass-bright);
-    background: rgba(200, 150, 75, 0.16);
-    border: 1px solid var(--brass);
-    border-radius: 999px;
-    padding: 0.12rem 0.55rem;
-    cursor: pointer;
-  }
-  .selchip em {
-    font-style: normal;
-    color: var(--parchment-dim);
-  }
-  .selchip:hover {
-    background: rgba(212, 69, 47, 0.25);
-    border-color: rgba(212, 69, 47, 0.6);
-    color: var(--parchment);
-  }
-  .clearpresets {
-    font-size: 0.72rem;
-    color: var(--muted);
-    background: none;
-    border: none;
-    text-decoration: underline;
-    cursor: pointer;
-    padding: 0.12rem 0.3rem;
-  }
-  .clearpresets:hover {
-    color: var(--parchment-dim);
-  }
-  .presets {
-    position: relative;
-  }
-  .dropbtn {
-    width: 100%;
-    text-align: left;
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--hairline-soft);
-    border-radius: var(--radius);
-    color: var(--parchment);
-    padding: 0.4rem 0.5rem;
-    font-size: 0.82rem;
-    text-transform: none;
-    letter-spacing: 0;
-  }
-  .dropdown {
-    position: absolute;
-    z-index: 30;
-    top: 110%;
-    left: 0;
-    right: 0;
-    background: linear-gradient(180deg, var(--panel-2), var(--panel));
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    padding: 0.35rem;
-  }
-  /* search pinned above the scrolling list so 138 presets are findable, not scrolled */
-  .presearch {
-    width: 100%;
-    box-sizing: border-box;
-    background: rgba(0, 0, 0, 0.4);
-    border: 1px solid var(--hairline-soft);
-    border-radius: var(--radius);
-    color: var(--parchment);
-    padding: 0.4rem 0.5rem;
-    font-size: 0.82rem;
-    margin-bottom: 0.35rem;
-  }
-  .presearch:focus {
-    outline: none;
-    border-color: var(--brass);
-  }
-  .optlist {
-    max-height: 260px;
-    overflow-y: auto;
-  }
-  .opt {
-    display: flex;
-    flex-direction: row;
-    align-items: flex-start;
-    gap: 0.45rem;
-    padding: 0.3rem 0.35rem;
-    border-radius: var(--radius);
-    text-transform: none;
-    letter-spacing: 0;
-    color: var(--parchment);
-  }
-  .opt:hover {
-    background: rgba(255, 220, 160, 0.06);
-  }
-  .opt.sel {
-    background: rgba(200, 150, 75, 0.12);
-  }
-  .opt input {
-    width: auto;
-    margin-top: 0.18rem;
-  }
-  .opt-text {
-    display: flex;
-    flex-direction: column;
-    gap: 0.05rem;
-    min-width: 0;
-  }
-  .opt-name {
-    font-size: 0.82rem;
-    color: var(--parchment);
-  }
-  .opt-desc {
-    font-size: 0.7rem;
-    line-height: 1.25;
-    color: var(--muted);
-  }
-  .opt-empty {
-    padding: 0.5rem 0.4rem;
-    font-size: 0.78rem;
-    color: var(--muted);
-    text-transform: none;
-    letter-spacing: 0;
   }
   /* focused-lanes echo */
   .focusbar {

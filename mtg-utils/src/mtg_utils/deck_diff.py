@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from pathlib import Path
 
 import click
 
 from mtg_utils.deck import accumulate_deck_metrics
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
 from mtg_utils.hydrated_deck import HydratedDeck
 
 
@@ -34,11 +34,12 @@ def _build_sideboard_qty(deck: dict) -> dict[str, int]:
 
 
 def _compute_stats(
-    name_qty: dict[str, int], by_name: Mapping[str, dict]
+    hd: HydratedDeck, name_qty: dict[str, int]
 ) -> tuple[int, float, int, int]:
     """Compute count, avg_cmc, land_count, ramp_count."""
     m = accumulate_deck_metrics(
-        (qty, by_name.get(name)) for name, qty in name_qty.items()
+        ((qty, hd.by_name.get(name)) for name, qty in name_qty.items()),
+        deck_mana=hd.deck_mana,
     )
     return m["total"], round(m["avg_cmc"], 2), m["land_count"], m["ramp_count"]
 
@@ -70,11 +71,9 @@ def deck_diff(old: HydratedDeck, new: HydratedDeck) -> dict:
     added, removed = _diff_card_lists(old_qty, new_qty)
 
     count_before, avg_cmc_before, land_before, ramp_before = _compute_stats(
-        old_qty, old.by_name
+        old, old_qty
     )
-    count_after, avg_cmc_after, land_after, ramp_after = _compute_stats(
-        new_qty, new.by_name
-    )
+    count_after, avg_cmc_after, land_after, ramp_after = _compute_stats(new, new_qty)
 
     result = {
         "added": added,
@@ -106,16 +105,10 @@ def deck_diff(old: HydratedDeck, new: HydratedDeck) -> dict:
 @click.command()
 @click.argument("old_deck_path", type=click.Path(exists=True, path_type=Path))
 @click.argument("new_deck_path", type=click.Path(exists=True, path_type=Path))
-@click.argument("old_hydrated_path", type=click.Path(exists=True, path_type=Path))
-@click.argument("new_hydrated_path", type=click.Path(exists=True, path_type=Path))
-def main(
-    old_deck_path: Path,
-    new_deck_path: Path,
-    old_hydrated_path: Path,
-    new_hydrated_path: Path,
-) -> None:
+@bulk_data_option
+def main(old_deck_path: Path, new_deck_path: Path, bulk_data: Path | None) -> None:
     """Compare two deck lists and compute impact metrics."""
-    old = HydratedDeck.from_paths(old_deck_path, old_hydrated_path)
-    new = HydratedDeck.from_paths(new_deck_path, new_hydrated_path)
+    old = acquire_for_cli(old_deck_path, bulk_data)
+    new = acquire_for_cli(new_deck_path, bulk_data)
     result = deck_diff(old, new)
     click.echo(json.dumps(result, indent=2))

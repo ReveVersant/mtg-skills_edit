@@ -1,11 +1,12 @@
 """Stage-2 gate for the Layer-2 concept overlay + first concept batch (ADR-0035).
 
 The crosswalk is ADDITIVE — nothing in production reads it; these tests are the
-shipped deliverable. They run CI-safe off two committed fixtures
-(``crosswalk_fixture_cards.json`` = a curated slice of phase ``card-data.json``
-records, ``phase_mirror_schema.json`` = the generated mirror schema): strict-load
-each record → build the concept overlay → derive the ported Signals — with **no**
-bulk / sidecar / phase / network.
+shipped deliverable. They run CI-safe off the committed card snapshot (each card's
+raw phase ``card-data.json`` face records, served by ``testkit.test_phase_records``
+— ADR-0056 merged the suite's own ``crosswalk_fixture_cards.json`` into it) and the
+committed mirror schema (``phase_mirror_schema.json``): strict-load each record →
+build the concept overlay → derive the ported Signals — with **no** bulk / sidecar /
+phase / network.
 
 The baked granularity fixtures are load-bearing: a flat-overlay regression (one
 that collapsed the per-ability / whole-card join structure) fails these loud.
@@ -23,21 +24,30 @@ that collapsed the per-ability / whole-card join structure) fails these loud.
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from functools import lru_cache
-from pathlib import Path
 
 import pytest
 
+from mtg_utils._analysis.lanes import (
+    SERVED_SIGNAL_KEYS,
+    extract_crosswalk_signals,
+)
+from mtg_utils._analysis.signal_trees import as_signal_tree
+from mtg_utils._card_ir.branches import apply_misreads
 from mtg_utils._card_ir.crosswalk import (
+    CIRCLED_COLORS_RESIDUE,
     OTHER,
+    PARTNER_GROUPS_PHASE_COLLAPSES,
+    UNPARSED_ACTIVATION_GATE,
     AbilityUnit,
     ConceptTree,
     build_concept_tree,
+    lost_pile_count,
+    tag_of,
 )
 from mtg_utils._card_ir.mirror import strict_load_card
-from mtg_utils._card_ir.mirror.build import fixtures_dir, load_committed_schema
+from mtg_utils._card_ir.mirror.build import load_committed_schema
 from mtg_utils._card_ir.overlay_corrections import (
     SubstratePurityError,
     _assert_substrate_pure,
@@ -46,34 +56,32 @@ from mtg_utils._card_ir.overlay_corrections import (
     apply_overlay_corrections,
     l1_bytes,
 )
-from mtg_utils._deck_forge.lanes import (
-    SERVED_SIGNAL_KEYS,
-    extract_crosswalk_signals,
-)
-
-FIXTURE = "crosswalk_fixture_cards.json"
+from mtg_utils._card_ir.trees import _text_only_trees, trees_for
+from mtg_utils.testkit import snapshot_records, test_card, test_phase_records
 
 
-@lru_cache(maxsize=1)
-def _fixture() -> dict:
-    path = fixtures_dir() / FIXTURE
-    if not path.exists():
-        pytest.skip(f"{FIXTURE} not present")
-    return json.loads(Path(path).read_text())
-
-
-def _cards() -> dict[str, dict]:
-    return _fixture()["cards"]
+def _record(name: str, face: str | None = None) -> dict:
+    """The raw phase face record a test reads for *name*: the record for *face*
+    when given, else the record named *name* (a single-face card, or one face of
+    a multi-face card named by that face — ``"Howlpack Alpha"``), else the front
+    face of an ``"A // B"`` name. *face* is for a back face whose own name is
+    another real card's (``Yavimaya Bloomsage // Channel``'s "Channel")."""
+    records = test_phase_records(name)
+    for want in (face or name, name.split(" // ", maxsplit=1)[0]):
+        for rec in records:
+            if rec.get("name") == want:
+                return rec
+    raise KeyError(f"no phase record for face {face or name!r} of {name!r}")
 
 
 def _kw(name: str) -> frozenset[str]:
     """The card's real Scryfall keyword array (the mill_makers field-lookup source).
 
-    Not in the phase typed substrate (phase carries no ``Mill`` keyword), so the
-    fixture stores it alongside the phase records — the shadow diff reads the same
-    array off the bulk record. Absent == no keywords.
+    Not in the phase typed substrate (phase carries no ``Mill`` keyword), so it
+    comes off the card's snapshot record — the same array production reads off
+    the bulk record. Absent == no keywords.
     """
-    return frozenset(_fixture().get("scryfall_keywords", {}).get(name, ()))
+    return frozenset(test_card(name).get("keywords") or ())
 
 
 @lru_cache(maxsize=1)
@@ -81,21 +89,51 @@ def _schema():
     return load_committed_schema()
 
 
-def _tree(name: str) -> ConceptTree:
-    rec = _cards()[name]
-    root = strict_load_card(rec, _schema(), name=name)
-    return build_concept_tree(root, name=name)
+def _raw_tree(name: str, face: str | None = None) -> ConceptTree:
+    """The RAW overlay tree (no corrections, no synthesis) — for the tests OF the
+    correction stage itself."""
+    rec = apply_misreads(_record(name, face))  # as ``trees.face_tree`` loads it
+    root = strict_load_card(rec, _schema(), name=rec["name"])
+    return build_concept_tree(root, name=rec["name"])
 
 
-def _idents(name: str) -> set[tuple[str, str, str]]:
+def _tree(name: str, face: str | None = None) -> ConceptTree:
+    """The SIGNAL tree for a card's face (ADR-0047: corrections + synthesis applied
+    once, at the seam the lanes read — a lane never re-applies a stage)."""
+    return as_signal_tree(_raw_tree(name, face))
+
+
+def _idents(name: str, face: str | None = None) -> set[tuple[str, str, str]]:
     return {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(_tree(name), keywords=_kw(name))
+        for s in extract_crosswalk_signals(_tree(name, face), keywords=_kw(name))
     }
 
 
-def _keys(name: str) -> set[str]:
-    return {k for k, _s, _su in _idents(name)}
+def _keys(name: str, face: str | None = None) -> set[str]:
+    return {k for k, _s, _su in _idents(name, face)}
+
+
+def _text_only_face_tree(name: str, face: str) -> ConceptTree:
+    """The W2c text-only tree production builds for *name*'s phase-missing *face*
+    (an Aftermath back half phase never emits a record for): the real card's
+    bulk face through ``_text_only_trees``, against the real phase records — so
+    the face text, mana cost and oracle_id are the card's, never typed in."""
+    record = test_card(name)
+    trees = _text_only_trees(
+        record, tuple(test_phase_records(name)), oracle_id=record["oracle_id"]
+    )
+    (tree,) = (t for t in trees if t.name == face)
+    return tree
+
+
+def _corpus() -> list[tuple[str, dict]]:
+    """Every raw phase face record in the snapshot, with its card's name."""
+    return [
+        (record["name"], rec)
+        for record in snapshot_records()
+        for rec in test_phase_records(record["name"])
+    ]
 
 
 # ── framework: tree-preserving overlay + lossless "other" ─────────────────────
@@ -111,7 +149,7 @@ def test_overlay_is_tree_preserving_with_typed_units():
         # the unit carries the verbatim typed node (round-trips losslessly)
         assert (
             unit.node.to_dict()
-            == _cards()["Krenko, Mob Boss"][
+            == _record("Krenko, Mob Boss")[
                 {
                     "ability": "abilities",
                     "trigger": "triggers",
@@ -566,7 +604,7 @@ def test_token_maker_directed_controller_grant_shed():
     ("name", "should_fire"),
     [
         ("The Locust God", True),  # "whenever you draw a card" — Drawn trigger
-        ("A-Orcish Bowmasters", False),  # opponent-draw punisher — not draw_matters
+        ("Orcish Bowmasters", False),  # opponent-draw punisher — not draw_matters
         ("Mulldrifter", False),  # self-ETB value, no draw trigger
     ],
 )
@@ -596,8 +634,21 @@ def test_death_matters_excludes_self_and_nondeath(name):
     assert "death_matters" not in _keys(name)
 
 
-def test_extra_turns_fires():
-    assert ("extra_turns", "you", "") in _idents("Time Warp")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Time Warp",
+        "Expropriate",  # a vote's per-choice branch
+        "Stitch in Time",  # a coin flip's win branch
+        # ControlNextTurn's grant_extra_turn_after: "After that turn, that player
+        # takes an extra turn" (its rulings: each cast creates an extra turn,
+        # CR 500.7).
+        "Emrakul, the Promised End",
+        "Timesifter",  # the timesifter_unbound_extra_turn ledger bridge
+    ],
+)
+def test_extra_turns_fires(name):
+    assert ("extra_turns", "you", "") in _idents(name)
 
 
 @pytest.mark.parametrize(
@@ -614,7 +665,7 @@ def test_own_lifelink_keyword_fires_lifegain_makers():
     # _signals_ir._IR_KEYWORD_MAP["lifelink"]) — the _lifegain_makers typed lane
     # reads only gain_life effects + GRANTED lifelink, so a vanilla-lifelink
     # creature (no grant node) needed this keyword row.
-    from mtg_utils._deck_forge.lanes import _keyword_field_signals
+    from mtg_utils._analysis.lanes import _keyword_field_signals
 
     sigs = _keyword_field_signals(frozenset({"Lifelink"}), "Aerial Responder")
     assert ("lifegain_makers", "you", "") in {(s.key, s.scope, s.subject) for s in sigs}
@@ -850,7 +901,7 @@ def test_blink_flicker_maker_signal_is_always_high_confidence():
     """The MAKER lane (:func:`_blink_flicker`) only ever emits HIGH — the
     task #83 blink preset view's discriminator (:func:`blink_flicker_is_maker`)
     depends on this."""
-    from mtg_utils._deck_forge.lanes import blink_flicker_is_maker
+    from mtg_utils._analysis.lanes import blink_flicker_is_maker
 
     sigs = [
         s
@@ -871,21 +922,13 @@ def test_blink_flicker_membership_floor_payoff_is_low_and_not_a_maker():
     ``blink_flicker`` for it). ``blink_flicker_is_maker`` correctly rejects
     the floor's LOW signal — this is the task #83 'blink' preset payoff
     noise (prec .06 in the raw corpus scan), not a maker."""
-    from mtg_utils._deck_forge.lanes import (
+    from mtg_utils._analysis.lanes import (
         apply_membership_floor,
         blink_flicker_is_maker,
     )
 
     assert "blink_flicker" not in _keys("Mulldrifter")
-    record = {
-        "name": "Mulldrifter",
-        "oracle_text": (
-            "Flying\nWhen Mulldrifter enters the battlefield, draw two cards.\n"
-            "Evoke {2}{U}"
-        ),
-        "cmc": 5,
-        "keywords": ["Flying", "Evoke"],
-    }
+    record = test_card("Mulldrifter")
     out = []
     apply_membership_floor([_tree("Mulldrifter")], record, out, out.append)
     floor_sigs = [s for s in out if s.key == "blink_flicker"]
@@ -1042,12 +1085,23 @@ def test_keyword_effect_unit_origin_braid_of_fire():
     assert [c.concept for c in kw_units[0].effects] == ["ramp"]
     assert ("ramp", "you", "") in _idents("Braid of Fire")
 
-    from mtg_utils._deck_forge.bridge_ledger import bridge_fires
+    from mtg_utils._analysis.bridge_ledger import bridge_fires
 
     assert bridge_fires("ramp_dropped_add_mana_clause", tree) is False
 
 
-def test_keyword_effect_unit_origin_corpus_census():
+@pytest.mark.parametrize(
+    ("name", "kind", "concept"),
+    [
+        ("Aboroth", "PutCounter", "place_counter"),
+        ("Braid of Fire", "Mana", "ramp"),
+        ("Infernal Darkness", "PayCost", OTHER),
+        ("Karplusan Minotaur", "FlipCoin", "flip_coin"),
+        ("Psychic Vortex", "Draw", "draw"),
+        ("Sheltering Ancient", "PutCounter", "place_counter"),
+    ],
+)
+def test_keyword_effect_unit_origin_corpus_census(name, kind, concept):
     """v0.23.0's full ``EffectCost``-keyword census (task #87, corpus
     swept): exactly 9 commander-legal cards, all ``CumulativeUpkeep``.
     Every one of them now carries a ``"keyword"``-origin unit (no arm
@@ -1058,20 +1112,11 @@ def test_keyword_effect_unit_origin_corpus_census():
     Leshrac: GainControl; Infernal Darkness: PayCost; Jötun Grunt:
     PutAtLibraryPosition; Karplusan Minotaur: FlipCoin; Psychic Vortex:
     Draw; Varchild's War-Riders: Token)."""
-    census = {
-        "Aboroth": ("PutCounter", "place_counter"),
-        "Braid of Fire": ("Mana", "ramp"),
-        "Infernal Darkness": ("PayCost", OTHER),
-        "Karplusan Minotaur": ("FlipCoin", "flip_coin"),
-        "Psychic Vortex": ("Draw", "draw"),
-        "Sheltering Ancient": ("PutCounter", "place_counter"),
-    }
-    for name, (kind, concept) in census.items():
-        tree = _tree(name)
-        kw_units = [u for u in tree.units if u.origin == "keyword"]
-        assert len(kw_units) == 1, name
-        assert kw_units[0].kind == kind, name
-        assert [c.concept for c in kw_units[0].effects] == [concept], name
+    tree = _tree(name)
+    kw_units = [u for u in tree.units if u.origin == "keyword"]
+    assert len(kw_units) == 1, name
+    assert kw_units[0].kind == kind, name
+    assert [c.concept for c in kw_units[0].effects] == [concept], name
 
 
 def test_keyword_effect_unit_secondary_gains_adjudicated():
@@ -1262,7 +1307,7 @@ def test_sacrifice_outlets_shed_opponent_directed(name):
 )
 def test_sacrifice_outlets_land_only_excluded(name):
     """A land-only sacrifice subject — whether the bare core type ``Land``
-    or an ALL-:data:`~mtg_utils._deck_forge.lanes._LAND_SUBTYPES`
+    or an ALL-:data:`~mtg_utils._analysis._subtypes.LAND_SUBTYPES`
     subtype list (Swamp, Mountain, ...) — stays ``land_sacrifice_makers``
     territory (CR 701.21), never ``sacrifice_outlets``, across BOTH the
     additional-cost-to-cast text idiom and the Composite cost-leaf arm
@@ -1275,9 +1320,9 @@ def test_sacrifice_outlets_land_subtype_effect_arm_excluded():
     ("sacrifice a Swamp" — Akuta, Born of Ash's upkeep trigger) previously
     slipped past the effect arm's exclusion, which only tested the bare
     core-type tuple ``("Land",)`` and never the CR 205.3i subtype
-    vocabulary (:data:`~mtg_utils._deck_forge.lanes._LAND_SUBTYPES`)
+    vocabulary (:data:`~mtg_utils._analysis._subtypes.LAND_SUBTYPES`)
     the cost-leaf arm already read. Both arms now share ONE subject-presence
-    read (:func:`~mtg_utils._deck_forge.lanes._sac_subject_present`),
+    read (:func:`~mtg_utils._analysis.lanes._sac_subject_present`),
     so a Swamp-only sacrifice stays ``land_sacrifice_makers`` territory here
     too (CR 701.21a — a player may only sacrifice a permanent they control;
     the LAND-subtype scoping is a lane boundary, not a rules distinction)."""
@@ -1309,8 +1354,8 @@ def test_sacrifice_outlets_token_predicate_effect_arm():
     (:func:`test_sacrifice_outlets_token_predicate_cost_leaf`) also hit the
     EFFECT arm — Chitterspitter's "you may sacrifice a token" trigger
     carries an explicit ``controller: You`` on a Token-predicate-only
-    filter; :func:`~mtg_utils._deck_forge.lanes._is_you_sac_subject`
-    now reads the shared :func:`~mtg_utils._deck_forge.lanes._sac_subject_present`
+    filter; :func:`~mtg_utils._analysis.lanes._is_you_sac_subject`
+    now reads the shared :func:`~mtg_utils._analysis.lanes._sac_subject_present`
     helper instead of the pre-flattened ``c.subject`` tuple, so this fires
     too (CR 111.1, CR 701.21a)."""
     assert ("sacrifice_outlets", "you", "") in _idents("Chitterspitter")
@@ -1345,7 +1390,7 @@ def test_sacrifice_outlets_unset_controller_other_actor_excluded(name):
     genuine bare-imperative self-sac (see
     :func:`test_sacrifice_outlets_unset_controller_defaults_to_you`) — a
     naive unset-to-you default over-fires here. The clause-head
-    disambiguator (:func:`~mtg_utils._deck_forge.lanes.
+    disambiguator (:func:`~mtg_utils._analysis.lanes.
     _sac_effect_names_other_actor`) reads the owning ability's OWN
     templated text and heads the sacrifice clause with "defending player,"
     a non-controller actor (CR 701.21a — a player may only sacrifice a
@@ -1368,7 +1413,7 @@ def test_sacrifice_outlets_unset_controller_compound_predicate_excluded(name):
     sacrifices a permanent" (Undercity Plague) both put real distance
     between the actor and "sacrifices". A first-attempt proximity-window
     probe missed both and over-fired; the clause-head test
-    (:func:`~mtg_utils._deck_forge.lanes._sac_effect_names_
+    (:func:`~mtg_utils._analysis.lanes._sac_effect_names_
     other_actor`) correctly heads the WHOLE sentence, not just the words
     immediately before "sacrifices" (CR 701.21a)."""
     assert "sacrifice_outlets" not in _keys(name)
@@ -1414,7 +1459,7 @@ def test_sacrifice_outlets_ward_cost_excluded():
         "Phyrexian Obliterator",  # "that source's controller sacrifices"
         "Fade Away",  # "for each creature, its controller sacrifices"
         "Maarika, Brutal Gladiator",  # "that creature's controller sacrifices"
-        "Vengeful Strangler // Strangling Grasp",  # enchanted permanent's controller
+        "Strangling Grasp",  # enchanted permanent's controller (Vengeful Strangler)
     ],
 )
 def test_sacrifice_outlets_parent_target_controller_ambiguous_fires(name):
@@ -1987,19 +2032,20 @@ def test_creatures_matter_w8_closer_batch(name, should_fire):
         # "untap all creatures you control" (CR 701.26), Superior
         # Numbers' excess-count comparator, Sovereign Okinec Ahau's
         # per-creature counter distribution, Whisperwood Elemental's
-        # face-up team-grant residue, Duskana's dropped per-base-2/2
-        # draw count (distinct row from the ALREADY-LANDED base_power_
-        # matters reference bridge — different key), Moku's mis-scoped
-        # SelfRef haste grant, Siege Behemoth's empty-modifications
-        # static, and Candlekeep Inspiration's mass base-P/T-setter
+        # face-up team-grant residue, Moku's mis-scoped SelfRef haste
+        # grant, and Candlekeep Inspiration's mass base-P/T-setter
         # residue (sharing its gap/match with the base_pt_set sibling
         # row, CR 613.4b).
         ("Lightning Runner", True),
         ("Superior Numbers", True),
         ("Sovereign Okinec Ahau", True),
         ("Whisperwood Elemental", True),
-        ("Duskana, the Rage Mother", True),
         ("Moku, Meandering Drummer", True),
+        # (4) bridges retired at phase v0.104.0, now structural: Duskana's
+        # per-base-2/2 draw count is a typed ``Ref`` count, and Siege
+        # Behemoth's per-creature unblocked assignment is an
+        # ``AssignDamageAsThoughUnblocked`` modification over the team.
+        ("Duskana, the Rage Mother", True),
         ("Siege Behemoth", True),
         ("Candlekeep Inspiration", True),
     ],
@@ -2778,7 +2824,7 @@ def test_voltron_makers_recovered_mechanisms(name):
     the unattach-maker / sibling-gear-attach / reanimate-with-attach /
     becomes-attached / Unimplemented-residue mechanisms the base structural
     gate above misses. Verified against the real Card IR this session; each
-    card's phase record is pinned in ``crosswalk_fixture_cards.json``."""
+    card's phase records are stored in the card snapshot."""
     assert ("voltron_makers", "you", "") in _idents(name)
 
 
@@ -2820,7 +2866,10 @@ def test_voltron_makers_sheds_no_attach_action(name):
         # equipment/aura" branch requires the literal word "attach"
         # immediately, which "you may return target Equipment card... If
         # you do, you may attach it" does not satisfy at the right
-        # position).
+        # position). Since phase v0.94.0 Fumble's "attach them to another
+        # creature" is an Unimplemented plural_attachment_anaphor residue, so
+        # the ledger row fumble_plural_attachment_anaphor serves it until
+        # phase types the Attach again (this stays the membership pin).
         "Fumble",
         "Auriok Survivors",
     ],
@@ -2902,7 +2951,7 @@ def test_voltron_matters_recovered_mechanisms(name):
     reduction, SourceIsEquipped condition, trigger-condition-filter,
     ability cost_reduction, bare-count-scaling, and Unrecognized-residue /
     static-affected mechanisms the base structural gate misses. Each card's
-    phase record is pinned in ``crosswalk_fixture_cards.json``."""
+    phase records are stored in the card snapshot."""
     assert ("voltron_matters", "you", "") in _idents(name)
 
 
@@ -3378,17 +3427,65 @@ def test_lifeloss_matters_trigger_and_keyword():
         ("Diabolic Edict", ("edict_makers", "opponents", "")),  # subject TargetPlayer
         ("Grave Pact", ("edict_makers", "opponents", "")),  # player_scope on wrapper
         ("Fleshbag Marauder", ("edict_makers", "each", "")),  # player_scope All
+        # "Target player loses 1 life, discards a card, then sacrifices a
+        # permanent": the chained clause's subject is the target player.
+        ("Undercity Plague", ("edict_makers", "opponents", "")),
+        # Its ruling: "You may target players who can't sacrifice a creature."
+        ("Priest of Forgotten Gods", ("edict_makers", "opponents", "")),
+        # "That player or that planeswalker's controller … then sacrifices".
+        ("Nicol Bolas, Planeswalker", ("edict_makers", "opponents", "")),
+        # A delayed trigger watching an opponent's attackers: "they sacrifice".
+        ("Davriel, Soul Broker", ("edict_makers", "opponents", "")),
+        # "its controller sacrifices another land": the destroyed land's controller.
+        ("Feast of Worms", ("edict_makers", "opponents", "")),
+        # Its ruling: "each player counts up the number of creatures they control".
+        ("Fade Away", ("edict_makers", "each", "")),
+        # Its ruling: "If everyone controls the same number of lands, everyone
+        # sacrifices two lands."
+        ("Tectonic Hellion", ("edict_makers", "each", "")),
     ],
 )
 def test_edict_makers_fires(name, ident):
     assert ident in _idents(name)
 
 
-@pytest.mark.parametrize("name", ["Mycoloth", "Viscera Seer"])
+@pytest.mark.parametrize(
+    "name",
+    ["Mycoloth", "Viscera Seer", "Vexing Devil", "Chain of Vapor", "Prowling Pangolin"],
+)
 def test_edict_makers_excludes_you_sac(name):
     """A you-sac (Mycoloth — sacrificed subject controller You; Viscera Seer — a sac
-    COST, never an effect) is NOT an edict (CR 701.21a)."""
+    COST, never an effect; Vexing Devil's "If a player does, sacrifice ~" after an
+    effect aimed at an opponent) is NOT an edict (CR 701.21a)."""
     assert "edict_makers" not in _keys(name)
+
+
+@pytest.mark.retirement_canary
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Undercity Plague",
+        "Din of the Fireherd",
+        "Nicol Bolas, Planeswalker",
+        # The sacrifice hangs beside the delayed trigger, not inside it.
+        "Davriel, Soul Broker",
+    ],
+)
+def test_chained_sacrifice_actor_dropped_canary(name):
+    """Retirement canary for ``lanes._shared._chained_sacrifice_actor``: phase
+    v0.104.0 drops the subject of a chained "…, then sacrifices …" clause (a
+    sacrifice naming no player — ``sacrifice_names_no_player``). Once phase
+    carries the actor, delete the chained read."""
+    from mtg_utils._card_ir.crosswalk import sacrifice_names_no_player
+
+    dropped = [
+        c
+        for t in trees_for(test_card(name))
+        for u in t.units
+        for c in u.effects
+        if c.concept == "sacrifice" and sacrifice_names_no_player(u.node, c.node)
+    ]
+    assert dropped, f"{name}: RETIRE-READY — phase now names the sacrificing player"
 
 
 def test_land_sacrifice_makers_fires():
@@ -3651,7 +3748,7 @@ def test_lifeloss_makers_degraded_typed_each_opponent(name, scope):
 # touched at all (Force of Will's "rather than pay this spell's mana
 # cost"); (d) a KEYWORD's own cost payload (Deep Analysis's "Flashback—
 # {1}{U}, Pay 3 life.") — see _spell_additional_cost_concepts /
-# _spell_alt_cost_paylife_concepts / _keyword_cost_paylife_concepts
+# _spell_alt_cost_paylife_concepts / _keyword_cost_concepts
 # (crosswalk.py).
 @pytest.mark.parametrize(
     ("name", "scope"),
@@ -3804,7 +3901,9 @@ def test_lifeloss_makers_ramp_exclusion_channel_face():
     pay 1 life. If you do, add {C}." — is itself a mana ability (a
     painland shape), excluded by the same non-ramp gate that protects
     Horizon Canopy."""
-    assert "lifeloss_makers" not in _keys("Yavimaya Bloomsage // Channel")
+    assert "lifeloss_makers" not in _keys(
+        "Yavimaya Bloomsage // Channel", face="Channel"
+    )
 
 
 def test_lifeloss_makers_scriv_token_attach_opponent_bleed_excluded():
@@ -4023,26 +4122,12 @@ def test_lure_makers_fires_on_the_lead_text_only_face_tree():
     via the production constructor and assert the ``_LURE_ABLE`` idiom reads
     it — "all creatures able to block ... do so" is a blocking requirement
     (CR 509.1c: "effects that say a creature must block")."""
-    from mtg_utils._deck_forge._ir_lookup import _text_only_tree
-
-    face = {
-        "name": "Lead",
-        "mana_cost": "{3}{G}",
-        "type_line": "Sorcery",
-        "oracle_text": (
-            "Aftermath (Cast this spell only from your graveyard. "
-            "Then exile it.)\n"
-            "All creatures able to block target creature this turn do so."
-        ),
-    }
-    tree = _text_only_tree(
-        face, {"cmc": 6.0}, oracle_id="7ebde396-6672-491a-a6ce-1de49b12379b"
-    )
+    tree = _text_only_face_tree("Destined // Lead", "Lead")
     assert tree is not None
     assert tree.units == ()  # zero typed substrate — text idioms only
     idents = {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(tree, keywords=frozenset())
+        for s in extract_crosswalk_signals(as_signal_tree(tree), keywords=frozenset())
     }
     assert ("lure_makers", "you", "") in idents
 
@@ -4670,7 +4755,7 @@ def test_convert_adapt_self_counter_grow_np_counters():
     adapt (CR 701.46a — a genuine self +1/+1 grow) is dropped WHOLE (no
     node, no Unimplemented residue), so the ``convert_adapt_self_counter_
     grow`` tree_synthesis arm re-derives it via the existing
-    ``synth_self_counter_grow`` marker. The fixture keys the back face by
+    ``synth_self_counter_grow`` marker. The test names the back face by
     its single-face name, matching phase's own card-data indexing (the
     Grizzled Angler DFC precedent). The adapt_matters lane's literal
     "adapt N" keyword-invocation veto keeps the card OUT of the enabler
@@ -4682,8 +4767,8 @@ def test_convert_adapt_self_counter_grow_np_counters():
 
 def test_dropped_counter_move_np_counters():
     """np_counters item 3: the possessed-counters relocation clause phase
-    drops WHOLE fires counter_move + any_counter_makers via the
-    ``dropped_counter_move`` synthesis arm — Ambitious Augmenter ("...then
+    dropped WHOLE through v0.94.0 (a synthesis arm, retired at v0.104.0, which
+    types it) fires counter_move + any_counter_makers — Ambitious Augmenter ("...then
     put this creature's counters on that token"; only the Token sibling
     survives) and Heroic Sacrifice (the entire delayed dies-trigger is
     gone; the card parses as only its damage-redirect replacement) join
@@ -4767,11 +4852,12 @@ def test_dice_makers_excludes_dice_reference_shape():
     """ADR-0034 shed: Pixie Guide's "Grant an Advantage — If you would roll
     one or more dice, instead roll that many dice plus one and ignore the
     lowest roll." is a REPLACEMENT modifying an EXISTING/future roll, not an
-    instruction to roll — the grammar's cursor-anchored parse lands on the
-    "instead roll" remainder, matching the SAME dice-REFERENCE shape the
-    old-IR's ``_DICE_TRIG`` discriminator routes to dice_matters (never
-    dice_makers). The recovery guard reuses ``_DICE_TRIG`` verbatim so this
-    stays unrecovered (CR 706, CR 614 replacement effects)."""
+    instruction to roll (CR 706.6 / 614.1a). Through v0.66.0 it was an
+    ``Unimplemented('replacement_structure')`` residue the recovery guard
+    left alone; phase v0.86.0 parses it as a ``replacements[]`` entry
+    (``event: RollDice``, ``die_ignore_rule: Lowest``) whose ``execute``
+    carries a typed ``RollDie`` — the dice_makers gate skips a RollDie
+    inside a die-roll replacement, so it stays dice_matters territory."""
     assert "dice_makers" not in _keys("Pixie Guide")
 
 
@@ -5362,9 +5448,9 @@ def test_colorless_matters_reference_idiom_synthesis():
     covers never doubles. Grizzled Angler // Grisly Anglerfish's front
     face ("if there is a colorless creature card in your graveyard,
     transform this creature") is the DFC case — the synthesis arm reads
-    THIS face's own ``tree.oracle`` (fixture keyed by the single-face
-    name, matching how phase's own card-data.json stores DFC faces as
-    separate records). CR 105.2c."""
+    THIS face's own ``tree.oracle`` (the test names the single face,
+    matching how phase's own card-data.json stores DFC faces as separate
+    records). CR 105.2c."""
     assert ("colorless_matters", "you", "") in _idents("Herald of Kozilek")
     assert ("colorless_matters", "you", "") in _idents("Grizzled Angler")
 
@@ -5746,7 +5832,7 @@ def test_opponent_discard_sibling_reveal_backref_rise_fall():
     random from their hand, then discards each nonland card revealed
     this way.") is the SAME recovered-discard-with-sibling-reveal shape
     as Nebuchadnezzar/Hint of Insanity, on a genuinely SEPARATE per-face
-    phase record (fixture keyed "Fall", not the combined card name) — a
+    phase record (the test names the "Fall" face, not the whole card) — a
     beyond-legacy recall gain (the split-card legacy IR doesn't reach
     this face at all), adjudicated genuine per the ADR-0038 recall-
     completion note (role-aware: a real payoff arm, not a conflation)."""
@@ -5779,26 +5865,12 @@ def test_opponent_discard_text_only_face_tree_oblivion():
     reference into a GRANTED trigger's quoted text with no "opponent"/
     "target player"/"each player" anchor at all) is correctly NOT
     matched — a genuinely un-closed gap, not force-fit this session."""
-    from mtg_utils._deck_forge._ir_lookup import _text_only_tree
-
-    face = {
-        "name": "Oblivion",
-        "mana_cost": "{4}{B}",
-        "type_line": "Sorcery",
-        "oracle_text": (
-            "Aftermath (Cast this spell only from your graveyard. "
-            "Then exile it.)\n"
-            "Target opponent discards two cards."
-        ),
-    }
-    tree = _text_only_tree(
-        face, {"cmc": 7.0}, oracle_id="8fe7436b-2467-486e-8a2d-7cbf21a65da9"
-    )
+    tree = _text_only_face_tree("Consign // Oblivion", "Oblivion")
     assert tree is not None
     assert tree.units == ()  # zero typed substrate — text idioms only
     idents = {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(tree, keywords=frozenset())
+        for s in extract_crosswalk_signals(as_signal_tree(tree), keywords=frozenset())
     }
     assert ("opponent_discard", "opponents", "") in idents
 
@@ -5839,7 +5911,7 @@ def test_opponent_discard_excludes_self_discard_then_unrelated_count():
 def test_opponent_discard_unless_clause_bridge():
     """The ``opp_discard_unless_clause`` ledgered bridge (bridge_ledger.py,
     shared with lifeloss_makers' ``withercrown_unless_lose_life`` bridge
-    via :func:`~mtg_utils._deck_forge.bridge_ledger.
+    via :func:`~mtg_utils._analysis.bridge_ledger.
     _unless_clause_failure_descs`): a discard-payoff "unless" clause
     phase's parser fails wholesale — Tainted Specter's "Target player
     discards a card unless they put a card ... on top of their library".
@@ -5860,22 +5932,23 @@ def test_v066_donate_superlative_player_bridge():
     assert ("donate_makers", "you", "") in _idents("Thoughtbound Primoc")
 
 
-def test_v066_emblem_self_reference_damage_bridge():
-    """BRIDGE ``emblem_self_reference_damage_unbound_subject``: Chandra,
-    Spark Hunter's ultimate emblem "this emblem deals 3 damage to any
-    target" — the self-referenced emblem source (CR 114.1) inside the
-    ``CreateEmblem`` granted trigger is an ``unbound_subject`` residue at
-    v0.66.0 (a typed nested ``DealDamage{target: Any}`` at v0.45.0); "any
-    target" reaches a player by rule (CR 115.4)."""
+def test_v086_emblem_self_reference_damage_is_structural():
+    """Chandra, Spark Hunter's ultimate emblem "this emblem deals 3 damage to any
+    target" (CR 114.1): an ``unbound_subject`` residue at v0.66.0 (bridged as
+    ``emblem_self_reference_damage_unbound_subject``), a typed nested
+    ``DealDamage{target: Any}`` again at v0.86.0 (phase-rs/phase#8169) — the
+    direct_damage lane serves it with no bridge; "any target" reaches a player by
+    rule (CR 115.4)."""
     assert ("direct_damage", "you", "") in _idents("Chandra, Spark Hunter")
 
 
-def test_v066_each_source_power_rider_bridges():
-    """BRIDGES ``removal_each_source_power_rider`` /
-    ``creature_ping_each_source_power_rider``: Master of the Wild Hunt's
+def test_v066_each_source_power_rider_recovered():
+    """Master of the Wild Hunt's
     "Each Wolf tapped this way deals damage equal to its power to target
     creature" — phase v0.53.0 (#7322) fails the per-source rider CLOSED as
-    ``each_source_unrepresentable_rider`` (a typed DealDamage at v0.45.0).
+    ``each_source_unrepresentable_rider`` (a typed DealDamage at v0.45.0); two
+    ledger bridges served it until phase v0.104.0, when the ``damage`` recovery
+    arms (removal, creature_ping) began reading the parked clause.
     CR 120.3 — a creature source dealing power-scaled damage to a creature
     (the creature_ping doer) that removes it (CR 701.8a territory)."""
     keys = _keys("Master of the Wild Hunt")
@@ -5972,8 +6045,8 @@ def test_opponent_discard_unless_pay_graduated_structural():
     ``keyword_mechanics._unless_pay_opponent_discard`` reads it
     structurally. Membership preserved, mechanism graduated. CR 608.2c /
     701.9a (the targeted opponent's own hand-to-graveyard discard)."""
+    from mtg_utils._analysis.bridge_ledger import bridge_fires
     from mtg_utils._card_ir.crosswalk import iter_cost_leaves, tag_of
-    from mtg_utils._deck_forge.bridge_ledger import bridge_fires
 
     tree = _tree("Remorseless Punishment")
     assert not bridge_fires("opp_discard_unless_clause", tree)
@@ -6051,7 +6124,7 @@ def test_opponent_discard_mindculling_dropped_conjunct_bridge():
     """The ``opp_discard_mindculling_dropped_conjunct`` ledgered bridge:
     Mindculling's "You draw two cards and target opponent discards two
     cards." — the SAME zero-residue dropped-second-conjunct shape as
-    Fungal Shambler, sharing :func:`~mtg_utils._deck_forge.bridge_ledger.
+    Fungal Shambler, sharing :func:`~mtg_utils._analysis.bridge_ledger.
     _no_typed_discard_node`'s broad absence-proof gap
     (the ``sacrifice_outlets`` ``_no_typed_sacrifice_node`` precedent)."""
     assert ("opponent_discard", "opponents", "") in _idents("Mindculling")
@@ -6066,29 +6139,14 @@ def test_opponent_discard_driven_despair_missing_face_bridge():
     no "target opponent"/"target player"/"each player" anchor the
     pre-existing text-only sweep requires — served by this bridge
     instead. Built via the W2c text-only path directly (not ``_idents``'s
-    ``cards``-dict lookup) mirroring
+    phase-record lookup) mirroring
     :func:`test_opponent_discard_text_only_face_tree_oblivion` — this
-    face has no phase record for the fixture's ``cards`` dict to carry at
-    all."""
-    from mtg_utils._deck_forge._ir_lookup import _text_only_tree
-
-    face = {
-        "name": "Despair",
-        "mana_cost": "{1}{B}",
-        "type_line": "Sorcery",
-        "oracle_text": (
-            "Aftermath (Cast this spell only from your graveyard. "
-            "Then exile it.)\n"
-            "Until end of turn, creatures you control gain menace and "
-            '"Whenever this creature deals combat damage to a player, '
-            'that player discards a card."'
-        ),
-    }
-    tree = _text_only_tree(face, {}, oracle_id="87fca901-678d-4c9a-be4a-9dce2a53074b")
+    face has no phase record to look up at all."""
+    tree = _text_only_face_tree("Driven // Despair", "Despair")
     assert tree is not None
     idents = {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(tree, keywords=frozenset())
+        for s in extract_crosswalk_signals(as_signal_tree(tree), keywords=frozenset())
     }
     assert ("opponent_discard", "opponents", "") in idents
 
@@ -6847,27 +6905,12 @@ def test_draw_for_each_fires_on_text_only_face_tree():
     trusted as a fallback when a typed Draw node's wrapper carries no
     grounding raw — runs over the whole (units-empty) face text instead.
     CR 121.1/107.3."""
-    from mtg_utils._deck_forge._ir_lookup import _text_only_tree
-
-    face = {
-        "name": "Feed",
-        "mana_cost": "{2}{G}",
-        "type_line": "Sorcery",
-        "oracle_text": (
-            "Aftermath (Cast this spell only from your graveyard. "
-            "Then exile it.)\n"
-            "Draw a card for each creature you control with power 3 "
-            "or greater."
-        ),
-    }
-    tree = _text_only_tree(
-        face, {"cmc": 5.0}, oracle_id="1b6c1f5d-2b1e-4f3a-9c1e-9f6b8e3d2a11"
-    )
+    tree = _text_only_face_tree("Mouth // Feed", "Feed")
     assert tree is not None
     assert tree.units == ()  # zero typed substrate — text idioms only
     idents = {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(tree, keywords=frozenset())
+        for s in extract_crosswalk_signals(as_signal_tree(tree), keywords=frozenset())
     }
     assert ("draw_for_each", "you", "") in idents
 
@@ -6980,15 +7023,14 @@ def test_discard_outlet_else_ability_effect_descent():
 
 
 def test_discard_outlet_alt_cast_cost_kept_mirror():
-    """ "As an additional cost to cast this spell, discard …" surfaces NO
-    typed ``Discard`` node anywhere in phase's tree for a Spell ability
-    (the Spell's own ``cost`` field is ``None`` — mirrors
-    ``_CAST_ADD_SAC_RX``'s documented sacrifice_outlets gap). The
-    byte-identical deleted SWEEP regex, run per-clause over the kept
-    oracle, recovers both Devastating Dreams ("discard X cards at
-    random") and Kaervek's Spite ("discard your hand") — CR 601.2f."""
-    assert ("discard_outlet", "you", "") in _idents("Devastating Dreams")
+    """Kaervek's Spite's "as an additional cost to cast this spell, sacrifice
+    all permanents you control and discard your hand" surfaces no typed
+    ``Discard`` node; the byte-identical deleted SWEEP regex, run per-clause
+    over the kept oracle, recovers it (CR 601.2f). Devastating Dreams' typed
+    "discard X cards at random" is out: a random discard is no outlet (CR
+    701.9b; Dan, 2026-10-10), so the mirror stays off it too."""
     assert ("discard_outlet", "you", "") in _idents("Kaervek's Spite")
+    assert ("discard_outlet", "you", "") not in _idents("Devastating Dreams")
 
 
 def test_discard_outlet_self_ref_cycling_excluded():
@@ -7018,7 +7060,7 @@ def test_discard_outlet_wheel_effect_fidelity_gain():
     "name",
     [
         "Torment of Hailfire",  # unless_pay: "unless that player discards"
-        "K'un-Lun Warrior",  # ChooseOneOf branches: ambiguous chooser
+        "Osseous Sticktwister",  # "each opponent may sacrifice OR discard": their choice
         "Mox Diamond",  # replacement MayCost decline-cost, not an outlet
     ],
 )
@@ -7039,6 +7081,19 @@ def test_discard_outlet_skip_fields_shed(name):
     Mox Diamond's "you may discard a land instead" is a replacement's
     decline-cost, not a discretionary value engine (CR 602.1a / 603.6)."""
     assert "discard_outlet" not in _keys(name)
+
+
+def test_discard_outlet_reflexive_you_pay_gain():
+    """K'un-Lun Warrior's "you may sacrifice an artifact or discard a card. If you
+    do, draw a card" was shed above through v0.66.0 (a ``ChooseOneOf`` whose
+    chooser the read couldn't tell from Osseous Sticktwister's opponent chooser).
+    phase v0.86.0 parses the reflexive payment (CR 603.12) as an effect-role
+    ``PayCost{cost: OneOf[Sacrifice(Artifact), Discard], payer: Controller}`` —
+    the action the resolving ability lets YOU take, and the reflexive trigger
+    fires on your taking it (CR 603.12), so the discard is a discretionary
+    self-outlet and the lane serves it; Sticktwister's opponent-paid form stays
+    out."""
+    assert ("discard_outlet", "you", "") in _idents("K'un-Lun Warrior")
 
 
 def test_discard_outlet_additional_generic_walk_gains():
@@ -7346,8 +7401,8 @@ def test_scaling_pump_recovered_dynamic_shapes(name):
     """ADR-0038 W3 batch 3 (CR 107.3 / 613.4c): scaling_pump recovers the
     Aggregate/Sum/GrantAbility-nested/degraded-literal dynamic P/T shapes
     the base ``ref_count_qty``/tag-set gate missed. Verified against the
-    real Card IR this session; each card's phase record is pinned in
-    ``crosswalk_fixture_cards.json``."""
+    real Card IR this session; each card's phase records are stored in
+    the card snapshot."""
     assert ("scaling_pump", "you", "") in _idents(name)
 
 
@@ -7742,8 +7797,9 @@ def test_dies_recursion_aura_equipment_attached_to_arm(name):
 # Wretch, Unstoppable Slasher, Infernal Vessel, Princess Yue), a Phoenix-
 # style modal branch (Bogardan Phoenix, Lamplight Phoenix), a
 # same-type-share condition (Fang Roku's Companion, Otherworldly Escort),
-# a self-transforming Aura-Land loop (Harold and Bob, Earth Village
-# Ruffians' land-creature analog), an exile-then-reattach (Lucius the
+# a self-transforming Aura-Land loop (Harold and Bob; Earth Village
+# Ruffians' earthbend sets the same return up on a land — the lane's
+# delayed grant arm, ``_sets_up_dies_return``), an exile-then-reattach (Lucius the
 # Eternal), and a delayed-trigger return AT THE BEGINNING OF THE NEXT END
 # STEP (Loyal Cathar — a flat ``ParentTarget`` with NO producer effect
 # preceding it, so it binds to the trigger's own source); a player-chosen
@@ -8555,12 +8611,13 @@ def test_exile_matters_bridge_grant_all_activated_abilities(name):
     assert ("exile_matters", "you", "") in _idents(name)
 
 
-def test_exile_matters_bridge_grolnok_cast_from_exile_counter_pile():
-    """ADR-0039 W7 endgame: PROMOTED via the
-    ``grolnok_cast_from_exile_counter_pile`` ledgered bridge — "You may
-    play lands and cast spells from among cards you own in exile with
-    croak counters on them" fails the effect parser
-    (``Unimplemented(name='effect_structure')``). CR 305.1/601.3/406.1."""
+def test_exile_matters_grolnok_cast_from_exile_counter_pile():
+    """ADR-0039 W7 endgame, graduated off the ledger at phase v0.104.0: "You may
+    play lands and cast spells from among cards you own in exile with croak
+    counters on them" fails the effect parser
+    (``Unimplemented(name='effect_structure')``), and the recovery stage's
+    ``cast_from_zone`` read marks the cards in exile that exile_matters
+    tests. CR 305.1/601.3/406.1."""
     assert ("exile_matters", "you", "") in _idents("Grolnok, the Omnivore")
 
 
@@ -9173,7 +9230,7 @@ def test_cheat_into_play_dig_subtype_land_subtype_stays_out():
     Dig subtype fallback, not a gap in it — ``Gate`` is itself a LAND
     subtype (CR 205.3i — Gate is a land type), so this is genuine land ramp
     (extra_land_drop), not a cheat build-around; the existing
-    ``_LAND_SUBTYPES`` gate correctly declines to fire."""
+    ``LAND_SUBTYPES`` gate correctly declines to fire."""
     assert "cheat_into_play" not in _keys("Nine-Fingers Keene")
 
 
@@ -9534,10 +9591,10 @@ def test_cheat_into_play_choose_one_of_branch_arm():
     """Dr. Eggman's "Then each opponent faces a villainous choice — That
     player discards a card, or you may put a Construct, Robot, or Vehicle
     card from your hand onto the battlefield" — the SECOND ``ChooseOneOf``
-    branch is a genuine Hand-origin cheat (CR 700.2 modal, CR 601.2/400.7
-    the cheat itself); crosswalk.py's ``_EFFECT_CHILD_FIELDS`` never walks a
-    ``ChooseOneOf``'s ``branches`` list, so ``unit.effects`` never surfaces
-    it without :func:`_cheat_choose_one_of_battlefield_put`'s descent."""
+    branch is a genuine Hand-origin cheat (CR 701.55a villainous choice; CR 601.2/400.7
+    the cheat itself); the shared effect walk reads the branch, so the
+    top-level ChangeZone arm sees it (served LOW by ``extract_signals``: the
+    choice is the opponent's, CR 701.55a)."""
     assert ("cheat_into_play", "you", "") in _idents("Dr. Eggman")
 
 
@@ -9545,11 +9602,10 @@ def test_cheat_into_play_negated_reveal_else_arm():
     """Impromptu Raid: "Reveal the top card of your library. If it isn't a
     creature card, put it into your graveyard. Otherwise, put that card
     onto the battlefield." — phase structures the BATTLEFIELD put on the
-    GRAVEYARD branch's own ``else_ability`` field, another container
-    ``unit.effects`` never reaches; :func:`_cheat_negated_reveal_else_put`
-    reads the inner (un-negated) ``RevealedHasCardType`` condition as the
-    genuine Creature type evidence (CR 726 if/otherwise — De Morgan's law
-    off the typed ``Not`` wrapper, not a guess)."""
+    GRAVEYARD branch's own ``else_ability`` field, which the shared effect
+    walk reads into ``unit.effects``; fix (e) (``_put_condition_types``) reads
+    the inner (un-negated) ``RevealedHasCardType`` as the else branch's
+    Creature type evidence (the branch runs exactly when that check holds)."""
     assert ("cheat_into_play", "you", "") in _idents("Impromptu Raid")
 
 
@@ -9686,9 +9742,7 @@ def test_cheat_into_play_land_only_carve_out_rona():
     (None isn't a trusted producer here) AND, even if trusted, the SAME
     Land-only condition the main arm's carve-out already excludes (CR
     305.1)."""
-    assert "cheat_into_play" not in _keys(
-        "Rona, Herald of Invasion // Rona, Tolarian Obliterator"
-    )
+    assert "cheat_into_play" not in _keys("Rona, Tolarian Obliterator")
 
 
 @pytest.mark.parametrize(
@@ -10174,6 +10228,17 @@ def test_keyword_grant_target_trigger_threaded_target():
     assert ("keyword_grant_target", "you", "") in _idents("Conquering Manticore")
 
 
+def test_keyword_grant_target_tracked_set_of_targets():
+    """phase v0.94.0: "target creature gets +3/+3, up to one other target
+    creature gets +2/+2, … Those creatures gain vigilance" (Arm the Cathars)
+    parses the grant's static as ``TrackedSet``-affected, not
+    ``ParentTarget`` — the targets thread through the Pump chain. A
+    ``PutCounterAll`` board filter feeding the same "those creatures" static
+    (Ajani Goldmane's -1 loyalty ability) is no target, so it stays out. CR 115.1 / 613.1f."""
+    assert ("keyword_grant_target", "you", "") in _idents("Arm the Cathars")
+    assert "keyword_grant_target" not in _keys("Ajani Goldmane")
+
+
 @pytest.mark.parametrize(
     "name", ["Chariot of the Sun", "Infuse with Vitality", "Balloon Stand"]
 )
@@ -10270,8 +10335,8 @@ def test_team_evasion_grant_broader_kept_mirror(name):
     the tribal/color/core-type/power/equipped/one-shot/can't-be-blocked
     forms the narrow structural gate above deliberately excludes (that gate
     stays scoped to the fully-generic continuous team anthem). Verified
-    against the real Card IR this session; each card's phase record is
-    pinned in ``crosswalk_fixture_cards.json``."""
+    against the real Card IR this session; each card's phase records
+    are stored in the card snapshot."""
     assert ("team_evasion_grant", "you", "") in _idents(name)
 
 
@@ -10528,20 +10593,17 @@ def test_base_pt_set_bridge_tk_sticker_parse_failure():
     assert ("base_pt_set", "any", "") in _idents("Cool Fluffy Loxodon")
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "Captain Rex Nebula",  # "... each equal to its mana value"
-        "Fractalize",  # "... each equal to X plus 1"
-    ],
-)
-def test_base_pt_set_bridge_each_equal_to_dropped(name):
-    """A DYNAMIC "base power and toughness each equal to <mana value | X>"
-    scalar-set clause is dropped from the site's own modifications
-    entirely — the site's own description DOES carry the hook text and
-    the target resolves fine, but no SetPowerDynamic/SetToughnessDynamic
-    node exists anywhere on that site."""
-    assert ("base_pt_set", "any", "") in _idents(name)
+def test_base_pt_set_each_equal_to_is_structural_at_v086():
+    """Fractalize's "base power and toughness each equal to X plus 1" (CR
+    613.4b): through v0.66.0 the ``SetPowerDynamic``/``SetToughnessDynamic``
+    pair was dropped from the site (the ``base_pt_each_equal_to_dropped``
+    ledgered bridge served it); phase v0.86.0 decomposes the scalar and the
+    lane's dynamic-pair arm serves it with no bridge. Captain Rex Nebula, the
+    bridge's other pin, regressed the other way at v0.86.0 — its whole "Crash
+    Land — Whenever ~ deals damage …" trigger parks as an
+    ``unrecognized_clause_head`` residue truncated to the trigger head, so no
+    residue text carries the hook and the card is a logged loss, not a pin."""
+    assert ("base_pt_set", "any", "") in _idents("Fractalize")
 
 
 def test_base_pt_set_bridge_addpt_misattributed_typechange():
@@ -10883,14 +10945,13 @@ def test_topdeck_stack_selection_idiom_excluded():
     assert "topdeck_stack" not in _keys("Telling Time")
 
 
-def test_topdeck_stack_nested_rolldie_result_excluded():
-    """Loathsome Troll's graveyard-recursion d20 result ("1-9 | Put this
-    card on top of your library") lives inside a modal ``RollDie.results``
-    branch — the nested-grant descent is scoped to
-    ``GrantAbility``/``GrantTrigger``/``GrantStaticAbility`` only, never a
-    blanket deep walk, so this stays out (legacy's project.py doesn't walk
-    it either)."""
-    assert "topdeck_stack" not in _keys("Loathsome Troll")
+def test_topdeck_stack_reads_a_rolldie_result_row():
+    """Loathsome Troll's d20 row "1-9 | Put this card on top of your library"
+    is one of the effects the shared walk reads since it descends
+    ``RollDie.results``: the same graveyard-to-top self-move Arashin Sovereign's
+    and Moss-Pit Skeleton's dies triggers already fire on. (Pinned out before
+    only because the walk didn't reach the row.)"""
+    assert "topdeck_stack" in _keys("Loathsome Troll")
 
 
 def test_target_player_draws_excludes_scoped_player_group_draw():
@@ -10965,8 +11026,8 @@ def test_target_player_draws_any_recipient_tag():
     the v0.66.0 pin bump phase fails the compound subject CLOSED (v0.46.0
     #7003) into an ``Unimplemented(name="unbound_subject")`` residue whose
     description is the clause; recovery.py's "draw" ALLOWLIST token recovers
-    it and :data:`_RECOVERED_DRAW_DIRECTED_RE`'s "you and … each draw"
-    alternative reads the direction — membership preserved either way."""
+    it and the seam's ``OTHER_PLAYER`` mark ("you and … each draw") reads the
+    direction — membership preserved either way."""
     for name in (
         "Karazikar, the Eye Tyrant",
         "Zurzoth, Chaos Rider",
@@ -11127,9 +11188,8 @@ def test_target_player_draws_excludes_bled_leadership_vacuum():
 def test_target_player_draws_excludes_recovered_each_and_self_branches():
     """Mathise, Surge Channeler's d20 table recovers TWO "draw" residues —
     "Each player draws a card." (group, no directed-recipient word) and
-    "You draw a card." (self, no directed-recipient word) — neither
-    matches :data:`_RECOVERED_DRAW_DIRECTED_RE`'s word list, so both
-    correctly stay out."""
+    "You draw a card." (self, no directed-recipient word) — the seam marks
+    neither ``OTHER_PLAYER``, so both correctly stay out."""
     assert "target_player_draws" not in _keys("Mathise, Surge Channeler")
 
 
@@ -12236,6 +12296,38 @@ def test_damage_prevention_shield_excludes_offensive_curse():
     assert ("damage_prevention", "you", "") in _idents("Pariah")
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        # phase v0.94.0 fails these static CR 615.1a prevention lines it
+        # structured through v0.86.0 as Prevention replacements; the ledger
+        # rows damage_prevention_replacement_parse_failure (the four
+        # replacement_structure residues + Silhouette's unparsed_replacement)
+        # and camel_attacking_prevention_empty_static (a hollow static) keep
+        # them served until phase restores the structure. The MEMBERSHIP pin:
+        # test_bridge_ledger pins the rows' mechanism, and when they graduate
+        # that goes while this stays (the graduation rule).
+        "Light of Sanction",
+        "Well-Laid Plans",
+        "Ironscale Hydra",
+        "Hyperion, Supreme Hero",
+        "Silhouette",
+        "Camel",
+    ],
+)
+def test_damage_prevention_v094_parse_failures_stay_served(name):
+    assert ("damage_prevention", "you", "") in _idents(name)
+
+
+@pytest.mark.parametrize("name", ["Phyrexian Vindicator", "Stuffy Doll Avatar"])
+def test_damage_prevention_bridge_skips_prevent_and_reflect(name):
+    """The near miss: the same failed-replacement residue on a prevent-and-
+    reflect card ("When damage is prevented this way, …") — never a
+    damage_prevention member (Vindicator is damage_redirect's), so the bridge
+    stays out."""
+    assert "damage_prevention" not in _keys(name)
+
+
 def test_opponent_cast_matters_spell_cast_or_copy_mode():
     """Follow-up (e): the batched ``SpellCastOrCopy`` mode joins the read —
     Mage Hunter's opponent-scoped valid_target fires; the Controller-scoped
@@ -13161,7 +13253,9 @@ def test_convoke_matters_cast_trigger_anchor_only():
 
 def test_curse_matters_subtype_reads_and_mirror():
     """CR 205.3h: the Curse trigger-subject read (Lynde), the Curse
-    effect-subject read (Witchbane Orb) and the kept mirror (Curse of
+    effect-subject read (Witchbane Orb — the
+    ``witchbane_orb_curses_attached_parked`` ledger bridge since phase v0.104.0
+    parks the effect) and the kept mirror (Curse of
     Misfortunes — search filter still dropped in v0.9.0, [P11] family)
     fire; MEMBERSHIP stays out — Cruel Reality (an Aura Curse CARD)
     never fires."""
@@ -13524,14 +13618,14 @@ def test_removal_granted_ability_body_descent(name):
 
 
 def test_removal_answer_types_granted_ability_body_descent():
-    """task #86: :func:`~mtg_utils._deck_forge.lanes.
+    """task #86: :func:`~mtg_utils._analysis.lanes.
     _removal_answer_types` (the 10 type-scoped preset predicates' shared
     source) stays in lockstep with :func:`_removal`'s own granted-ability
     third arm — a card that gains ``removal`` membership from the descent
     must also answer its permanent type, or a "creature removal" preset
     view would silently miss it even though the bare ``removal`` lane
     fires."""
-    from mtg_utils._deck_forge.lanes import _removal_answer_types
+    from mtg_utils._analysis.lanes import _removal_answer_types
 
     assert _removal_answer_types(_tree("Arc Spitter")) == {"Creature"}
     assert _removal_answer_types(_tree("Tyrant's Familiar")) == {"Creature"}
@@ -13704,6 +13798,18 @@ def test_self_counter_grow_selfref_and_keyword_actions():
     assert ("self_counter_grow", "you", "") in _idents("Arbor Colossus")
     assert "self_counter_grow" not in _keys("Cathars' Crusade")
     assert "self_counter_grow" not in _keys("Giant Growth")
+
+
+def test_self_counter_grow_reads_otherwise_branch():
+    """phase v0.94.0 carries "put a +1/+1 counter on that creature if its
+    power is less than Shelinda's power. Otherwise, put a +1/+1 counter on
+    Shelinda" as a conditional whose ``else_ability`` holds the
+    PutCounter{P1P1, SelfRef} — the effect chain never walks that branch, so
+    the structural read does. CR 122.1. The near miss: Tribute to the World
+    Tree's "Otherwise, put two +1/+1 counters on it" rides the same
+    ``else_ability`` shape but grows the ENTERING creature, never itself."""
+    assert ("self_counter_grow", "you", "") in _idents("Shelinda, Yevon Acolyte")
+    assert "self_counter_grow" not in _keys("Tribute to the World Tree")
 
 
 def test_flash_matters_opponent_turn_cast_payoff_mirror():
@@ -14465,6 +14571,26 @@ def test_toughness_combat_structural_and_value_residue():
     assert "toughness_combat" not in _keys("Master of Cruelties")
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Shape Stealer",
+        "Eldrazi Mimic",
+        "Exuberant Wolfbear",
+        "Halfdane",
+        "Ambassador Blorpityblorpboop",  # base toughness alone, set to a sum
+    ],
+)
+def test_toughness_combat_base_pt_copy_is_not_a_value_read(name):
+    """CR 613.4b: "base power and toughness become equal to <X>'s power and
+    toughness" is a layer-7b P/T copy, not toughness read as a value — the
+    v0.94.0 Oracle wording ("become equal to", was "change … to") must not
+    trip the residue mirror's ``equal to … toughness`` arm. A lone "base
+    toughness become equal to …" (Ambassador Blorpityblorpboop) is the same
+    7b set."""
+    assert "toughness_combat" not in _keys(name)
+
+
 def test_typed_anthem_multi_structural_and_color_gate():
     """CR 205.3m (creature types) + 613.4c + 105.2a (colors are NOT
     subtypes): a pump modification over a Creature filter naming >= 2
@@ -14764,44 +14890,56 @@ def test_voting_matters_trigger_event_and_effect_split():
     assert "voting_makers" in expro
 
 
-# ── named_synergy (ADR-0039 W8, KEPT-twelve wave) ────────────────────────────
-# CR 201.4 / 201.5. Entirely bridge-served (named_synergy_overloaded_named_
-# node in bridge_ledger.py) — the raw typed Named node this idiom carries is
-# corpus-verified too overloaded (partner pairs / copy-limit swarms / named-
-# card tutoring / planeswalker-uncoupled callbacks) to read directly, so the
-# bridge's idiom-bounded regex (byte-identical to the deleted
-# NAMED_PERMANENT_REGEX SWEEP producer) stays the mechanism. 27/27 both, 0
-# live_only, 0 cw_only on the full commander-legal corpus re-measure
-# (2026-07-12).
+# ── named_synergy ──────────────────────────────────────────────────────────────
+# A typed ``Named`` reference to a permanent (``reads.named_permanent_refs``),
+# read by the ``_named_synergy`` lane; the clauses phase parks or drops ride the
+# ``named_synergy_parked_reference`` ledger row (test_bridge_ledger.py).
 
 
-def test_named_synergy_self_reference_legend_rule_bypass():
-    """Brothers Yamazaki's "Each other creature named Brothers Yamazaki
-    gets +2/+2 and has haste" — a self-referencing permanent-named-X
-    payoff (CR 201.5) that ALSO carries a real typed ``Named`` filter
-    property (phase v0.20.0 preserves the name string here), but the
-    bridge's idiom-bounded regex match is what actually fires the lane
-    (the raw node is too overloaded to read directly — see the bridge's
-    module comment)."""
-    assert ("named_synergy", "you", "") in _idents("Brothers Yamazaki")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Brothers Yamazaki",  # "each other creature named Brothers Yamazaki"
+        "Mishra, Claimed by Gix",  # a meld partner
+        "Festering Newt",  # "if you control a creature named Bogbrew Witch"
+        "Plague Rats",  # "the number of creatures named Plague Rats"
+        "Crown of Empires",  # "artifacts named Scepter of Empires and …"
+    ],
+)
+def test_named_synergy_reads_a_typed_named_permanent(name):
+    from mtg_utils._analysis.lanes import _named_synergy
+
+    assert any(s.key == "named_synergy" for s in _named_synergy(_tree(name)))
+    assert ("named_synergy", "you", "") in _idents(name)
 
 
-def test_named_synergy_other_card_reference():
-    """Mishra, Claimed by Gix's meld clause references a DIFFERENT card by
-    name ("a creature named Phyrexian Dragon Engine") — CR 201.4, the
-    genuinely-other-permanent half of the split (not the CR 201.5 self-
-    reference half). No typed ``Named`` node here either (the bridge's
-    regex match is the only mechanism, matching Sheltered Valley)."""
-    assert ("named_synergy", "you", "") in _idents("Mishra, Claimed by Gix")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Squadron Hawk",  # "search your library for … cards named Squadron Hawk"
+        "Accumulated Knowledge",  # "cards named … in all graveyards"
+        "Oriss, Samite Guardian",  # grandeur: "Discard another card named …"
+        "Ebondeath, Dracolich",  # "a creature not named Ebondeath"
+        "Relentless Rats",  # a copy-limit swarm naming itself: copy_limit's
+        "Seven Dwarves",
+        # a name the card supplies itself: its own token, its own copy, a rename
+        "Rite of the Raging Storm",  # "Creatures named Lightning Rager" (its token)
+        "Wirefly Hive",  # "destroy all permanents named Wirefly" (its token)
+        "Wedding Ring",  # an opponent's copy of it
+        "Tenth District Hero",  # "becomes a legendary creature named Mileva"
+    ],
+)
+def test_named_synergy_skips_cards_tutors_and_swarms(name):
+    assert "named_synergy" not in _keys(name)
 
 
-def test_named_synergy_no_typed_node_at_all():
-    """Sheltered Valley's "sacrifice each other permanent named Sheltered
-    Valley you control" carries NO typed ``Named`` node anywhere (phase
-    drops the reference entirely here — the stale ADR-0027 case this
-    bridge's module comment notes still holds for SOME cards even though
-    it no longer holds universally). The bridge's regex-over-oracle match
-    is the ONLY mechanism that reaches it."""
+def test_named_synergy_parked_reference_is_bridged():
+    """Sheltered Valley's "sacrifice each other permanent named Sheltered Valley"
+    is a replacement phase parks whole (no typed Named node): the ledger row
+    serves it."""
+    from mtg_utils._analysis.lanes import _named_synergy
+
+    assert not _named_synergy(_tree("Sheltered Valley"))
     assert ("named_synergy", "you", "") in _idents("Sheltered Valley")
 
 
@@ -14901,29 +15039,35 @@ def test_gain_control_exchange_control(name):
 
 
 def test_fixture_corpus_emits_only_manifest_served_keys():
-    """Every key the lanes emit over the fixture corpus is manifest-served.
+    """Every key the lanes emit over the snapshot's phase records is manifest-served.
 
     NOT tautological (ADR-0014): the strangler-era in-extractor filter that
     once made this assertion unfalsifiable was deleted 2026-07-25 — the lanes
     now emit whatever they produce, so this is a live drift guard (the
     snapshot-corpus twin lives in test_signal_keys_real_cards.py)."""
-    for name in _cards():
-        assert _keys(name) <= SERVED_SIGNAL_KEYS
+    for card, rec in _corpus():
+        root = strict_load_card(rec, _schema(), name=rec["name"])
+        tree = as_signal_tree(build_concept_tree(root, name=rec["name"]))
+        keys = {s.key for s in extract_crosswalk_signals(tree, keywords=_kw(card))}
+        assert keys <= SERVED_SIGNAL_KEYS, rec["name"]
 
 
 # ── ADR-0035 Stage-3b (b) — overlay-correction stage + substrate-purity ───────
 
 
 def test_overlay_stage_never_writes_into_the_l1_substrate():
-    """The substrate-purity invariant over the WHOLE fixture: the overlay stage
+    """The substrate-purity invariant over the WHOLE snapshot: the overlay stage
     decorates the Layer-2 concept overlay and leaves every Layer-1 phase-mirror
     node byte-identical AND the same object.
 
     This is the load-bearing safety property (ADR-0035): a correction that leaked
     into the frozen substrate — or swapped a mirror node for a rebuilt one — fails
     here loud, per card."""
-    for name in _cards():
-        tree = _tree(name)
+    for _card, rec in _corpus():
+        name = rec["name"]
+        tree = build_concept_tree(
+            strict_load_card(rec, _schema(), name=name), name=name
+        )
         before_bytes = l1_bytes(tree)
         before_ids = [id(n) for n in _l1_nodes(tree)]
         corrected = apply_overlay_corrections(tree)
@@ -14945,7 +15089,7 @@ def test_substrate_purity_guard_is_not_vacuous():
     content check — cannot see the swap; the id-based ``_assert_substrate_pure``
     (the live guard) MUST. If this ever stops raising, the invariant has gone
     vacuous and every positive substrate-purity assertion is worthless."""
-    tree = _tree("Smite")
+    tree = _raw_tree("Smite")
     before = _l1_identity(tree)
 
     unit = tree.units[0]
@@ -14967,7 +15111,7 @@ def test_substrate_purity_guard_is_not_vacuous():
 
 def _corrected_effects(name: str):
     """The (before, after) concept-node pairs for one fixture card's effects."""
-    tree = _tree(name)
+    tree = _raw_tree(name)
     corrected = apply_overlay_corrections(tree)
     pairs = []
     for ub, ua in zip(tree.units, corrected.units, strict=True):
@@ -15001,10 +15145,11 @@ def test_overlay_exile_removal_lands_category_and_subject():
 
 def test_overlay_removal_target_subject_lands_subject():
     """(b) _recover_removal_target_subject: a destroy whose creature target phase
-    dropped (Smite) gains a Creature subject on the overlay."""
+    dropped (Fatal Push; Smite was the pin until phase v0.104.0 typed its
+    "target blocked creature") gains a Creature subject on the overlay."""
     hits = [
         a
-        for b, a in _corrected_effects("Smite")
+        for b, a in _corrected_effects("Fatal Push")
         if a.concept == "destroy" and not b.subject and a.subject
     ]
     assert hits
@@ -15067,7 +15212,7 @@ def test_overlay_graveyard_zones_native_stand_aside():
 
 def test_overlay_stage_is_noop_when_no_arm_fires():
     """A card no arm touches is returned by identity (cheap, allocation-free)."""
-    tree = _tree("Grizzly Bears")
+    tree = _raw_tree("Grizzly Bears")
     assert apply_overlay_corrections(tree) is tree
 
 
@@ -15249,21 +15394,21 @@ def test_graveyard_matters_modifycost_morbid_excluded():
     assert "graveyard_matters" not in _keys("Bone Picker")
 
 
-def test_graveyard_matters_canattackwithdefender_via_marker_only():
-    """Expedition Lookout's ``CanAttackWithDefender`` condition
-    (GraveyardSize, player=Opponent) is excluded from the CONDITION-GATE
-    arm (the old IR this lane mirrors never builds an ``Ability``/
-    ``.condition`` object for that static-mode there), but the SEPARATE
-    ``_graveyard_count_markers`` deep-scan fallback below reaches the SAME
-    node via a raw whole-record walk that legacy's own marker producer
-    ALSO performs regardless of ability kind — confirmed against a direct
-    ``extract_signals_ir`` run: legacy DOES fire
-    ``('graveyard_matters', 'opponents')`` for this card, via its
-    ``board_count`` marker (scope='opp'), never a forced 'you' (CR
-    400.7)."""
+def test_graveyard_matters_gated_evasion_split_reads_like_phantasm():
+    """Expedition Lookout's "can attack as though it didn't have defender
+    and it can't be blocked" is TWO statics since phase v0.94.0 — a
+    ``CanAttackWithDefender`` and a sibling ``CantBeBlocked``, each gated
+    on the same GraveyardSize(player=Opponent) condition. The
+    ``CanAttackWithDefender`` half stays excluded from the CONDITION-GATE
+    arm (the old IR's blind spot for that static-mode), but the
+    ``CantBeBlocked`` half is an ordinary gated static — the Jace's
+    Phantasm class: the field's own 'opponents' scope plus the arm's
+    forced 'you'. (Through v0.86.0 phase folded both halves into the one
+    ``CanAttackWithDefender`` static, so only the deep-scan fallback
+    reached the count and fired 'opponents' alone.)"""
     idents = _idents("Expedition Lookout")
     assert ("graveyard_matters", "opponents", "") in idents
-    assert ("graveyard_matters", "you", "") not in idents
+    assert ("graveyard_matters", "you", "") in idents
 
 
 # ── ADR-0038 W6 endgame: graveyard_matters landfall (31 -> 0 live_only) ─────
@@ -15466,11 +15611,12 @@ def test_artifacts_matter_choose_one_of_wrapped_sac():
     {2}{W}." (CR 603.12 reflexive trigger; Food is an artifact subtype, CR
     205.3g). Through phase v0.23.0 this decomposed as a modal
     ``ChooseOneOf`` branch whose typed Food Sacrifice the deep scan read;
-    the v0.26.0+ reflexive-payment rework parks the WHOLE body as
-    ``Unimplemented(name='reflexive optional payment')`` — a parse
-    REGRESSION now served by the
-    ``artifact_sac_reflexive_payment_unparsed`` ledgered bridge
-    (self-retiring when phase re-lands the typed branch)."""
+    the v0.26.0-v0.66.0 reflexive-payment rework parked the WHOLE body as
+    ``Unimplemented(name='reflexive optional payment')``; v0.86.0 structures
+    it as an effect-role ``PayCost{cost: OneOf[Sacrifice(Food), Mana]}`` +
+    ``WhenYouDo`` — a shape OUR overlay's cost decoration doesn't read yet,
+    served by the ``artifact_sac_reflexive_payment_undecorated`` ledgered
+    bridge until it does."""
     assert ("artifacts_matter", "you", "") in _idents("Nimble Hobbit")
 
 
@@ -15749,8 +15895,8 @@ def test_damage_recovery_row_closes_computed_amount_tail():
     the sacrificed creatures" (CR 120.1) — a total-power sacrifice tally
     phase's own amount grammar can't structure — lands as an Unimplemented
     residue the recovery.ALLOWLIST "damage" row re-decorates to
-    "deal_damage"; the raw residue's "any target" phrase satisfies
-    ``_RECOVERED_DAMAGE_REACH``."""
+    "deal_damage"; the residue's "any target" phrase earns the seam's
+    ``OTHER_PLAYER`` mark."""
     assert ("direct_damage", "you", "") in _idents("Soulblast")
 
 
@@ -15766,8 +15912,8 @@ def test_damage_recovery_row_closes_computed_amount_tail():
 def test_direct_damage_recovered_reach_words(name):
     """The recovered-node raw-read direction gate (no typed ``target`` field
     survives a computed-amount Unimplemented residue): "each opponent" /
-    "that player" / "target player or planeswalker" all satisfy
-    ``_RECOVERED_DAMAGE_REACH`` (CR 120.1). An "unless" guard on the damage
+    "that player" / "target player or planeswalker" all earn the seam's
+    ``OTHER_PLAYER`` mark (CR 120.1). An "unless" guard on the damage
     (Crimson Honor Guard / Curse Artifact) doesn't change the recipient —
     still a genuine burn source, just a punisher/upkeep-tax shape."""
     assert ("direct_damage", "you", "") in _idents(name)
@@ -15788,8 +15934,8 @@ def test_direct_damage_recovered_creature_only_stays_excluded():
     """Whipkeeper's "deals damage to target creature equal to the damage
     already dealt to it" (CR 120.1) recovers to "deal_damage" (the amount is
     a computed reference phase drops) but its recipient phrase is bare
-    "target creature" — no player-reach word — so ``_RECOVERED_DAMAGE_REACH``
-    correctly excludes it. Joins the pre-existing creature-only tap-ability
+    "target creature" — no player-reach word — so the seam marks no
+    ``OTHER_PLAYER`` and the lane correctly excludes it. Joins the pre-existing creature-only tap-ability
     shed class rather than closing a genuine gap."""
     assert "direct_damage" not in _keys("Whipkeeper")
 
@@ -15949,14 +16095,14 @@ def test_direct_damage_valakut_exploration_graduated_structural():
     assert ("direct_damage", "you", "") in _idents("Valakut Exploration")
 
 
-def test_direct_damage_bridge_avatar_aang_conjunction_tail_drop():
-    """BRIDGE ``avatar_aang_conjunction_tail_drop``: a FIVE-effect
-    ``SequentialSibling`` conjunction (gain life, draw, put counters, deal
-    damage) terminates after the FOURTH effect — the fifth conjunct "he
-    deals 4 damage to each opponent" carries no node (CR 120.1). Pinned via
-    the transformed back face's own fixture key ("Aang, Master of
-    Elements") — the front face ("Avatar Aang") carries neither this
-    trigger nor the damage clause."""
+def test_direct_damage_avatar_aang_fifth_conjunct():
+    """A FIVE-effect ``SequentialSibling`` conjunction (gain life, draw, put
+    counters, deal damage): through v0.94.0 phase's chain stopped after the
+    fourth effect and the ``avatar_aang_conjunction_tail_drop`` ledger bridge
+    served "he deals 4 damage to each opponent"; v0.104.0 carries the fifth
+    conjunct, so the read is structural. Pinned via the transformed back
+    face's own name ("Aang, Master of Elements") — the front face ("Avatar
+    Aang") carries neither this trigger nor the damage clause."""
     assert ("direct_damage", "you", "") in _idents("Aang, Master of Elements")
 
 
@@ -15967,37 +16113,21 @@ def test_direct_damage_bridge_insult_injury_aftermath_face_unparsed():
     ``ConceptTree`` — neither phase's own parse nor the W2c text-only
     fallback structures this face at all (the ``lure_makers`` "Lead"
     precedent's zero-typed-substrate shape, CR 120.1)."""
-    from mtg_utils._deck_forge._ir_lookup import _text_only_tree
-
-    face = {
-        "name": "Injury",
-        "mana_cost": "{2}{R}",
-        "type_line": "Sorcery",
-        "oracle_text": (
-            "Aftermath (Cast this spell only from your graveyard. "
-            "Then exile it.)\n"
-            "Injury deals 2 damage to target creature and 2 damage to "
-            "target player or planeswalker."
-        ),
-    }
-    tree = _text_only_tree(
-        face, {"cmc": 3.0}, oracle_id="47543892-4d60-4c6b-a6a4-69b9172af01e"
-    )
+    tree = _text_only_face_tree("Insult // Injury", "Injury")
     assert tree is not None
     assert tree.units == ()  # zero typed substrate — text idioms only
     idents = {
         (s.key, s.scope, s.subject)
-        for s in extract_crosswalk_signals(tree, keywords=frozenset())
+        for s in extract_crosswalk_signals(as_signal_tree(tree), keywords=frozenset())
     }
     assert ("direct_damage", "you", "") in idents
 
 
-def test_direct_damage_bridge_karn_living_legacy_emblem_tap_cost_damage():
-    """BRIDGE ``karn_living_legacy_emblem_tap_cost_damage``: the [-7]
-    emblem's granted "Tap an untapped artifact you control: This emblem
-    deals 1 damage to any target." is parked entirely as an opaque
-    ``CreateEmblem.statics[].description`` string (the ``sac_emblem_
-    activated_cost`` bridge's Sacrifice-costed sibling shape, CR 120.1).
+def test_direct_damage_karn_living_legacy_emblem_tap_cost_damage():
+    """The [-7] emblem's granted "Tap an untapped artifact you control: This
+    emblem deals 1 damage to any target." is parked entirely as an opaque
+    emblem_creation residue; the recovery stage reads the grant's own damage
+    instruction after its cost (a ledger row through phase v0.104.0's bump).
     Koth of the Hammer's structurally-identical-looking emblem stays
     UNaffected — its Mountain-static grant is already served via a
     different, already-structural path."""
@@ -16022,12 +16152,9 @@ def test_direct_damage_devil_token_quoted_grant_structural(name):
     a tapped and attacking 1/1 red Devil creature token with 'When this
     token dies, it deals 1 damage to any target.'" is ONE ``Unimplemented
     (name='create', ...)`` residue whose dominant verb token is "create,"
-    so the make_token recovery ALLOWLIST never descends into the quoted
-    granted-ability text (contrast Dance with Devils's simpler,
-    un-triggered phrasing, which IS structured). ``tree_synthesis``'s
-    ``devil_token_quoted_grant_dominant_verb_create`` arm now synthesizes a
-    typed ``synth_direct_damage_dropped_grant`` marker node for the nested
-    damage clause, which ``_direct_damage`` reads structurally (CR 120.1)."""
+    through phase v0.94.0, served by a synthesis arm. Phase v0.104.0 types the
+    quoted grant, so the arm retired and the structural read serves it (CR
+    120.1)."""
     assert ("direct_damage", "you", "") in _idents(name)
 
 
@@ -16048,10 +16175,9 @@ def test_direct_damage_keranos_effect_structure_structural():
     ``Unimplemented(name='effect_structure', ...)`` diagnostic residue (a
     genuine upstream parse failure; Grolnok / Mairsil share the same
     diagnostic name for unrelated idioms and stay open bridge rows).
-    ``tree_synthesis``'s ``keranos_effect_structure_parse_failure`` arm now
-    synthesizes a typed ``synth_direct_damage_dropped_grant`` marker node
-    for the bounded damage-clause tail, which ``_direct_damage`` reads
-    structurally (CR 120.1)."""
+    Since phase v0.104.0 the recovery stage reads the residue instruction by
+    instruction, so "Keranos deals 3 damage to any target" is a recovered
+    damage clause ``_direct_damage`` reads (its synthesis arm retired)."""
     assert ("direct_damage", "you", "") in _idents("Keranos, God of Storms")
 
 
@@ -16250,11 +16376,9 @@ def test_base_power_matters_excludes_current_power_scope():
 
 def test_base_power_matters_conjunctive_bridge_duskana():
     """The former ``duskana_bess_base_pt_and_toughness_ref`` ledgered
-    bridge, graduated (ADR-0039 task #82) into ``tree_synthesis.
-    _arm_base_power_ref_conjunctive``: phase drops the CONJUNCTIVE "base
-    power and toughness 2/2" reference form (Duskana's ETB draw-per) with
-    zero trace — no PtComparison node at all, unlike the single-stat form
-    Rapid Augmenter carries structurally."""
+    bridge, then a synthesis arm: phase dropped the CONJUNCTIVE "base power and
+    toughness 2/2" reference (Duskana's ETB draw-per) through v0.94.0. Phase
+    v0.104.0 types it as a ``PtComparison``, so the structural read serves it."""
     assert ("base_power_matters", "you", "") in _idents("Duskana, the Rage Mother")
 
 
@@ -16598,19 +16722,10 @@ def test_cheat_from_top_scopes_target_owner_beneficiary_any():
     ``_idents`` call never runs the floor) — the SAME ParentTargetOwner
     beneficiary override :func:`_cheat_into_play`'s structural arm reads
     for it applies here too. Scope "any", not "you"."""
-    from mtg_utils._deck_forge.lanes import apply_membership_floor
+    from mtg_utils._analysis.lanes import apply_membership_floor
 
     assert "cheat_from_top" not in _keys("Chaos Warp")
-    record = {
-        "name": "Chaos Warp",
-        "oracle_text": (
-            "The owner of target permanent shuffles it into their library, "
-            "then reveals the top card of their library. If it's a "
-            "permanent card, they put it onto the battlefield."
-        ),
-        "cmc": 3,
-        "keywords": [],
-    }
+    record = test_card("Chaos Warp")
     out = []
     apply_membership_floor([_tree("Chaos Warp")], record, out, out.append)
     floor_sigs = [s for s in out if s.key == "cheat_from_top"]
@@ -16884,7 +16999,7 @@ def test_type_changers_excludes(name):
 
 
 def test_grant_payloads_bonescythe_double_strike():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Bonescythe Sliver"))
     assert [(p.keyword, p.scope, p.subject) for p in pays] == [
@@ -16894,7 +17009,7 @@ def test_grant_payloads_bonescythe_double_strike():
 
 
 def test_grant_payloads_first_slivers_chosen_exalted():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("First Sliver's Chosen"))
     assert [(p.keyword, p.scope, p.subject) for p in pays] == [
@@ -16906,7 +17021,7 @@ def test_grant_payloads_absolute_grace_each_scope_mirrorvariant():
     # "All creatures have protection from black": no controller filter (an
     # each-scope grant) and a MirrorVariant-wrapped keyword that must
     # normalize to its key name.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Absolute Grace"))
     assert [(p.keyword, p.scope, p.subject) for p in pays] == [
@@ -16916,7 +17031,7 @@ def test_grant_payloads_absolute_grace_each_scope_mirrorvariant():
 
 def test_grant_payloads_empty_for_a_type_changer():
     # Xenograft adds a TYPE, not an ability — no AddKeyword, no payload.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     assert extract_grant_payloads(_tree("Xenograft")) == ()
 
@@ -16925,7 +17040,7 @@ def test_grant_payloads_ability_grants_carry_kind_and_raw():
     # ADR-0040 §2 (task #97): a granted ACTIVATED ability (Scuttling Sliver's
     # untap, CR 113.3b) is a real grant payload — kind "ability", no keyword.
     # Dan's Q2 adjudication: Scuttling Sliver is not a correct cut.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Scuttling Sliver"))
     assert [(p.kind, p.keyword, p.scope, p.subject) for p in pays] == [
@@ -16937,7 +17052,7 @@ def test_grant_payloads_ability_grants_carry_kind_and_raw():
 def test_grant_payloads_bladeback_hellbent_condition_survives_in_raw():
     # The hellbent gate (the ADR-0040 §2 observed mislead) must be readable
     # off the payload so the quality predicate can demote it.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Bladeback Sliver"))
     assert [(p.kind, p.scope, p.subject) for p in pays] == [
@@ -16949,20 +17064,20 @@ def test_grant_payloads_bladeback_hellbent_condition_survives_in_raw():
 def test_grant_payloads_exclude_attached_single_recipients():
     # "Equipped creature … has flying" grants to ONE creature — never a mass
     # Granter payload (the type_changers attach-exclusion, same shapes).
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     assert extract_grant_payloads(_tree("Raven Wings")) == ()
 
 
 def test_grant_payloads_keyword_kind_default():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Lancer Sliver"))
     assert [(p.kind, p.keyword) for p in pays] == [("keyword", "first strike")]
 
 
 def test_grant_payloads_outlast_parameterized_keyword():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Enduring Sliver"))
     assert [(p.kind, p.keyword) for p in pays] == [("keyword", "outlast")]
@@ -16978,7 +17093,7 @@ def test_grant_payloads_outlast_parameterized_keyword():
 
 
 def test_grant_payloads_goblin_king_emits_anthem_alongside_landwalk():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     pays = extract_grant_payloads(_tree("Goblin King"))
     kinds = [(p.kind, p.keyword) for p in pays]
@@ -16991,7 +17106,7 @@ def test_grant_payloads_goblin_king_emits_anthem_alongside_landwalk():
 def test_grant_payloads_goblin_king_grades_solid_via_anthem():
     # The anthem IS the card's value; the table-weak landwalk keyword must
     # never be the sole grade once the +1/+1 payload is surfaced.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
     from mtg_utils._tuner.ability_quality import grant_grade
 
     pays = extract_grant_payloads(_tree("Goblin King"))
@@ -17001,7 +17116,7 @@ def test_grant_payloads_goblin_king_grades_solid_via_anthem():
 def test_grant_payloads_enduring_sliver_still_grades_weak():
     # A pure weak-keyword granter (no AddPower/AddToughness mod) must NOT
     # pick up a phantom anthem payload from the anthem arm.
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
     from mtg_utils._tuner.ability_quality import grant_grade
 
     pays = extract_grant_payloads(_tree("Enduring Sliver"))
@@ -17018,7 +17133,7 @@ def test_grant_payloads_enduring_sliver_still_grades_weak():
 
 
 def test_grant_payloads_exclude_combat_relation_recipients():
-    from mtg_utils._deck_forge.lanes import extract_grant_payloads
+    from mtg_utils._analysis.lanes import extract_grant_payloads
 
     assert extract_grant_payloads(_tree("Alms Beast")) == ()
 
@@ -17098,8 +17213,8 @@ def test_type_changers_structural_graveyard_zone_routes_to_graveyard_key():
     # affected — the Ashes of the Fallen shape, CR 109.2), the lane must key
     # it graveyard, NOT battlefield: the bridges' retirement path depends on
     # the structural read routing zones honestly.
+    from mtg_utils._analysis.lanes import _type_changers
     from mtg_utils._card_ir.mirror.generated import T_properties__InZone
-    from mtg_utils._deck_forge.lanes import _type_changers
 
     tree = _synth_type_changer_tree([T_properties__InZone(zone="Graveyard")])
     idents = {(s.key, s.scope, s.subject) for s in _type_changers(tree)}
@@ -17108,8 +17223,8 @@ def test_type_changers_structural_graveyard_zone_routes_to_graveyard_key():
 
 
 def test_type_changers_structural_inanyzone_routes_to_all_keys():
+    from mtg_utils._analysis.lanes import _type_changers
     from mtg_utils._card_ir.mirror.generated import T_properties__InAnyZone
-    from mtg_utils._deck_forge.lanes import _type_changers
 
     tree = _synth_type_changer_tree([T_properties__InAnyZone(zones=[])])
     keys = {s.key for s in _type_changers(tree)}
@@ -17299,6 +17414,9 @@ def test_damage_for_each_excludes(name):
         "Razia's Purification",
         "Covetous Elegy",
         "Slaughter the Strong",
+        # Graduated off the keep_n_wrath_unimplemented_choose bridge at phase
+        # v0.94.0: a first-class ChooseAndSacrificeRest node now.
+        "Promise of Loyalty",
     ],
 )
 def test_keep_n_wrath_fires_each(name):
@@ -17310,7 +17428,24 @@ def test_keep_n_wrath_one_sided_opponents():
     # untouched — the trigger's OnlyDuringOpponentsTurn constraint carries
     # the scope (Archfiend of Depravity).
     assert ("keep_n_wrath", "opponents", "") in _idents("Archfiend of Depravity")
-    assert ("keep_n_wrath", "opponents", "") in _idents("No One Will Hear Your Cries")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # phase v0.94.0 moved this onto ChooseAndSacrificeRest; the Opponent
+        # player_scope rides the owning wrapper, not the node.
+        "No One Will Hear Your Cries",
+        # The -9 / -4 loyalty abilities carried an Opponent player_scope all along, but the
+        # ChooseAndSacrificeRest arm used to fire "each" unconditionally.
+        "Liliana, Dreadhorde General",
+        "Ajani, Nacatl Avenger",
+    ],
+)
+def test_keep_n_wrath_choose_and_sacrifice_rest_one_sided(name):
+    idents = _idents(name)
+    assert ("keep_n_wrath", "opponents", "") in idents
+    assert ("keep_n_wrath", "each", "") not in idents
 
 
 def test_keep_n_wrath_bridge_serves_unimplemented_choose_members():
@@ -17394,11 +17529,28 @@ def test_keep_n_wrath_cataclysm_keeps_its_mass_removal_fire():
 # its CopySpell node, never a ChangeTargets node. Wild Ricochet fires BOTH
 # lanes — its ChangeTargets node redirects the original AND its CopySpell
 # sub-ability copies (each read on its own node). Gain-control-then-retarget
-# follow-ons (Commandeer's ParentTarget) and ability-only redirects carry no
-# StackSpell leaf in the ChangeTargets target — excluded.
+# follow-ons (Commandeer's ParentTarget) carry no stack leaf in the
+# ChangeTargets target, but a unit that gains control of a stack spell is a
+# thief, and the thieves count (Dan, 2026-10-08). An ability redirect counts too
+# (CR 115.7: "change the target(s) of a spell or ability" — Reroute).
 
 
-@pytest.mark.parametrize("name", ["Wild Ricochet", "Deflecting Swat", "Bolt Bend"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Wild Ricochet",
+        "Deflecting Swat",
+        "Bolt Bend",
+        "Reroute",
+        "Wyll's Reversal",  # nested in its d20 table
+        # Spell thieves (Commandeer's ruling: "After Commandeer resolves, you
+        # control the targeted spell"), Dan 2026-10-08.
+        "Commandeer",
+        "Aethersnatch",
+        "Perplexing Chimera",
+        "Invert Polarity",
+    ],
+)
 def test_spell_redirect_fires_for_stack_spell_changetargets(name):
     assert ("spell_redirect", "you", "") in _idents(name)
 
@@ -17417,8 +17569,6 @@ def test_wild_ricochet_fires_both_redirect_and_copy_lanes():
         "Twincast",
         # Counter tag — counter_control's lane.
         "Counterspell",
-        # ParentTarget follow-on after GainControl, no StackSpell leaf.
-        "Commandeer",
     ],
 )
 def test_spell_redirect_excludes(name):
@@ -17494,3 +17644,177 @@ def test_combat_choice_makers_excludes(name):
 @pytest.mark.parametrize("name", ["Balance", "Limited Resources"])
 def test_keep_n_wrath_bridge_excludes_land_resets(name):
     assert "keep_n_wrath" not in _keys(name)
+
+
+# ── Retirement canaries for card_classify's crosswalk reads ───────────────────
+
+
+@pytest.mark.retirement_canary
+@pytest.mark.parametrize("name", ["Ellie, Vengeful Hunter", "Atreus, Impulsive Son"])
+def test_survivors_partner_is_still_generic_canary(name):
+    """Retirement canary for ``crosswalk.core.PARTNER_GROUPS_PHASE_COLLAPSES``.
+    Phase v0.94.0 parses partner—Survivors and partner—Father & son as
+    ``Partner{Generic}`` (plain partner), which CR 702.124f keeps apart. When phase
+    gives them their own variants, this fails RETIRE-READY."""
+    rec = _record(name)
+    kinds = [
+        kw["Partner"]
+        for kw in rec.get("keywords") or []
+        if isinstance(kw, dict) and "Partner" in kw
+    ]
+    group = next(g for g in PARTNER_GROUPS_PHASE_COLLAPSES if g in rec["oracle_text"])
+    assert kinds == [{"type": "Generic"}], (
+        "crosswalk.core._corrected_partner_kind: RETIRE-READY — phase now reads "
+        f"{name}'s partner—{group} ability as {kinds}. Map the new variant in "
+        "card_classify._PARTNER_KIND_OF_VARIANT, then delete "
+        "PARTNER_GROUPS_PHASE_COLLAPSES, _corrected_partner_kind and this canary."
+    )
+
+
+@pytest.mark.retirement_canary
+def test_cryptic_spires_mana_is_still_a_residue_canary():
+    """Retirement canary for ``crosswalk.reads.CIRCLED_COLORS_RESIDUE``. Phase
+    v0.94.0 parks Cryptic Spires' mana ability as an ``Unimplemented`` residue, so
+    its trees carry no ``Mana`` effect (and ``mana_colors`` reads the residue as
+    ``"any"``)."""
+    trees = trees_for(test_card("Cryptic Spires"))
+    has_mana_node = any(
+        tag_of(c.node) == "Mana"
+        for tree in trees
+        for u in tree.units
+        for c in u.effects
+    )
+    still_residue = (
+        any(CIRCLED_COLORS_RESIDUE in r for tree in trees for r in tree.residues())
+        and not has_mana_node
+    )
+    assert still_residue, (
+        "crosswalk.reads.mana_colors: RETIRE-READY — phase now parses Cryptic "
+        "Spires' mana ability. Delete CIRCLED_COLORS_RESIDUE, its check in "
+        "mana_colors and this canary."
+    )
+
+
+@pytest.mark.retirement_canary
+def test_boxing_ring_gate_is_still_a_residue_canary():
+    """Retirement canary for ``crosswalk.reads.UNPARSED_ACTIVATION_GATE``. Phase
+    v0.94.0 parks Boxing Ring's "Activate only if you control a creature that fought
+    this turn" as an ``unparsed_condition`` residue in its Treasure ability's effect
+    chain, with no ``activation_restrictions`` entry."""
+    units = [
+        u
+        for tree in trees_for(test_card("Boxing Ring"))
+        for u in tree.units
+        if any(c.concept == "make_token" for c in u.effects)
+    ]
+    typed = any(
+        tag_of(a) == "RequiresCondition"
+        for u in units
+        if isinstance(ars := getattr(u.node, "activation_restrictions", None), list)
+        for a in ars
+    )
+    residue = any(
+        (getattr(c.node, "description", "") or "").startswith(UNPARSED_ACTIVATION_GATE)
+        for u in units
+        for c in u.effects
+        if tag_of(c.node) == "Unimplemented"
+    )
+    retire = (
+        "crosswalk.reads._unit_activation_gated: RETIRE-READY — phase now carries "
+        "Boxing Ring's activation condition. Delete UNPARSED_ACTIVATION_GATE, its "
+        "residue arm in _unit_activation_gated and this canary."
+    )
+    assert residue, retire
+    assert not typed, retire
+
+
+@pytest.mark.retirement_canary
+def test_verdant_mastery_piles_are_still_lost_canary():
+    """Retirement canary for ``crosswalk.reads.lost_pile_count``. Phase v0.94.0
+    loses Verdant Mastery's piles ("Put two of them onto the battlefield tapped
+    under your control and the rest into your hand"): no count on the battlefield
+    moves, and the hand pile parsed as a ``ChangeZoneAll`` onto your battlefield.
+    When phase counts the piles, the gate stops matching and this fails
+    RETIRE-READY."""
+    (tree,) = trees_for(test_card("Verdant Mastery"))
+    piles = [lost_pile_count(u) for u in tree.units]
+    assert 2 in piles, (
+        "crosswalk.reads.lost_pile_count: RETIRE-READY — phase now parses Verdant "
+        "Mastery's piles. Read your pile's count off the tree, then delete "
+        "lost_pile_count, _YOUR_PILE_RE and this canary."
+    )
+
+
+@pytest.mark.parametrize("name", ["Earth Village Ruffians", "Wildgrove Summoner"])
+def test_a_dies_trigger_returning_another_card_is_no_self_return(name):
+    """``is_dies_return_trigger`` (undying / persist, CR 702.93a / 702.79a) wants the
+    object that died. Earthbend's "when it dies, return it" watches the animated
+    land; Wildgrove Summoner puts the Forests it seeks onto the battlefield."""
+    from mtg_utils._card_ir.crosswalk import is_dies_return_trigger
+
+    units = [u for t in trees_for(test_card(name)) for u in t.iter_units("trigger")]
+    assert units
+    assert not any(is_dies_return_trigger(u.node) for u in units)
+
+
+@pytest.mark.retirement_canary
+def test_glorfindel_blocking_limit_misparse_canary():
+    """Phase v0.94.0 parses Glorfindel, Dauntless Rescuer's "can't be blocked by more
+    than one creature each combat this turn" as ``CantBeBlockedBy`` a typeless
+    filter, so ``reads.limits_blockers_to_one`` (cut-check's menace interaction)
+    misses it. RETIRE-READY when the mode reads ``CantBeBlockedByMoreThan``: then
+    cut-check flags menace + Glorfindel with no change, and this canary goes."""
+    from mtg_utils._card_ir.crosswalk.reads import limits_blockers_to_one
+
+    trees = trees_for(test_card("Glorfindel, Dauntless Rescuer"))
+    assert not any(limits_blockers_to_one(t) for t in trees), (
+        "Glorfindel: RETIRE-READY — phase now parses the blocking limit; delete "
+        "this canary and its backlog line."
+    )
+
+
+@pytest.mark.retirement_canary
+def test_wylls_reversal_target_constraint_canary():
+    """Phase v0.94.0 drops Wyll's Reversal's "with one or more targets", leaving a
+    bare ``StackSpell``, so ``_analysis.multipliers`` reads its copy as able to copy
+    a commander spell (which has no targets, CR 115.1a/b). RETIRE-READY when the
+    target carries the constraint: then the multipliers' targeting veto drops it."""
+    from mtg_utils._analysis.multipliers import commander_multipliers
+
+    out = commander_multipliers(
+        [test_card("Wyll's Reversal")], [test_card("Krenko, Mob Boss")]
+    )
+    assert "Wyll's Reversal" in out, (
+        "Wyll's Reversal: RETIRE-READY — no longer read as a commander copy; "
+        "delete this canary and its backlog line."
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ["Earth Village Ruffians", "Fatal Fissure", "Bumi's Feast Lecture"]
+)
+def test_earthbend_is_dies_recursion(name):
+    """CR 701.66a: earthbend's land returns "when that land dies or is put into
+    exile" — dies-recursion set up on a land, like a granted undying."""
+    assert ("dies_recursion", "you", "") in _idents(name)
+
+
+@pytest.mark.retirement_canary
+def test_earthbend_last_created_binding_canary():
+    """Phase v0.94.0 binds Bumi's Feast Lecture's earthbend return to ``LastCreated``
+    (the Food token it just made), not the land; ``lanes.card_advantage.
+    _sets_up_dies_return`` counts it (``EARTHBEND_LAST_CREATED_MISBIND``). When
+    the return names the land, drop that arm and this canary."""
+    from mtg_utils._card_ir.crosswalk import tag_of
+
+    targets = {
+        tag_of(getattr(n, "target", None))
+        for t in trees_for(test_card("Bumi's Feast Lecture"))
+        for n in t.iter_typed()
+        if tag_of(n) == "ChangeZone"
+        and getattr(n, "destination", None) == "Battlefield"
+    }
+    assert "LastCreated" in targets, (
+        "_sets_up_dies_return: RETIRE-READY — Bumi's Feast Lecture's earthbend "
+        "return no longer reads LastCreated; delete the misbind arm and this canary."
+    )

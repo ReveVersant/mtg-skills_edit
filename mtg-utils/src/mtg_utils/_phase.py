@@ -8,23 +8,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
-from mtg_utils._http import urllib_get
+from mtg_utils._http import cache_root, urllib_get
 
 # Deliberately its own identity (not mtg_utils._http.USER_AGENT): this
 # fetches from GitHub releases/raw, so it names the phase subsystem
 # specifically rather than the generic Scryfall/EDHREC/Spellbook UA.
 _USER_AGENT = "mtg-skills/_phase"
 
-PHASE_TAG = "v0.66.0"
+PHASE_TAG: str = "v0.104.0"  # rewritten by `bump-phase-pin` (ADR-0049)
 PHASE_REPO = "https://github.com/phase-rs/phase"
 
 # Since v0.32.0 releases ship no server tarball; instead a small manifest
@@ -58,13 +62,8 @@ class PhaseRuntimeError(RuntimeError):
 
 
 def cache_dir() -> Path:
-    """Return the phase cache root: ``$MTG_SKILLS_CACHE_DIR/phase``
-    or ``$HOME/.cache/mtg-skills/phase``.
-    """
-    base = os.environ.get("MTG_SKILLS_CACHE_DIR")
-    if base:
-        return Path(base) / "phase"
-    return Path(os.environ["HOME"]) / ".cache" / "mtg-skills" / "phase"
+    """Return the phase cache root: ``<cache root>/phase`` (``_http.cache_root``)."""
+    return cache_root() / "phase"
 
 
 def _repo_dir() -> Path:
@@ -384,34 +383,46 @@ def _card_data_path() -> Path:
 
 
 # Known-bad card-data records: phase stamps a DIFFERENT card's parse with this
-# oracle_id. The only member at v0.66.0 (re-censused 2026-08-29 at the pin
-# bump; 1 true impostor, zero errata-drift flags — the v0.45.0 census's 2
-# errata-drift records no longer flag): bulk
-# carries TWO distinct cards named "Fast // Furious" — 62411ced
-# (J21/MH2, commander-legal, discard-draw / damage) and 298a6369 (playtest,
-# not_legal, haste-unblockable / Fuse) — and phase's name-keyed corpus
-# mis-joins the two. Through v0.45.0 it emitted the PLAYTEST card's "Fast"
-# half stamped with the LEGAL card's oracle_id; since v0.66.0 the join runs
-# the OTHER way: the LEGAL card's "Fast" half ("Discard a card, then draw two
-# cards.") is stamped with the PLAYTEST oracle_id (and the legal card has no
-# record of its own at all — a plain coverage hole, not an impostor). The
-# v0.45.0 entry self-retired exactly as designed and is replaced below.
+# oracle_id. Bulk carries TWO distinct cards named "Fast // Furious" —
+# 62411ced (J21/MH2, commander-legal, discard-draw / damage) and 298a6369
+# (playtest, not_legal, haste-unblockable / Fuse) — and phase's name-keyed
+# corpus mis-joins the two; the direction has flipped across pins:
+#   - through v0.45.0: the PLAYTEST card's "Fast" half stamped with the LEGAL
+#     card's oracle_id;
+#   - v0.66.0 (re-censused 2026-08-29): the other way — the LEGAL card's "Fast"
+#     half stamped with the PLAYTEST oracle_id, the legal card with no record
+#     of its own;
+#   - by v0.86.0, and at v0.94.0 (re-censused 2026-09-26): back to the
+#     v0.45.0 direction — the legal card's own "Fast" record is correct under
+#     62411ced, and a SECOND 62411ced record ("fast [62411ced-…]") carries the
+#     playtest card's text; the playtest card has no record of its own (a
+#     plain coverage hole for a not_legal card, not an impostor). The v0.66.0
+#     entry went dead at the v0.86.0 bump unnoticed (it matched nothing, so it
+#     was a no-op) and is replaced below.
 # Keyed by (scryfall_oracle_id, exact oracle_text) so the entry self-retires
-# the moment upstream fixes the join (nothing matches → no-op). A general
-# text-mismatch gate was rejected: the v0.23.0 census found 8 other phase
-# records whose text differed from bulk only by oracle-errata drift (same
-# card, retemplated wording — e.g. Thran Turbine, Elven Farsight) that such a
-# gate would wrongly drop. Census procedure: join every card-data record to
-# bulk by scryfall_oracle_id and flag records whose oracle_text matches NO
-# bulk face text for that oracle_id (v0.23.0: 9 flagged = 8 errata-drift +
+# the moment upstream fixes the join (nothing matches → no-op); a dead entry
+# is REPLACED, never kept beside the live one. A general text-mismatch gate
+# was rejected: the v0.23.0 census found 8 other phase records whose text
+# differed from bulk only by oracle-errata drift (same card, retemplated
+# wording — e.g. Thran Turbine, Elven Farsight) that such a gate would wrongly
+# drop. Census procedure (``bump-phase-pin`` step 5): join every card-data
+# record to bulk by scryfall_oracle_id and flag records whose oracle_text
+# matches NO bulk face text for that oracle_id, then read each row — only a
+# different card's text is an impostor (v0.23.0: 9 flagged = 8 errata-drift +
 # Fast; v0.35.2: exactly 1 flagged = Fast — the weekly MTGJSON refresh phase
-# runs since v0.32.0 cleaned up the errata drift, the impostor join remains;
-# v0.66.0: exactly 1 flagged = the flipped Fast join).
+# runs since v0.32.0 cleaned up the errata drift; v0.66.0: exactly 1 flagged =
+# the flipped Fast join; v0.94.0: 52 flagged = 51 errata-drift, phase's
+# MTGJSON a few days newer than the bulk's retemplating, + Fast).
 _IMPOSTOR_RECORDS: frozenset[tuple[str, str]] = frozenset(
     {
         (
-            "298a6369-1c1f-4d75-aa97-69c56323c122",
-            "Discard a card, then draw two cards.",
+            "62411ced-843e-4b63-bdf6-dafb2ac27047",
+            (
+                "Target creature gains haste until end of turn. It can't be "
+                "blocked this turn except by Vehicles or by creatures with "
+                "haste.\nFuse (You may cast one or both halves of this card "
+                "from your hand.)"
+            ),
         ),
     }
 )
@@ -516,7 +527,7 @@ def _known_tokens_path() -> Path:
 # release tarball :func:`ensure_card_data` pulls for one member). Unlike that
 # function, this ensure NEVER raises: a missing/unreachable file just means the
 # known-tokens substrate contributes nothing (see
-# ``_deck_forge._ir_lookup._known_tokens_index``), never a crash.
+# ``_card_ir.trees._known_tokens_index``), never a crash.
 _KNOWN_TOKENS_ASSET_PATH = "crates/engine/data/known-tokens.toml"
 
 
@@ -648,69 +659,70 @@ def to_phase_deck(deck: dict, *, label: str) -> dict:
     return payload
 
 
-def run_duel(
-    deck_a_path: Path,
-    deck_b_path: Path,
+#: ai-duel prints a batch's summary only when the whole batch ends, so a batch killed
+#: at the timeout reports nothing. :func:`run_duel` therefore runs it as consecutive
+#: chunks: a timeout loses only the chunk in flight. About ten chunks per run, at
+#: least ``_DUEL_MIN_CHUNK`` games each so the per-process start-up (loading
+#: card-data) stays a small share of the time.
+_DUEL_CHUNKS = 10
+_DUEL_MIN_CHUNK = 10
+
+#: Tests replace this to drive the time budget without sleeping.
+_monotonic = time.monotonic
+
+
+def _duel_chunk_size(games: int) -> int:
+    return max(_DUEL_MIN_CHUNK, math.ceil(games / _DUEL_CHUNKS))
+
+
+def _run_budgeted(
     *,
     games: int,
     seed: int | None,
-    format_: str,  # noqa: ARG001 — phase infers format from deck JSON; kept for call-site symmetry
-    difficulty: str = "Medium",
     timeout_s: int,
+    chunk: int,
+    play: Callable[[int, int, float], None],
 ) -> dict:
-    """Run an ``ai-duel`` batch and return parsed results.
+    """Play ``games`` as consecutive chunks of at most ``chunk`` within ``timeout_s``
+    seconds, and return the run's envelope: ``status`` (``ok`` / ``timeout``),
+    ``games`` (= ``games_completed``), ``games_requested``, ``timed_out`` and ``seed``.
 
-    Returned dict contains: ``wins_p0``, ``wins_p1``, ``draws``,
-    ``avg_turns``, ``avg_duration_ms``, ``games``, ``status`` (``ok`` or
-    ``timeout``).
-
-    v0.8.0 model: ``ai-duel <data-root> --matchup-files <a> <b> --batch N`` (the
-    ``--matchup-files`` flag is re-grafted by :func:`_apply_duel_files_patch` at
-    install — stock v0.8.0 only resolves built-in matchups). The batch summary is
-    printed to STDERR (no ``--output`` JSON), so we parse it. ``format_`` is unused
-    (phase reads the format from the deck JSON), kept for call-site symmetry.
+    ``play(n, chunk_seed, remaining)`` runs one chunk of ``n`` games seeded
+    ``chunk_seed`` (``seed`` + the index of its first game, so a chunked run plays
+    the games one batch would) with only the ``remaining`` budget, folding its
+    results into the caller's totals; a ``subprocess.TimeoutExpired`` it raises
+    ends the run and keeps every chunk that finished. With no seed, one is drawn
+    here so the chunks don't overlap and the run replays from the seed it reports.
     """
-    binary = find_binary("ai-duel")
-    data_root = _binary_data_root()
-    if not (data_root / "card-data.json").exists():
-        raise PhaseNotInstalledError(
-            f"phase card-data.json not found at {data_root / 'card-data.json'}. "
-            "Run `playtest-install-phase`.",
-        )
-    cmd = [
-        str(binary),
-        str(data_root),
-        "--matchup-files",
-        str(deck_a_path),
-        str(deck_b_path),
-        "--batch",
-        str(games),
-        "--difficulty",
-        difficulty,
-    ]
-    if seed is not None:
-        cmd += ["--seed", str(seed)]
-    try:
-        proc = subprocess.run(
-            cmd, check=True, timeout=timeout_s, capture_output=True, text=True
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "timeout",
-            "wins_p0": 0,
-            "wins_p1": 0,
-            "draws": 0,
-            "games": 0,
-            "avg_turns": 0.0,
-            "avg_duration_ms": 0,
-        }
-    except subprocess.CalledProcessError as exc:
-        raise PhaseRuntimeError(
-            f"phase ai-duel exited with code {exc.returncode}",
-            stderr=exc.stderr or "",
-        ) from exc
+    if seed is None:
+        seed = random.SystemRandom().randrange(2**31)
+    deadline = _monotonic() + timeout_s
+    completed = 0
+    timed_out = False
+    while completed < games:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        n = min(chunk, games - completed)
+        try:
+            play(n, seed + completed, remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            break
+        completed += n
+    return {
+        "status": "timeout" if timed_out else "ok",
+        "games": completed,
+        "games_completed": completed,
+        "games_requested": games,
+        "timed_out": timed_out,
+        "seed": seed,
+    }
 
-    out = proc.stderr or ""  # ai-duel prints the batch summary to stderr
+
+def _parse_duel_summary(out: str) -> dict:
+    """One batch's stderr summary: win / draw counts and per-game averages."""
 
     def _int(pat: str) -> int:
         m = re.search(pat, out)
@@ -721,13 +733,97 @@ def run_duel(
         return float(m.group(1)) if m else 0.0
 
     return {
-        "status": "ok",
         "wins_p0": _int(r"P0 \(.*?\) wins:\s*(\d+)"),
         "wins_p1": _int(r"P1 \(.*?\) wins:\s*(\d+)"),
         "draws": _int(r"Draws/aborted:\s*(\d+)"),
-        "games": games,
         "avg_turns": _float(r"Avg turns:\s*([\d.]+)"),
-        "avg_duration_ms": _int(r"Avg duration:\s*(\d+)ms"),
+        "avg_duration_ms": _float(r"Avg duration:\s*([\d.]+)ms"),
+    }
+
+
+def run_duel(
+    deck_a_path: Path,
+    deck_b_path: Path,
+    *,
+    games: int,
+    seed: int | None,
+    format_: str,  # noqa: ARG001 — phase infers format from deck JSON; kept for call-site symmetry
+    difficulty: str = "Medium",
+    timeout_s: int,
+) -> dict:
+    """Run an ``ai-duel`` batch within ``timeout_s`` seconds and return its results.
+
+    Returned dict: ``wins_p0``, ``wins_p1``, ``draws``, ``avg_turns``,
+    ``avg_duration_ms`` (over the games that finished), ``games`` (= games
+    completed), ``games_completed``, ``games_requested``, ``timed_out``, ``seed``
+    (the base seed used), and ``status`` (``ok``, or ``timeout`` when the budget ran
+    out before every game finished).
+
+    v0.8.0 model: ``ai-duel <data-root> --matchup-files <a> <b> --batch N`` (the
+    ``--matchup-files`` flag is re-grafted by :func:`_apply_duel_files_patch` at
+    install — stock v0.8.0 only resolves built-in matchups). The batch summary is
+    printed to STDERR only when the batch ends (no per-game lines, no ``--output``
+    JSON), so the games run as consecutive chunks (:data:`_DUEL_CHUNKS`) and a
+    timeout keeps every chunk that finished. ai-duel seeds game ``i`` of a batch
+    ``seed + i``, so a chunk starting at game ``k`` runs with ``--seed seed + k``:
+    a chunked run plays exactly the games one batch would, and a seeded run stays
+    reproducible. With no seed, one is drawn here so the chunks don't overlap.
+    ``format_`` is unused (phase reads the format from the deck JSON), kept for
+    call-site symmetry.
+    """
+    binary = find_binary("ai-duel")
+    data_root = _binary_data_root()
+    if not (data_root / "card-data.json").exists():
+        raise PhaseNotInstalledError(
+            f"phase card-data.json not found at {data_root / 'card-data.json'}. "
+            "Run `playtest-install-phase`.",
+        )
+    totals = {"wins_p0": 0, "wins_p1": 0, "draws": 0, "turns": 0.0, "ms": 0.0}
+
+    def play(n: int, chunk_seed: int, remaining: float) -> None:
+        cmd = [
+            str(binary),
+            str(data_root),
+            "--matchup-files",
+            str(deck_a_path),
+            str(deck_b_path),
+            "--batch",
+            str(n),
+            "--difficulty",
+            difficulty,
+            "--seed",
+            str(chunk_seed),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, check=True, timeout=remaining, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as exc:
+            raise PhaseRuntimeError(
+                f"phase ai-duel exited with code {exc.returncode}",
+                stderr=exc.stderr or "",
+            ) from exc
+        batch = _parse_duel_summary(proc.stderr or "")  # summary is on stderr
+        for key in ("wins_p0", "wins_p1", "draws"):
+            totals[key] += batch[key]
+        totals["turns"] += batch["avg_turns"] * n
+        totals["ms"] += batch["avg_duration_ms"] * n
+
+    run = _run_budgeted(
+        games=games,
+        seed=seed,
+        timeout_s=timeout_s,
+        chunk=_duel_chunk_size(games),
+        play=play,
+    )
+    completed = run["games_completed"]
+    return {
+        **run,
+        "wins_p0": totals["wins_p0"],
+        "wins_p1": totals["wins_p1"],
+        "draws": totals["draws"],
+        "avg_turns": round(totals["turns"] / completed, 2) if completed else 0.0,
+        "avg_duration_ms": round(totals["ms"] / completed) if completed else 0,
     }
 
 
@@ -771,15 +867,25 @@ def run_commander(
     difficulty: str = "Medium",
     timeout_s: int,
 ) -> dict:
-    """Run ``ai-commander`` for a 4-player FFA. Returns per-seat win counts.
+    """Run ``games`` 4-player FFA games of ``ai-commander`` within ``timeout_s``
+    seconds and return per-seat win counts.
 
     ``deck_paths`` must have length 4 (phase requires 4 seats). Each is a
     phase-native deck JSON (see :func:`to_phase_deck`) carrying a ``commander``.
 
+    Returned dict: ``winners_by_seat``, ``draws``, ``avg_turns`` (over the games
+    that finished), ``games`` (= games completed), ``games_completed``,
+    ``games_requested``, ``timed_out``, ``seed`` (the base seed used), and
+    ``status`` (``ok``, or ``timeout`` when the budget ran out before every game
+    finished).
+
     v0.8.0 model: ``ai-commander <data-root> --feed <feed.json>`` plays ONE game
     and prints the result to stdout (no ``--decks``/``--games``/``--output``). We
-    synthesize a runtime feed from the four decks and invoke once per game (seed
-    bumped per game), aggregating the parsed ``Winner: P<seat>`` lines.
+    synthesize a runtime feed from the four decks and invoke once per game,
+    aggregating the parsed ``Winner: P<seat>`` lines. Each game is a chunk of one
+    under :func:`_run_budgeted`, the budget :func:`run_duel` runs under:
+    ``timeout_s`` covers the whole run, each game gets only what remains, a timeout
+    keeps every game that finished, and game ``g`` runs with ``--seed seed + g``.
     """
     if len(deck_paths) != 4:
         raise ValueError(
@@ -799,15 +905,14 @@ def run_commander(
         ]
     }
     winners = [0, 0, 0, 0]
-    draws = 0
-    turns_total = 0
-    completed = 0
+    totals = {"draws": 0, "turns": 0}
     with tempfile.TemporaryDirectory() as td:
         # An absolute --feed path overrides the data-root join (Rust Path::join
         # with an absolute path replaces the base), so the feed lives off-root.
         feed_path = Path(td) / "feed.json"
         feed_path.write_text(json.dumps(feed))
-        for g in range(games):
+
+        def play(_n: int, game_seed: int, remaining: float) -> None:
             cmd = [
                 str(binary),
                 str(data_root),
@@ -815,21 +920,13 @@ def run_commander(
                 str(feed_path),
                 "--difficulty",
                 difficulty,
+                "--seed",
+                str(game_seed),
             ]
-            if seed is not None:
-                cmd += ["--seed", str(seed + g)]
             try:
                 proc = subprocess.run(
-                    cmd, check=True, timeout=timeout_s, capture_output=True, text=True
+                    cmd, check=True, timeout=remaining, capture_output=True, text=True
                 )
-            except subprocess.TimeoutExpired:
-                return {
-                    "status": "timeout",
-                    "winners_by_seat": [0, 0, 0, 0],
-                    "games": 0,
-                    "draws": 0,
-                    "avg_turns": 0.0,
-                }
             except subprocess.CalledProcessError as exc:
                 raise PhaseRuntimeError(
                     f"phase ai-commander exited with code {exc.returncode}",
@@ -840,16 +937,19 @@ def run_commander(
             if m and 0 <= int(m.group(1)) < 4:
                 winners[int(m.group(1))] += 1
             else:
-                draws += 1  # no winner line → draw / abort
+                totals["draws"] += 1  # no winner line → draw / abort
             tm = _TURNS_RE.search(out)
             if tm:
-                turns_total += int(tm.group(1))
-            completed += 1
+                totals["turns"] += int(tm.group(1))
 
+        # One game per invocation: each game is a chunk of one.
+        run = _run_budgeted(
+            games=games, seed=seed, timeout_s=timeout_s, chunk=1, play=play
+        )
+    completed = run["games_completed"]
     return {
-        "status": "ok",
+        **run,
         "winners_by_seat": winners,
-        "games": completed,
-        "draws": draws,
-        "avg_turns": (turns_total / completed) if completed else 0.0,
+        "draws": totals["draws"],
+        "avg_turns": round(totals["turns"] / completed, 2) if completed else 0.0,
     }

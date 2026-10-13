@@ -17,14 +17,6 @@ export const COLOR_LABEL = {
 // CMC buckets for the curve chart (7 collects everything 7+).
 export const CURVE_BUCKETS = [0, 1, 2, 3, 4, 5, 6, 7];
 
-// Deck-size target per Commander-family format (the footer reads "current/target").
-export const FORMAT_TARGET = {
-  commander: 100,
-  brawl: 60,
-  historic_brawl: 100,
-  competitive_brawl: 100,
-};
-
 // Cheapest USD listing for a card, or null (no-listing ≠ free — never shown as $0).
 // Mirrors DeckList.priceOf so the footer's deck total agrees with the list subtotals.
 export function priceOf(card) {
@@ -58,67 +50,69 @@ const WC_WORD = {
   common: "common",
 };
 
-export function isBasicLand(card) {
-  return /\bBasic Land\b/.test(card?.type_line || "");
+// Copies of a card still to acquire: the hub's served `copies_short` (deck rows, Find
+// results and combo pieces all carry it; the ownership rule is applied there and never
+// re-derived here). null when a row wasn't served one — the cost is unknown.
+export function copiesShort(card) {
+  return card?.copies_short ?? null;
 }
 
-// Per-card Arena cost for a digital build → { text, cls, title } for display.
-// Owned cards and basics are free; everything else is one wildcard of its rarity.
+// Per-card Arena cost for a digital build → { text, cls, title } for display, read
+// from the served `copies_short` / `covered_by` (free basic, owned, or each copy short
+// costs one wildcard of its rarity).
 // `cls` is a .wc-* class suffix (owned | free | mythic | rare | uncommon | common).
 export function wildcardLabel(card) {
-  if (card?.owned)
-    return {
-      text: "owned",
-      cls: "owned",
-      title: "Already in your Arena collection",
-    };
-  if (isBasicLand(card))
+  const short = copiesShort(card);
+  if (short === null)
+    return { text: "—", cls: "unknown", title: "Cost unknown" };
+  if (card.covered_by === "free")
     return {
       text: "free",
       cls: "free",
       title: "Basic land — no wildcard needed",
     };
+  if (short === 0)
+    return {
+      text: "owned",
+      cls: "owned",
+      title: "Your collection covers every copy",
+    };
   const letter = WC_LETTER[card?.rarity];
   if (!letter) return { text: "—", cls: "unknown", title: "Rarity unknown" };
+  const word = WC_WORD[card.rarity];
   return {
-    text: letter,
+    text: short > 1 ? `${letter}×${short}` : letter,
     cls: card.rarity,
-    title: `1 ${WC_WORD[card.rarity]} wildcard`,
+    title: `${short} ${word} wildcard${short > 1 ? "s" : ""}`,
   };
 }
 
-// Wildcards needed across a list of deck cards, by tier — owned cards and basics are
-// free, so they don't count. Singleton Commander-family formats are one copy each, so a
-// card contributes exactly one wildcard of its rarity. Mirrors the backend wildcard_cost
-// definition the footer's $wildcards aggregate uses, but per-group (Command Zone / Deck).
+// Wildcards needed across a list of deck cards, by tier: the sum of each card's served
+// shortfall — the same numbers the footer's $wildcards total is built from, per group.
 export function wildcardTotals(cards) {
   const out = { mythic: 0, rare: 0, uncommon: 0, common: 0 };
   for (const c of cards || []) {
-    if (c.owned || isBasicLand(c)) continue;
-    if (c.rarity in out) out[c.rarity] += c.quantity || 1;
+    if (c.rarity in out) out[c.rarity] += copiesShort(c) ?? 0;
   }
   return out;
 }
 
-// The land-health readout shared by the footer pill and the Mana Gate modal.
-// Adds the soft FLOOD band (recommended + 2) on top of the backend's PASS/WARN/FAIL:
-// above the flood line the deck is over-landed (offer to trim) — but FLOOD never gates
-// finalize, because an all-lands two/three-card combo deck is a legitimate build.
-// See deck-forge CONTEXT.md › "Flood line".
+// The land-health readout shared by the footer pill and the Mana Gate modal — a
+// pass-through of the backend's ONE `land_band` (ADR-0041): floor (the gate), top
+// (the target), flood (top + 2, the soft FLOOD line — never gates finalize, because an
+// all-lands combo deck is a legitimate build) and status PASS | WARN | FAIL | FLOOD.
+// Nothing about the band is derived here. See deck-forge CONTEXT.md › "Land band".
 export function landState(mana) {
-  if (!mana) return null;
-  const count = mana.land_count ?? 0;
-  const recommended = mana.recommended_land_count ?? 0;
-  const ceiling = recommended + 2;
-  const status = count > ceiling ? "FLOOD" : mana.land_count_status;
+  const band = mana?.land_band;
+  if (!band) return null;
   return {
-    count,
-    recommended,
-    floor: mana.land_count_floor ?? 0,
-    ceiling,
-    status, // PASS | WARN | FAIL | FLOOD
-    over: count - recommended, // how many to trim back to recommended (FLOOD only)
-    short: Math.max(0, (mana.land_count_floor ?? 0) - count), // how many to add (FAIL)
+    count: band.count,
+    recommended: band.top,
+    floor: band.floor,
+    ceiling: band.flood,
+    status: band.status,
+    over: band.count - band.top, // how many to trim back to the top (FLOOD only)
+    short: Math.max(0, band.floor - band.count), // how many to add (FAIL)
   };
 }
 

@@ -16,10 +16,17 @@ three classes are inert strings under ``from __future__ import annotations``
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import re
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
+from mtg_utils._card_ir.branches import (
+    BRANCH_LISTS,
+    natural_top_only,
+    uncertain_list,
+)
+from mtg_utils._card_ir.creature_types import CREATURE_TYPES
 from mtg_utils._card_ir.mirror.runtime import (
     MISSING,
     MirrorVariant,
@@ -47,9 +54,37 @@ def tag_of(node: object) -> str | None:
     return None
 
 
+def residue_is(node: object, name: str) -> bool:
+    """Whether an ``Unimplemented`` residue is the one a read keys on by ``name``.
+
+    Through v0.66.0 phase named a parked clause by its HEAD WORD ("turn", "flip",
+    "look", "create", "reveal", "creatures" …) or by a structural category
+    ("static_structure", "unbound_subject", "Unsupported unless clause"). v0.86.0
+    keeps the categories but files every head-word residue under a generic one
+    (``unrecognized_clause_head`` / ``unparsed_verb_arguments`` / ``unparsed_quantity``
+    …), so a verb-keyed read matches the phase name OR the description's first word —
+    the same word the old name was. ``~`` (the card's own name) is a head word too."""
+    if tag_of(node) != "Unimplemented":
+        return False
+    if getattr(node, "name", None) == name:
+        return True
+    desc = str(getattr(node, "description", "") or "")
+    head = desc.split(None, 1)[0].lower() if desc.strip() else ""
+    return head == name
+
+
 # Recipient-bearing sub-fields an effect/trigger uses to name a player. Read in
 # order; the first present one decides scope.
 _SCOPE_FIELDS = ("target", "player", "owner", "recipient", "valid_target")
+
+# The player-reference tags naming the opponents, and every player, on a
+# recipient or a wrapper's ``player_scope``. A ``player_scope`` may also read
+# ``All`` (Garruk, Veiled Butcher's -2), which only :func:`effect_player_reach`
+# accepts.
+_OPPONENT_ACTOR_TAGS: frozenset[str] = frozenset(
+    {"Opponent", "Opponents", "EachOpponent"}
+)
+_EACH_ACTOR_TAGS: frozenset[str] = frozenset({"Each", "AllPlayers", "EachPlayer"})
 
 
 def _unwrap_role_target(sub: object) -> object:
@@ -85,9 +120,9 @@ def _scope_from_player_node(node: object) -> str | None:
     t = tag_of(node)
     if t in ("Controller", "SelfRef", "You"):
         return "you"
-    if t in ("Opponent", "Opponents", "EachOpponent"):
+    if t in _OPPONENT_ACTOR_TAGS:
         return "opponents"
-    if t in ("Each", "AllPlayers", "EachPlayer"):
+    if t in _EACH_ACTOR_TAGS:
         return "each"
     # A chosen/targeted player (``ParentTarget`` / ``Player`` / ``Any``) is NOT a
     # self resource — "target player draws, then discards" is a targeted effect,
@@ -133,13 +168,16 @@ def explicit_recipient_scope(node: TypedMirrorNode) -> str | None:
 
 
 # Recipient tags naming a player OTHER than the ability's controller: the
-# triggering object's controller (``ParentTargetController``), the triggering
-# player (``TriggeringPlayer``), or a chosen/targeted player (``ParentTarget`` /
-# ``Player`` / ``Target`` / ``Any``). A loss aimed at one of these is a DIRECTED
-# loss at another player (CR 119.3), never a self-loss.
+# triggering object's controller (``ParentTargetController``; phase v0.86.0 also
+# emits ``EventTargetController`` — "that creature's controller" resolved off the
+# TRIGGERING EVENT's target, Bellowing Fiend), the triggering player
+# (``TriggeringPlayer``), or a chosen/targeted player (``ParentTarget`` / ``Player``
+# / ``Target`` / ``Any``). A loss aimed at one of these is a DIRECTED loss at
+# another player (CR 119.3), never a self-loss.
 _DIRECTED_PLAYER_TAGS: frozenset[str] = frozenset(
     {
         "ParentTargetController",
+        "EventTargetController",
         "TriggeringPlayer",
         "ParentTarget",
         "Player",
@@ -221,15 +259,10 @@ def lifeloss_recipient_is_degraded_typed(node: TypedMirrorNode) -> bool:
 # (``_DIRECTED_PLAYER_TAGS``) and :func:`discard_recipient_scope`
 # (``_DISCARD_OPP_TAGS``, defined further below), plus the explicit
 # opponent/defending-player tags (CR 506.2 — the b11 tap_down precedent).
-_DETRIMENT_DIRECTED_TAGS: frozenset[str] = _DIRECTED_PLAYER_TAGS | frozenset(
-    {
-        "Opponent",
-        "Opponents",
-        "EachOpponent",
-        "DefendingPlayer",
-        "TargetPlayer",
-        "TargetOpponent",
-    }
+_DETRIMENT_DIRECTED_TAGS: frozenset[str] = (
+    _DIRECTED_PLAYER_TAGS
+    | _OPPONENT_ACTOR_TAGS
+    | frozenset({"DefendingPlayer", "TargetPlayer", "TargetOpponent"})
 )
 
 
@@ -315,6 +348,53 @@ def trigger_turn_constraint(trig: TypedMirrorNode) -> str | None:
     return trigger_constraint_tag(trig)
 
 
+def trigger_phase(trig: TypedMirrorNode) -> str | None:
+    """The step / phase a phase-trigger fires at the beginning of (``"Upkeep"`` /
+    ``"Draw"`` / ``"BeginCombat"`` / ``"End"`` …), or ``None`` for any other
+    trigger. phase carries it as a bare string on the trigger's ``phase`` field
+    beside ``mode: "Phase"`` (the ``trigger_event == "phase"`` units)."""
+    p = getattr(trig, "phase", MISSING)
+    return p if isinstance(p, str) else None
+
+
+def scoped_player_scope(unit: AbilityUnit | None) -> str | None:
+    """Resolve a ``ScopedPlayer`` reference ("that player") to a lane scope via the
+    owning trigger's turn constraint (CR 701.21a for the edict case).
+
+    phase tags a triggered "that player sacrifices / draws / is dealt damage" with
+    ``ScopedPlayer`` — the scoped player is whoever the trigger references, which
+    the constraint disambiguates: ``OnlyDuringOpponentsTurn`` (Sheoldred — "each
+    opponent's upkeep") → opponents; no constraint (Braids, Cabal Minion;
+    Smokestack — "each player's upkeep, that player sacrifices") → each, a
+    SYMMETRIC self-inclusive effect that hits YOU too; ``OnlyDuringYourTurn`` (a
+    "your upkeep, you sacrifice" self-sac) → ``None``. A non-trigger ScopedPlayer
+    keeps the opponent default.
+    """
+    if unit is None or getattr(unit, "origin", None) != "trigger":
+        return "opponents"
+    c = trigger_turn_constraint(unit.node)
+    if c == "OnlyDuringOpponentsTurn":
+        return "opponents"
+    if c == "OnlyDuringYourTurn":
+        return None
+    return "each"
+
+
+def refers_to_scoped_player(node: object) -> bool:
+    """Whether anything under ``node`` (a trigger unit's node: its condition,
+    effect chain and operands) refers to the trigger's ``ScopedPlayer`` — "that
+    player" / "that opponent" bound by an "each player's / each opponent's
+    [step]" trigger. A deep walk, so an intervening-if on the scoped player
+    (Lavaborn Muse: "if that player has two or fewer cards in hand") counts, as
+    does a filter controlled by them (Braids: "that player sacrifices"). CR
+    805.4d keys a Two-Headed Giant step trigger's per-player firing on exactly
+    this reference."""
+    return any(
+        tag_of(n) == "ScopedPlayer" or getattr(n, "controller", None) == "ScopedPlayer"
+        for n in _iter_typed_nodes(node)
+    )
+
+
 def trigger_damage_kind(trig: TypedMirrorNode) -> str:
     """The ``damage_kind`` of a damage trigger (``"CombatOnly"`` / ``"Any"``),
     ``""`` when absent.
@@ -341,6 +421,415 @@ def mana_restrictions(node: TypedMirrorNode) -> tuple[str, ...]:
     if _present(rs) and isinstance(rs, (list, tuple)):
         return tuple(r for r in rs if isinstance(r, str))
     return ()
+
+
+def mana_spell_type_restriction(node: TypedMirrorNode) -> str:
+    """The spell type a ``Mana`` effect's mana is limited to (CR 106.6), or ``""``.
+
+    phase carries the typed restrictions as variants beside the string ones
+    :func:`mana_restrictions` reads: ``SpellTypeOrAbilityActivation`` with a
+    ``spell_type`` ("Artifact": The Mightstone and Weakstone's "can't be spent to
+    cast nonartifact spells"; "Colorless Eldrazi": Eldrazi Temple), and
+    ``SpellType`` with a bare string ("Multicolored": Pillar of the Paruns).
+    """
+    rs = getattr(node, "restrictions", MISSING)
+    if not (_present(rs) and isinstance(rs, (list, tuple))):
+        return ""
+    for r in rs:
+        if not isinstance(r, MirrorVariant):
+            continue
+        if r.key == "SpellTypeOrAbilityActivation":
+            spell_type = getattr(r.inner, "spell_type", None)
+        elif r.key == "SpellType":
+            spell_type = r.inner
+        else:
+            continue
+        if isinstance(spell_type, str) and spell_type:
+            return spell_type
+    return ""
+
+
+def cost_mana_value(cost: object) -> int | None:
+    """Mana value (CR 202.3) of a phase ``Cost`` node: its ``generic`` plus one per
+    shard, an ``X`` shard counting 0 (CR 202.3e). ``None`` for anything else."""
+    if tag_of(cost) != "Cost":
+        return None
+    generic = getattr(cost, "generic", MISSING)
+    shards = getattr(cost, "shards", MISSING)
+    if not (isinstance(generic, int) and isinstance(shards, (list, tuple))):
+        return None
+    return generic + sum(1 for s in shards if s != "X")
+
+
+def mana_value_paying_life(parts: Iterable[tuple[str, int | None]]) -> int | None:
+    """The mana value of a cost made of mana and life payments, or ``None`` when a
+    part is neither (an exile or sacrifice is a condition a deck can't always
+    meet). ``parts`` are ``("mana", mana value)`` / ``("life", None)`` /
+    ``("other", None)`` — Infestation's "Evoke—{1}{B}{B}, Pay 3 life" is 3."""
+    total = 0
+    for kind, mv in parts:
+        if kind == "mana" and mv is not None:
+            total += mv
+        elif kind != "life":
+            return None
+    return total
+
+
+def _composite_mana_value(cost: object) -> int | None:
+    """:func:`mana_value_paying_life` over a ``Composite`` cost node."""
+    parts = getattr(cost, "costs", MISSING)
+    if tag_of(cost) != "Composite" or not isinstance(parts, (list, tuple)):
+        return None
+    return mana_value_paying_life(
+        ("mana", cost_mana_value(getattr(part, "cost", MISSING)))
+        if tag_of(part) == "Mana"
+        else ("life" if tag_of(part) == "PayLife" else "other", None)
+        for part in parts
+    )
+
+
+# The keywords that cast the card itself, from hand, for a different payment that
+# takes effect now — the cost a deck plays the card for on curve. Evoke (CR 702.74a),
+# dash (702.109a), blitz (702.152a), warp (702.185a) and impending (702.176a) are paid
+# instead of the mana cost; prototype (702.160a) casts it with an alternative set of
+# characteristics, mana cost included. Suspend and plot are not here: their payment
+# exiles the card to cast it on a later turn.
+CURVE_COST_KEYWORDS = frozenset(
+    {"Warp", "Evoke", "Dash", "Blitz", "Prototype", "Impending"}
+)
+
+
+def keyword_cost(keyword: object) -> object | None:
+    """The cost node a parameterized keyword carries, unwrapped, or ``None``.
+
+    Phase's keyword payloads come in four shapes: the ``Cost`` itself (Warp, Dash,
+    Foretell, Morph …); a ``Mana`` / ``NonMana`` wrapper whose ``data`` is a
+    ``Cost`` or a non-mana cost such as a ``Composite`` (Evoke, Flashback,
+    Escape, Buyback); a struct with a ``cost`` field beside its other parameters
+    (Suspend's ``count``, Prototype's power and toughness, Impending's
+    ``counters``); or Emerge's ``mana_cost`` beside its ``sacrifice_filter``."""
+    if not isinstance(keyword, MirrorVariant):
+        return None
+    inner = keyword.inner
+    tag = tag_of(inner)
+    if tag == "Cost":
+        return inner
+    if tag in ("Mana", "NonMana"):
+        data = getattr(inner, "data", MISSING)
+        return data if _present(data) else None
+    for field in ("cost", "mana_cost"):
+        sub = getattr(inner, field, MISSING)
+        if _present(sub):
+            return sub
+    return None
+
+
+def keyword_curve_cost(keyword: object) -> int | None:
+    """The mana value of a :data:`CURVE_COST_KEYWORDS` keyword's cost, or ``None``.
+
+    Read off :func:`keyword_cost`: a ``Cost`` (Warp, Dash, Blitz, Prototype,
+    Impending, a mana Evoke), or a mana-and-life ``Composite`` (Infestation's
+    evoke). Fury's "Exile a red card from your hand" has no mana cost to plan on."""
+    if not isinstance(keyword, MirrorVariant) or keyword.key not in CURVE_COST_KEYWORDS:
+        return None
+    cost = keyword_cost(keyword)
+    if tag_of(cost) == "Composite":
+        return _composite_mana_value(cost)
+    return cost_mana_value(cost)
+
+
+class ObjectFacts(NamedTuple):
+    """What a card IS, for asking whether a filter can describe it: its own core
+    types, subtypes and supertypes (phase's capitalized words), its colors
+    (``W``/``U``/``B``/``R``/``G``), and whether it is every creature type
+    (:func:`is_every_creature_type` — changeling, CR 702.73a), which no printed
+    ``subtypes`` set spells out. Built from a card's trees by
+    ``_card_ir.trees.object_facts``. Ask it through :meth:`has_type` /
+    :meth:`has_supertype` / :meth:`has_subtype` (any case), never the raw sets:
+    only :meth:`has_subtype` knows what changeling adds."""
+
+    types: frozenset[str]
+    subtypes: frozenset[str]
+    supertypes: frozenset[str]
+    colors: frozenset[str]
+    every_creature_type: bool = False
+    #: Its mana value (CR 202.3), ``None`` when unknown; and whether its mana cost
+    #: has {X} (CR 107.3).
+    mana_value: int | None = None
+    x_cost: bool = False
+    #: Its printed keywords, folded (:func:`normalised_keyword_name`) — for what a
+    #: filter asks of a spell's casting ("a kicked spell" needs kicker).
+    keywords: frozenset[str] = frozenset()
+    #: The core types and subtypes its own static adds only while it isn't on the
+    #: battlefield (:func:`off_battlefield_types` — Grist, the Hunger Tide), which
+    #: :meth:`off_battlefield` folds in.
+    off_battlefield_types: frozenset[str] = frozenset()
+    off_battlefield_subtypes: frozenset[str] = frozenset()
+
+    def off_battlefield(self) -> ObjectFacts:
+        """The object as a card or a spell — anywhere but the battlefield, where
+        the types :func:`off_battlefield_types` reads are its own too. Grist's
+        ruling: "Anywhere but on the battlefield, Grist is a Legendary
+        Planeswalker Creature — Grist Insect" (a creature spell Essence Scatter
+        counters, a creature card Chord of Calling finds)."""
+        if not (self.off_battlefield_types or self.off_battlefield_subtypes):
+            return self
+        return self._replace(
+            types=self.types | self.off_battlefield_types,
+            subtypes=self.subtypes | self.off_battlefield_subtypes,
+            off_battlefield_types=frozenset(),
+            off_battlefield_subtypes=frozenset(),
+        )
+
+    def has_type(self, word: str) -> bool:
+        return _fold(word) in {_fold(t) for t in self.types}
+
+    def has_supertype(self, word: str) -> bool:
+        return _fold(word) in {_fold(t) for t in self.supertypes}
+
+    def has_subtype(self, word: str) -> bool:
+        """Whether the object has subtype ``word``: printed, or — for an object
+        that is every creature type — any of CR 205.3m's creature types. A
+        changeling is no Equipment, Aura or Forest."""
+        w = _fold(word)
+        if w in {_fold(t) for t in self.subtypes}:
+            return True
+        return self.every_creature_type and w in CREATURE_TYPES
+
+
+def _fold(word: str) -> str:
+    return word.lower().replace("\u2019", "'")
+
+
+def _is_off_battlefield_condition(cond: object) -> bool:
+    """A static's ``Not(SourceInZone Battlefield)`` condition — "as long as ~
+    isn't on the battlefield"."""
+    if tag_of(cond) != "Not":
+        return False
+    inner = getattr(cond, "condition", None)
+    return tag_of(inner) == "SourceInZone" and getattr(inner, "zone", None) == (
+        "Battlefield"
+    )
+
+
+def off_battlefield_types(tree: ConceptTree) -> tuple[frozenset[str], frozenset[str]]:
+    """``(core types, subtypes)`` the card's own static adds to it while it isn't
+    on the battlefield: Grist, the Hunger Tide's "As long as Grist isn't on the
+    battlefield, it's a 1/1 Insect creature in addition to its other types" —
+    ``Creature`` and ``Insect``. An ability that states which zones it functions
+    in functions only there (CR 113.6b), so on the battlefield Grist is "just a
+    planeswalker" (its ruling) and these types aren't its own."""
+    types: set[str] = set()
+    subtypes: set[str] = set()
+    for unit in tree.iter_units("static"):
+        for sdef, mod in iter_mod_sites(unit.node):
+            if tag_of(getattr(sdef, "affected", None)) != "SelfRef":
+                continue
+            if not _is_off_battlefield_condition(getattr(sdef, "condition", None)):
+                continue
+            tag = tag_of(mod)
+            if tag == "AddType" and isinstance(
+                core := getattr(mod, "core_type", None), str
+            ):
+                types.add(core)
+            elif tag == "AddSubtype" and isinstance(
+                sub := getattr(mod, "subtype", None), str
+            ):
+                subtypes.add(sub)
+    return frozenset(types), frozenset(subtypes)
+
+
+#: Where :func:`object_facts_of` reads a card: ``"battlefield"`` (printed types
+#: only — a permanent), ``"elsewhere"`` (a card or a spell, with the types it has
+#: only off the battlefield folded in — :meth:`ObjectFacts.off_battlefield`), or
+#: ``"any"`` (both kept apart, so :func:`filter_admits` picks per filter).
+FactsZone = Literal["any", "battlefield", "elsewhere"]
+
+
+def object_facts_of(
+    trees: Iterable[ConceptTree],
+    *,
+    zone: FactsZone = "any",
+    colors: frozenset[str] = frozenset(),
+    mana_value: int | None = None,
+    x_cost: bool = False,
+) -> ObjectFacts:
+    """The :class:`ObjectFacts` a card's trees (every face) say: its types,
+    subtypes and supertypes, whether it is every creature type
+    (:func:`is_every_creature_type`), its keywords, and — unless ``zone`` is
+    ``"battlefield"`` — the types it has only off the battlefield
+    (:func:`off_battlefield_types`), folded in for ``"elsewhere"``. Colors, mana
+    value and {X} come from the record (``_card_ir.trees.object_facts``) when the
+    caller has one."""
+    trees = tuple(trees)
+    elsewhere = (
+        [] if zone == "battlefield" else [off_battlefield_types(t) for t in trees]
+    )
+    facts = ObjectFacts(
+        types=frozenset(t for tree in trees for t in tree.card_types),
+        subtypes=frozenset(t for tree in trees for t in tree.card_subtypes),
+        supertypes=frozenset(t for tree in trees for t in tree.card_supertypes),
+        colors=colors,
+        every_creature_type=any(is_every_creature_type(tree) for tree in trees),
+        mana_value=mana_value,
+        x_cost=x_cost,
+        keywords=frozenset(
+            normalised_keyword_name(k) for tree in trees for k in tree.card_keywords
+        ),
+        off_battlefield_types=frozenset(t for types, _ in elsewhere for t in types),
+        off_battlefield_subtypes=frozenset(t for _, subs in elsewhere for t in subs),
+    )
+    return facts.off_battlefield() if zone == "elsewhere" else facts
+
+
+def _describes_off_battlefield(filt: object) -> bool:
+    """Whether a filter describes an object off the battlefield: a spell (an
+    ``And`` holding ``StackSpell`` — Double Major's "target creature spell you
+    control") or a card in a zone its ``InZone`` property names. Reading the
+    filter's zone as the card's is this read's own decision, so a card whose type
+    holds only off the battlefield (Grist's ruling: "Anywhere but on the
+    battlefield, Grist is a Legendary Planeswalker Creature"; CR 113.6b) is
+    judged as it is there."""
+    tag = tag_of(filt)
+    if tag == "And" and any(
+        tag_of(f) == "StackSpell" for f in getattr(filt, "filters", ()) or ()
+    ):
+        return True
+    zones = filter_inzone_zones(filt) if tag == "Typed" else ()
+    return bool(zones) and "Battlefield" not in zones
+
+
+def filter_admits(filt: object, facts: ObjectFacts) -> bool | None:
+    """Whether a phase object filter can describe the card ``facts`` describes.
+
+    Reads the type words (``Permanent`` and ``Card`` admit any type), the negated
+    ones ("noncreature"), subtypes, the
+    supertype / token / colorless properties, and recurses ``Or`` (any) / ``And``
+    (all). ``SelfRef`` (the filter's own card) is ``False``. ``None`` when the filter
+    is a reference this read can't resolve (``ParentTarget``, ``AttachedTo``, …) —
+    the caller resolves those against their own context. A filter describing a
+    spell or a card in another zone (:func:`_describes_off_battlefield`) sees the
+    card as it is there (:meth:`ObjectFacts.off_battlefield`)."""
+    tag = tag_of(filt)
+    if tag == "SelfRef":
+        return False
+    if tag == "StackSpell":
+        return True  # "a spell" — the And beside it carries the constraint
+    if (
+        facts.off_battlefield_types or facts.off_battlefield_subtypes
+    ) and _describes_off_battlefield(filt):
+        facts = facts.off_battlefield()
+    if tag in ("Or", "And"):
+        answers = [filter_admits(f, facts) for f in getattr(filt, "filters", ()) or ()]
+        if not answers or None in answers:
+            return None
+        return any(answers) if tag == "Or" else all(answers)
+    if tag != "Typed":
+        return None
+    cores = set(filter_core_types(filt))
+    if cores and not (
+        {"Permanent", "Card"} & cores or any(facts.has_type(c) for c in cores)
+    ):
+        return False
+    for word in filter_non_types(filt):  # "noncreature permanent" (Astral Dragon)
+        if facts.has_type(word) or facts.has_supertype(word) or facts.has_subtype(word):
+            return False
+    subtypes = set(filter_subtypes(filt))
+    if subtypes and not any(facts.has_subtype(s) for s in subtypes):
+        return False
+    for prop in getattr(filt, "properties", ()) or ():
+        ptag = tag_of(prop)
+        value = getattr(prop, "value", MISSING)
+        if ptag == "Token":
+            return False  # a card is never a token
+        if ptag == "HasSupertype" and not facts.has_supertype(str(value)):
+            return False
+        if ptag == "NotSupertype" and facts.has_supertype(str(value)):
+            return False
+        if ptag == "WasKicked" and not facts.keywords & {"kicker", "multikicker"}:
+            return False  # "a kicked spell" (Verazol): only one with kicker, 702.33a
+        if ptag == "HasXInManaCost" and not facts.x_cost:
+            return False  # "a spell with {X} in its mana cost" (Owlin Spiralmancer)
+        if ptag == "Cmc" and not _mana_value_admits(prop, facts.mana_value):
+            return False  # "a spell with mana value 5 or greater" (Gandalf)
+        if (
+            ptag == "ColorCount"
+            and getattr(prop, "comparator", MISSING) == "EQ"
+            and getattr(prop, "count", MISSING) == 0
+            and facts.colors
+        ):
+            return False  # "colorless" (CR 105.2c)
+    return True
+
+
+_COMPARE: dict[str, Callable[[int, int], bool]] = {
+    "EQ": lambda a, b: a == b,
+    "NE": lambda a, b: a != b,
+    "GE": lambda a, b: a >= b,
+    "GT": lambda a, b: a > b,
+    "LE": lambda a, b: a <= b,
+    "LT": lambda a, b: a < b,
+}
+
+
+def _mana_value_admits(prop: object, mana_value: int | None) -> bool:
+    """A ``Cmc`` filter property (:func:`_fixed_cmc`) against a known mana value;
+    a bound the read can't fix (X, a chosen number) admits."""
+    bound = _fixed_cmc(prop)
+    if mana_value is None or bound is None or bound[0] not in _COMPARE:
+        return True
+    return _COMPARE[bound[0]](mana_value, bound[1])
+
+
+def copied_ability_kind(node: object) -> str | None:
+    """Which abilities a ``CopySpell`` of a ``StackAbility`` copies (CR 707.10):
+    ``"Triggered"`` (Strionic Resonator: "Copy target triggered ability you
+    control"), ``"Activated"``, or ``"Any"`` when the target names no kind
+    (Lithoform Engine: "Copy target activated or triggered ability"). ``None`` for
+    anything else — a spell copier (Twincast) copies no ability."""
+    if tag_of(node) != "CopySpell":
+        return None
+    target = getattr(node, "target", MISSING)
+    if tag_of(target) != "StackAbility":
+        return None
+    kind = getattr(target, "kind", MISSING)
+    return kind if isinstance(kind, str) else "Any"
+
+
+def double_triggers_cause(node: object) -> tuple[str, tuple[str, ...]] | None:
+    """The cause a ``DoubleTriggers`` static scopes its doubling to, or ``None``.
+
+    ``("Any", ())`` doubles every trigger of the affected permanents (Roaming
+    Throne, Echoes of Eternity); ``("EntersBattlefield", core types)`` only those an
+    entering object of those types causes (Panharmonicon: Artifact, Creature;
+    Ancient Greenwarden: Land); ``("CreatureDying", ())`` (Teysa Karlov) and
+    ``("CreatureAttacking", ())`` (Isshin) the dying / attacking ones."""
+    if static_mode_tag(node) != "DoubleTriggers":
+        return None
+    cause = static_mode_field(node, "cause")
+    if isinstance(cause, str):
+        return cause, ()
+    if isinstance(cause, MirrorVariant):
+        inner = cause.inner
+        types = inner.inner if isinstance(inner, MirrorVariant) else inner
+        if not isinstance(types, (list, tuple)):
+            types = ()
+        return cause.key, tuple(t for t in types if isinstance(t, str))
+    return None
+
+
+def produced_kind(node: TypedMirrorNode) -> str:
+    """The tag of a ``Mana`` effect's ``produced`` spec, or ``""`` when absent.
+
+    ``Colorless`` / ``AnyOneColor`` / ``ChosenColor`` / ``OpponentLandColors``, and
+    the deck-colored kinds: ``AnyInCommandersColorIdentity`` (Arcane Signet),
+    ``AnyOneColorAmongPermanents`` (Mox Amber), ``ChoiceAmongExiledColors``
+    (Chrome Mox).
+    """
+    p = getattr(node, "produced", MISSING)
+    if not _present(p):
+        return ""
+    return tag_of(p) or ""
 
 
 # phase v0.66.0 pin bump: the per-source batch damage effect. "Each <X> you
@@ -489,7 +978,12 @@ def _damage_target_reaches_player(tgt: object, root: object | None = None) -> bo
         return True
     if tt in _CHOSEN_PLAYER_TARGETS:
         return True
-    if tt in ("ScopedPlayer", "ParentTargetController", "DefendingPlayer"):
+    if tt in (
+        "ScopedPlayer",
+        "ParentTargetController",
+        "EventTargetController",
+        "DefendingPlayer",
+    ):
         return True
     if tt == "Or":
         return any(
@@ -661,6 +1155,13 @@ def _node_raw(node: TypedMirrorNode) -> str:
 # ── trigger-event derivation (provenance: phase ``mode`` + zone/recipient) ─────
 
 
+#: The derived trigger events that fire as a permanent enters (CR 603.6a: "When
+#: [this object] enters, ..." / "Whenever a [type] enters, ..."): a plain enters
+#: event, and the compound ``entersorattacks`` ("Whenever this creature enters or
+#: attacks" -- its enters event is an ETB per 603.6a).
+ENTERS_EVENTS: frozenset[str] = frozenset({"enters", "entersorattacks"})
+
+
 def _trigger_event(trig: TypedMirrorNode) -> str:
     """Derive a normalized trigger event from a phase trigger's typed shape.
 
@@ -715,6 +1216,31 @@ def _trigger_event(trig: TypedMirrorNode) -> str:
     }.get(mode, mode.lower())
 
 
+def trigger_zone_changes(trig: object) -> tuple[tuple[str | None, str | None], ...]:
+    """The ``(origin, destination)`` of each zone change a ``ChangesZone`` trigger
+    watches. Phase v0.104.0 folds "whenever a creature dies or a creature card is
+    put into a graveyard from a library" (Dreadhound) into one trigger whose
+    ``zone_change_clauses`` each carry an origin predicate: ``Equals`` names the
+    zone; ``NotEquals`` / ``OneOf`` ("from anywhere other than the battlefield")
+    read as an unrestricted ``None``, phase's own shape for "from anywhere". A
+    single-move trigger is its own ``origin`` / ``destination``."""
+    clauses = getattr(trig, "zone_change_clauses", MISSING)
+    if not (_present(clauses) and isinstance(clauses, list) and clauses):
+        return ((getattr(trig, "origin", None), getattr(trig, "destination", None)),)
+    out: list[tuple[str | None, str | None]] = []
+    for clause in clauses:
+        pred = getattr(clause, "origin", None)
+        origin = getattr(pred, "data", None) if tag_of(pred) == "Equals" else None
+        dest = getattr(clause, "destination", None)
+        out.append(
+            (
+                origin if isinstance(origin, str) else None,
+                dest if isinstance(dest, str) else None,
+            )
+        )
+    return tuple(out)
+
+
 def trigger_scope(trig: TypedMirrorNode) -> str:
     """The scope a trigger watches (you/opponents/each) from its recipient field.
 
@@ -727,6 +1253,25 @@ def trigger_scope(trig: TypedMirrorNode) -> str:
         if sc is not None:
             return sc
     return "you"
+
+
+def _names_itself(filt: object, *, among_others: bool) -> bool:
+    tag = tag_of(filt)
+    if among_others and tag in ("Or", "And"):
+        return any(
+            _names_itself(f, among_others=True)
+            for f in getattr(filt, "filters", ()) or ()
+        )
+    return tag == "SelfRef"
+
+
+def watches_itself(trig: object, *, among_others: bool = False) -> bool:
+    """Whether a trigger or replacement watches the card itself: its
+    ``valid_card`` is ``SelfRef`` ("When ~ dies"), or — ``among_others`` — a
+    ``SelfRef`` branch of an ``Or`` / ``And`` beside other objects (Forgeborn
+    Phoenix's "Whenever ~ or equipped creature dies"). Without ``among_others``
+    a shared watcher (Blood Artist's "~ or another creature") doesn't count."""
+    return _names_itself(getattr(trig, "valid_card", None), among_others=among_others)
 
 
 def trigger_subject(trig: TypedMirrorNode) -> tuple[str, ...]:
@@ -895,17 +1440,66 @@ def count_distinct_operand_filter(node: TypedMirrorNode) -> object | None:
 
 def filter_controller(filt: object) -> str | None:
     """The phase ``controller`` of a typed filter (``"You"`` / ``"Opponent"`` /
-    ``None``), recursing ``Or`` / ``And`` to the first that names one.
+    ``None``), recursing ``Or`` / ``And`` to the first that names one. A chosen
+    player's permanents ("Choose an opponent. That player sacrifices a creature"
+    — Myrkul's Edict's d20 row) carry a variant controller, read as its key
+    (``"ChosenPlayer"``), never as unset.
     """
     t = tag_of(filt)
     if t == "Typed":
         c = getattr(filt, "controller", None)
+        if isinstance(c, MirrorVariant):
+            return c.key
         return c if isinstance(c, str) else None
     if t in ("Or", "And"):
         for sub in getattr(filt, "filters", ()) or ():
             c = filter_controller(sub)
             if c is not None:
                 return c
+    return None
+
+
+def _fixed_cmc(prop: object) -> tuple[str, int] | None:
+    """A ``Cmc`` filter property's ``(comparator, value)`` when the value is a
+    fixed number (``"GE"``, 5 — "mana value 5 or greater"), else ``None`` (X, a
+    chosen number)."""
+    if tag_of(prop) != "Cmc":
+        return None
+    value = getattr(prop, "value", None)
+    n = getattr(value, "value", None) if tag_of(value) == "Fixed" else None
+    comparator = getattr(prop, "comparator", None)
+    if not isinstance(n, int) or not isinstance(comparator, str):
+        return None
+    return comparator, n
+
+
+def filter_mana_value_floor(filt: object) -> int | None:
+    """The lowest mana value a typed filter admits, from its ``Cmc`` ``GE`` / ``GT``
+    predicates ("target creature or planeswalker with mana value 3 or greater" —
+    Your Fate Ends Here → 3), or ``None`` when it sets no floor. An ``Or`` floors
+    at its lowest arm (any arm without a floor → ``None``); an ``And`` at its
+    highest. A ceiling (``LE`` — Solitary Cell's "3 or less") is not a floor."""
+    t = tag_of(filt)
+    if t == "Typed":
+        floors: list[int] = []
+        for prop in getattr(filt, "properties", ()) or ():
+            bound = _fixed_cmc(prop)
+            if bound is None:
+                continue
+            comparator, n = bound
+            if comparator == "GE":
+                floors.append(n)
+            elif comparator == "GT":
+                floors.append(n + 1)
+        return max(floors) if floors else None
+    if t in ("Or", "And"):
+        arms = [filter_mana_value_floor(s) for s in getattr(filt, "filters", ()) or ()]
+        if not arms:
+            return None
+        if t == "Or":
+            return None if None in arms else min(a for a in arms if a is not None)
+        present = [a for a in arms if a is not None]
+        return max(present) if present else None
     return None
 
 
@@ -1151,21 +1745,17 @@ def count_operand_qty(node: TypedMirrorNode) -> object | None:
 # player ("target player / opponent discards" — Mind Rot, Stupor), or an explicit
 # opponent. A you/controller recipient is a self-loot (the ported ``discard_makers``
 # lane), not this hand-attack.
-_DISCARD_OPP_TAGS: frozenset[str] = frozenset(
+_DISCARD_OPP_TAGS: frozenset[str] = _OPPONENT_ACTOR_TAGS | frozenset(
     {
         "Player",
         "Target",
         "ParentTarget",
         "Any",
-        "Opponent",
-        "Opponents",
-        "EachOpponent",
         "TargetPlayer",
         "TriggeringPlayer",
         "ParentTargetController",
     }
 )
-_DISCARD_EACH_TAGS: frozenset[str] = frozenset({"Each", "AllPlayers", "EachPlayer"})
 
 
 def recipient_tag(node: TypedMirrorNode) -> str | None:
@@ -1243,6 +1833,18 @@ def modal_mode_description(
     return ""
 
 
+def discard_is_random(node: object) -> bool:
+    """Whether a ``Discard`` node discards at random (CR 701.9b: by default the
+    discarding player chooses the card; some effects require a random discard).
+
+    Phase carries the choice on the node's own ``random`` flag, on an effect
+    (Goblin Lore's "discard three cards at random") and a cost (Flowstone Flood's
+    "Buyback—Pay 3 life, Discard a card at random") alike; an absent flag is a
+    chosen discard.
+    """
+    return getattr(node, "random", False) is True
+
+
 def discard_recipient_scope(node: TypedMirrorNode) -> str | None:
     """The DIRECTION of a ``Discard`` effect (who discards) from its recipient node.
 
@@ -1259,7 +1861,7 @@ def discard_recipient_scope(node: TypedMirrorNode) -> str | None:
         if not _present(sub) or tag_of(sub) is None:
             continue
         t = tag_of(sub)
-        if t in _DISCARD_EACH_TAGS:
+        if t in _EACH_ACTOR_TAGS:
             return "each"
         if t in _DISCARD_OPP_TAGS:
             return "opponents"
@@ -1294,19 +1896,38 @@ def change_zone_dirs(node: TypedMirrorNode) -> tuple[str | None, str | None]:
     )
 
 
-def additional_phase_kind(node: TypedMirrorNode) -> str:
-    """The lowercased ``phase`` of an ``AdditionalPhase`` effect (CR 505 / 506), or
-    ``""`` when absent.
+#: A whole added PHASE (``segment: Phase``) → the step-name kind the readers key
+#: on: an added combat phase is ``"begincombat"`` (its first step), an added
+#: beginning phase ``"untap"`` (CR 501.1: untap, upkeep, draw), an added ending
+#: phase ``"end"``.
+_ADDED_PHASE_KIND: dict[str, str] = {
+    "combat": "begincombat",
+    "beginning": "untap",
+    "ending": "end",
+}
 
-    Phase carries the granted extra phase on ``AdditionalPhase.phase``
-    (``"BeginCombat"`` — Aurelia, Moraug, Combat Celebrant). The ``extra_combats``
-    lane gates on it being a combat phase, mirroring ``project._EXTRA_PHASE``: phase
-    v0.9.0 only structurally emits a combat phase here (it mis-routes
-    extra-upkeep/draw/end to combat, recovered by a separate ``project`` marker), so
-    the combat read mirrors the live ``extra_combats`` exactly.
+
+def additional_phase_kind(node: TypedMirrorNode) -> str:
+    """The lowercased kind of an ``AdditionalPhase`` effect's added phase or step
+    (CR 500.8), or ``""`` when absent: ``"begincombat"`` for an added combat phase
+    (Aurelia, Moraug, Combat Celebrant), ``"untap"`` for an added beginning phase
+    (Sphinx of the Second Sun), ``"upkeep"`` / ``"draw"`` / ``"end"`` for an added
+    step (Paradox Haze, Y'shtola Rhul).
+
+    Phase v0.104.0 replaced the flat ``phase: "BeginCombat"`` string with a tagged
+    ``segment``: ``Phase`` (a whole phase — ``Combat`` / ``Beginning`` / ``Ending``),
+    ``Step`` (one step — ``Upkeep`` / ``End`` …) or ``CreatedPhase`` (Obeka's
+    "additional upkeep steps"), each carrying its name on ``data``. Both read to the
+    same step-name kinds the ``extra_combats`` and extra-phase lanes key on.
     """
-    p = getattr(node, "phase", MISSING)
-    return p.lower() if isinstance(p, str) else ""
+    seg = getattr(node, "segment", MISSING)
+    data = getattr(seg, "data", None)
+    if isinstance(data, str):
+        name = data.lower()
+        if tag_of(seg) == "Phase":
+            return _ADDED_PHASE_KIND.get(name, name)
+        return name
+    return ""
 
 
 def modify_cost_mode(static_node: TypedMirrorNode) -> str | None:
@@ -1433,6 +2054,51 @@ def has_fixed_count(node: TypedMirrorNode, field: str = "amount") -> bool:
     return _present(q) and tag_of(q) == "Fixed"
 
 
+#: The effects whose fixed number a trigger multiplier multiplies: damage, life
+#: gained, tokens made, cards drawn — tag → the field holding the number.
+_MULTIPLIABLE_FIELDS: dict[str, str] = {
+    "LoseLife": "amount",
+    "DealDamage": "amount",
+    "DamageEachPlayer": "amount",
+    "DamageAll": "amount",
+    "GainLife": "amount",
+    "Token": "count",
+    "Draw": "count",
+}
+
+
+class FixedAmount(NamedTuple):
+    """The first fixed number an ability yields (:func:`fixed_amount`): ``value``,
+    and ``per_opponent`` when it is damage or life loss dealt to each opponent."""
+
+    value: int
+    per_opponent: bool
+
+
+def fixed_amount(unit: AbilityUnit) -> FixedAmount | None:
+    """The first fixed damage, life loss dealt to opponents, life gain, token or card
+    count an ability yields (:func:`has_fixed_count` + :func:`amount_factor`), or
+    ``None``. Kokusho's "each opponent loses 5 life" is 5 per opponent. An amount that
+    scales — "gain life equal to the life lost this way" (Kokusho), "tokens equal
+    to its power" — isn't a fixed number. Damage that reaches each opponent
+    (:func:`effect_player_reach`) is marked, so a caller can count it per opponent
+    (Purphoros, God of the Forge's 2)."""
+    for concept in unit.effects:
+        node = concept.node
+        tag = tag_of(node) or ""
+        field = _MULTIPLIABLE_FIELDS.get(tag)
+        if field is None or not has_fixed_count(node, field):
+            continue
+        reach = effect_player_reach(unit.node, node)
+        per_opponent = reach in ("opponents", "per_opponent")
+        if tag == "LoseLife" and not (per_opponent or reach == "target"):
+            continue  # your own life payment (Phyrexian Arena) is no yield
+        if tag not in DAMAGE_EFFECT_TAGS and tag != "LoseLife":
+            per_opponent = False
+        return FixedAmount(amount_factor(node, field), per_opponent)
+    return None
+
+
 def pump_is_negative(node: TypedMirrorNode) -> bool:
     """Whether a ``Pump`` / ``PumpAll`` effect is a SHRINK (CR 613.4c) — a negative
     fixed ``power`` or ``toughness`` (Bile Blight's -3/-3, a -X/-X mass shrink).
@@ -1485,7 +2151,7 @@ def cost_has_paylife(node: object, *, depth: int = 0) -> bool:
     return False
 
 
-def damage_recipient_is_player(vt: object) -> bool:
+def damage_recipient_is_player(vt: object, *, aimed: bool = False) -> bool:
     """Whether a combat-damage TRIGGER's recipient (``valid_target``) is a PLAYER an
     aggressor reaches — an OPPONENT / generic / targeted player (CR 510.1c).
 
@@ -1498,19 +2164,24 @@ def damage_recipient_is_player(vt: object) -> bool:
     triggers as ``Controller``, a phase-parse bug the live path excludes too), NOT this
     aggressive lane. A bare ``Typed`` filter with no core type words (a controller-only
     reference — Coastal Piracy's "an opponent") IS a reachable player.
+
+    ``aimed`` asks the narrower question of a damage EFFECT's target (the reach
+    read, :func:`reach_amount`): can the effect be pointed at a player? A
+    ``ParentTarget`` / ``Target`` is "that creature" an earlier clause targeted
+    (Abyssal Hunter's tapped creature), and a planeswalker arm is not a player
+    (Bite Down's "creature or planeswalker"); "target player" (``TargetPlayer``)
+    is one.
     """
     t = tag_of(vt)
-    if t in (
-        "Player",
-        "Any",
-        "Target",
-        "ParentTarget",
-        "Opponent",
-        "Opponents",
-        "EachOpponent",
-        "Each",
-        "AllPlayers",
-        "EachPlayer",
+    back_reference = t in ("Target", "ParentTarget")
+    if aimed and back_reference:
+        return False
+    if (
+        t in _OPPONENT_ACTOR_TAGS
+        or t in _EACH_ACTOR_TAGS
+        or t in ("Player", "Any")
+        or back_reference
+        or (aimed and t == "TargetPlayer")
     ):
         return True
     if t == "Typed":
@@ -1520,14 +2191,15 @@ def damage_recipient_is_player(vt: object) -> bool:
         cores = filter_core_types(vt)
         if not cores:
             return True
-        return "Player" in cores or "Planeswalker" in cores
+        return "Player" in cores or (not aimed and "Planeswalker" in cores)
     if t == "Or":
         # ADR-0038 W3 batch 2 unit 6: "deals combat damage to a player or
         # planeswalker/battle" (Flitterwing Nuisance, Zurgo and Ojutai)
         # reaches a player in the Player branch even though the OTHER
         # branch is object-typed; ANY reachable branch is enough.
         return any(
-            damage_recipient_is_player(f) for f in getattr(vt, "filters", ()) or ()
+            damage_recipient_is_player(f, aimed=aimed)
+            for f in getattr(vt, "filters", ()) or ()
         )
     return False
 
@@ -1816,21 +2488,91 @@ def ref_count_filter(node: object, field: str) -> object | None:
 # ability-shaped fields — same flattening rationale, 6 carriers at the bump
 # census (Fact or Fiction, Sphinx of Clear Skies, Sphinx of Uthuun, Unesh,
 # Boneyard Parley, Make an Example).
+# ``else_ability``: phase v0.94.0's "Otherwise, …" branch of a conditional
+# (Bogardan Phoenix's "Otherwise, return it to the battlefield"; Sphinx
+# Sovereign's "Otherwise, each opponent loses 3 life") — one of the two
+# outcomes the ability can have, so a faithful unit aggregates it too.
 _EFFECT_CHILD_FIELDS = (
     "effect",
     "sub_ability",
     "execute",
     "chosen_pile_effect",
     "unchosen_pile_effect",
+    "else_ability",
 )
+# The LIST-valued branch fields, each entry one alternative outcome of the
+# node that carries it: a modal ability's ``mode_abilities`` (Demonic Pact), a
+# ``ChooseOneOf``'s ``branches`` (an unbulleted "X or Y" choice — Endling's "~
+# gets +1/-1 or -1/+1", fabricate's counters or Servos), a ``Vote``'s
+# ``per_choice_effect`` (Tyrant's Choice, CR 701.38a), and a ``RollDie``'s
+# ``results`` table rows (Farideh's Fireball's d20, CR 706 — each row an
+# untyped ``{min, max, effect}`` struct whose ``effect`` is the row's ability).
+_EFFECT_LIST_FIELDS = ("mode_abilities", *BRANCH_LISTS.values())
+# Every field a walk over an ability's effects descends, single and list alike.
+_EFFECT_WALK_FIELDS = (*_EFFECT_CHILD_FIELDS, *_EFFECT_LIST_FIELDS)
+
+
+def effect_child_items(node: object) -> Iterator[tuple[str, int | None, object]]:
+    """``(field, list index or None, child)`` for each child a walk over the card's
+    OWN effects descends from ``node``: every "otherwise" branch, choice branch,
+    vote outcome and die-roll row. (The certain trees leave out the branches the
+    controller doesn't decide by pruning them from the records before load —
+    ``_card_ir.branches.certain_records`` — so no walk needs to know.)
+
+    A "sacrifice it unless you …" choice is always skipped, the choice and its
+    "otherwise, sacrifice it" branch: champion's "sacrifice it unless you exile
+    another [object] you control" (CR 702.72a — Changeling Hero, Mistbind
+    Clique) is a drawback the controller pays to keep the card, so neither
+    alternative is something the card does for them."""
+    tag = tag_of(node)
+    for fname in _EFFECT_WALK_FIELDS:
+        child = getattr(node, fname, MISSING)
+        if fname == "else_ability" and is_self_sacrifice(child):
+            continue
+        if (
+            fname == BRANCH_LISTS["ChooseOneOf"]
+            and tag == "ChooseOneOf"
+            and _present(child)
+            and isinstance(child, list)
+            and any(is_self_sacrifice(b) for b in child)
+        ):
+            continue
+        if isinstance(child, TypedMirrorNode):
+            yield fname, None, child
+        elif _present(child) and isinstance(child, list):
+            for i, m in enumerate(child):
+                yield fname, i, m
+
+
+def effect_children(node: object) -> Iterator[object]:
+    """The child nodes :func:`effect_child_items` names."""
+    for _fname, _i, child in effect_child_items(node):
+        yield child
+
+
+def is_self_sacrifice(ability_like: object) -> bool:
+    """Whether an ability wrapper's effect is "sacrifice this permanent" (a
+    ``Sacrifice`` of ``SelfRef``) — the drawback half of "sacrifice it unless"."""
+    eff = getattr(ability_like, "effect", None)
+    return (
+        tag_of(eff) == "Sacrifice" and tag_of(getattr(eff, "target", None)) == "SelfRef"
+    )
+
 
 _MOD_SITES_CACHE_ATTR = "_xw_mod_sites"
 
 
 def iter_mod_sites(
-    root: object,
+    root: object, *, deep: bool = False
 ) -> Iterator[tuple[TypedMirrorNode, TypedMirrorNode]]:
     """``(static_def, modification)`` pairs reachable from one unit node.
+
+    ``deep`` widens the walk to EVERY typed node under ``root`` (the generic
+    deep walk, :func:`iter_typed_nodes`): a ``ChooseOneOf``'s ``branches``
+    (Apostle's Blessing's and Giver of Runes' protection choices), a token's
+    definition, a granted ability's body, an emblem — the board-protection
+    reads (``crosswalk.protection``) need every grant wherever phase nests it;
+    the default walk stays the anthem / team-buff lanes' narrower one.
 
     Covers BOTH continuous-ability shapes: a top-level static (the unit node
     itself carries ``modifications`` — Glorious Anthem, Commander's Insignia)
@@ -1842,7 +2584,33 @@ def iter_mod_sites(
     Iterates a per-root memoized walk like :func:`_iter_typed_nodes` — many
     lanes re-scan the same unit node.
     """
+    if deep:
+        yield from _deep_mod_sites(root)
+        return
     yield from _mod_sites(root)
+
+
+_DEEP_MOD_SITES_CACHE_ATTR = "_xw_deep_mod_sites"
+
+
+def _deep_mod_sites(
+    root: object,
+) -> tuple[tuple[TypedMirrorNode, TypedMirrorNode], ...]:
+    def walk() -> Iterator[tuple[TypedMirrorNode, TypedMirrorNode]]:
+        for node in _iter_typed_nodes(root):
+            mods = getattr(node, "modifications", MISSING)
+            if _present(mods) and isinstance(mods, list):
+                for mod in mods:
+                    if isinstance(mod, TypedMirrorNode):
+                        yield node, mod
+
+    if isinstance(root, TypedMirrorNode):
+        cached = root.__dict__.get(_DEEP_MOD_SITES_CACHE_ATTR)
+        if cached is None:
+            cached = tuple(walk())
+            object.__setattr__(root, _DEEP_MOD_SITES_CACHE_ATTR, cached)
+        return cached
+    return tuple(walk())
 
 
 def _mod_sites(
@@ -1872,12 +2640,12 @@ def _walk_mod_sites(
             for mod in mods:
                 if isinstance(mod, TypedMirrorNode):
                     yield node, mod
-        for fname in (*_EFFECT_CHILD_FIELDS, "mode_abilities", "static_abilities"):
-            child = getattr(node, fname, MISSING)
-            if isinstance(child, TypedMirrorNode):
-                stack.append(child)
-            elif _present(child) and isinstance(child, list):
-                stack.extend(child)
+        stack.extend(effect_children(node))
+        child = getattr(node, "static_abilities", MISSING)
+        if isinstance(child, TypedMirrorNode):
+            stack.append(child)
+        elif _present(child) and isinstance(child, list):
+            stack.extend(child)
 
 
 def filter_inzone_zones(filt: object) -> tuple[str, ...]:
@@ -1897,6 +2665,39 @@ def filter_inzone_zones(filt: object) -> tuple[str, ...]:
     elif t in ("Or", "And"):
         for sub in getattr(filt, "filters", ()) or ():
             out.extend(filter_inzone_zones(sub))
+    return tuple(out)
+
+
+# The card types a ``Typed`` filter must not carry for its ``Named`` property to name a
+# permanent: ``Card`` is a card in a zone (a tutor, a grandeur discard, a graveyard
+# count), and an empty type list is the "a card named X" of a search or seek.
+_NAMED_CARD_TYPES = frozenset({"Card"})
+
+
+def named_permanent_refs(nodes: Iterable[object]) -> tuple[str, ...]:
+    """The names the typed ``nodes`` (a tree's or unit's ``iter_typed()``) refer to
+    as permanents on the battlefield: each positive ``Named`` property of a
+    ``Typed`` filter over a permanent type with no ``InZone`` outside the
+    battlefield ("each other creature named Brothers Yamazaki", "if you control a
+    creature named Bogbrew Witch", "artifacts named Crown of Empires", a meld
+    partner). Such a filter matches every object with that name, unlike a
+    self-reference by name (CR 201.5). Not a card named in a library, graveyard or
+    hand (a tutor, a grandeur discard, "cards named Kindle in all graveyards"), a
+    spell named in a cast count, nor a ``Not`` wrapper ("a creature not named
+    Ebondeath")."""
+    out: list[str] = []
+    for n in nodes:
+        if tag_of(n) != "Typed":
+            continue
+        types = getattr(n, "type_filters", ()) or ()
+        if not types or _NAMED_CARD_TYPES.intersection(filter_core_types(n)):
+            continue
+        if any(z != "Battlefield" for z in filter_inzone_zones(n)):
+            continue
+        for prop in getattr(n, "properties", ()) or ():
+            name = getattr(prop, "name", None) if tag_of(prop) == "Named" else None
+            if isinstance(name, str) and name not in out:
+                out.append(name)
     return tuple(out)
 
 
@@ -2223,12 +3024,8 @@ def _walk_static_defs(root: object) -> Iterator[TypedMirrorNode]:
         seen.add(id(node))
         if _is_static_def(node):
             yield node
-        for fname in (
-            *_EFFECT_CHILD_FIELDS,
-            "mode_abilities",
-            "static_abilities",
-            "statics",
-        ):
+        stack.extend(effect_children(node))
+        for fname in ("static_abilities", "statics"):
             child = getattr(node, fname, MISSING)
             if isinstance(child, TypedMirrorNode):
                 stack.append(child)
@@ -2359,8 +3156,21 @@ def has_nested_extra_turn(node: object) -> bool:
     effect`` / ``win_effect`` / a modification's ``definition`` aren't
     among those fields. The ``extra_turns`` lane's structural fallback,
     the :func:`has_nested_roll_die` sibling (task #85, phase v0.23.0).
+
+    Also a ``ControlNextTurn`` whose ``grant_extra_turn_after`` is set: Emrakul,
+    the Promised End's "After that turn, that player takes an extra turn" rides
+    the control effect as a flag, not an ``ExtraTurn`` node. Its rulings confirm
+    the extra turn is real ("each ability's effect will create an extra turn"),
+    added after the controlled turn (CR 500.7).
     """
-    return any(tag_of(n) == "ExtraTurn" for n in _iter_typed_nodes(node))
+    return any(
+        tag_of(n) == "ExtraTurn"
+        or (
+            tag_of(n) == "ControlNextTurn"
+            and getattr(n, "grant_extra_turn_after", None) is True
+        )
+        for n in _iter_typed_nodes(node)
+    )
 
 
 # ── ADR-0037/0038 W1 batch-3 / task #86 — the granted-ability shared descent ─
@@ -2392,7 +3202,7 @@ def has_nested_extra_turn(node: object) -> bool:
 # shaped bodies only), and :func:`iter_nested_granted_effect_concepts` walks
 # EVERY yielded body (trigger AND ability alike) through the same effect/
 # sub_ability/execute chain a top-level unit's own effects walk uses
-# (:func:`_walk_effect_chain`) — so a granted trigger's ``execute.effect``
+# (:func:`walk_effect_chain`) — so a granted trigger's ``execute.effect``
 # and a granted ability's ``definition.effect`` decorate identically, tagged
 # "granted" only by way of never appearing in ``unit.effects`` otherwise.
 #
@@ -2534,7 +3344,7 @@ def is_opponent_cast_trigger_def(trig: object) -> bool:
     if _trigger_event(trig) not in ("cast_spell", "spellcastorcopy"):
         return False
     vt = getattr(trig, "valid_target", None)
-    return tag_of(vt) in ("Opponent", "Opponents", "EachOpponent") or (
+    return tag_of(vt) in _OPPONENT_ACTOR_TAGS or (
         tag_of(vt) == "Typed" and filter_controller(vt) == "Opponent"
     )
 
@@ -2578,7 +3388,7 @@ def is_creature_etb_trigger_def(trig: object) -> bool:
     """
     if not isinstance(trig, TypedMirrorNode):
         return False
-    if _trigger_event(trig) not in ("enters", "entersorattacks"):
+    if _trigger_event(trig) not in ENTERS_EVENTS:
         return False
     return "Creature" in filter_core_types(getattr(trig, "valid_card", None))
 
@@ -2591,7 +3401,7 @@ def damage_to_player_trigger_kind(trig: object) -> str | None:
     SUBTYPE-carrying recipient (an object, not a player). ``None`` when not
     this shape; else the typed ``damage_kind`` (``"CombatOnly"`` routes
     combat_damage_matters, anything else damage_to_opp_matters — the SAME
-    split :func:`~mtg_utils._deck_forge.lanes._combat_damage_lanes`
+    split :func:`~mtg_utils._analysis.lanes._combat_damage_lanes`
     applies at its top-level read, now shared with the granted-ability
     nested position (Snake Umbra's Aura grant, Talon of Pain's static
     grant, Sword of War and Peace's Equipment grant, Stormbreath Dragon's
@@ -2677,29 +3487,26 @@ def is_damage_reflect_trigger_def(node: object) -> bool:
 
 
 def mana_restricted_to_multicolored(node: object) -> bool:
-    """Whether a ``Mana`` effect's ``restrictions`` carry a
-    ``SpellType: Multicolored`` entry (CR 105.2c) — "Spend this mana only
-    to cast a multicolored spell" (Obsidian Obelisk, Pillar of the
-    Paruns)."""
-    if tag_of(node) != "Mana":
-        return False
-    restrictions = getattr(node, "restrictions", MISSING)
-    if not (_present(restrictions) and isinstance(restrictions, list)):
-        return False
-    return any(
-        isinstance(r, MirrorVariant)
-        and r.key == "SpellType"
-        and r.inner == "Multicolored"
-        for r in restrictions
+    """Whether a ``Mana`` effect's mana is restricted to multicolored spells (CR
+    105.2b) — "Spend this mana only to cast a multicolored spell" (Obsidian Obelisk,
+    Pillar of the Paruns): :func:`mana_spell_type_restriction` reads ``SpellType:
+    Multicolored``."""
+    return (
+        tag_of(node) == "Mana"
+        and isinstance(node, TypedMirrorNode)
+        and mana_spell_type_restriction(node) == "Multicolored"
     )
 
 
 def iter_threaded_target_statics(
     ability_like: object,
+    *,
+    affected_tag: str = "ParentTarget",
+    resets_thread: Callable[[TypedMirrorNode], bool] | None = None,
 ) -> Iterator[tuple[object, TypedMirrorNode]]:
     """``(resolved_target_filter, static_def)`` pairs for every
-    ``ParentTarget``-affected nested static in one ability/trigger chain, the
-    target THREADED through the chain.
+    ``affected_tag``-affected (default ``ParentTarget``) nested static in one
+    ability/trigger chain, the target THREADED through the chain.
 
     Mirrors the live v14 tracked-target walk over the typed substrate: phase
     parses "target creature gains <kw> / becomes a 1/1" as a ``GenericEffect``
@@ -2710,6 +3517,13 @@ def iter_threaded_target_statics(
     High; Cyclone Sire's land animate), resolved by threading the most recent
     non-ParentTarget filter through the ``effect`` / ``sub_ability`` /
     ``execute`` chain. Callers apply their own gates on the resolved filter.
+
+    ``affected_tag="TrackedSet"`` reads the plural back-reference instead —
+    "those creatures gain X" over the chain's own targets (phase v0.94.0's
+    Arm the Cathars). ``resets_thread`` names the effects that END the thread
+    (the caller's call: e.g. a token producer or a mass effect, after which
+    "it" / "those" no longer names a chosen target); such an effect clears
+    the tracked target instead of supplying one.
     """
     tracked: object | None = None
     seen: set[int] = set()
@@ -2726,13 +3540,15 @@ def iter_threaded_target_statics(
         if isinstance(eff, TypedMirrorNode) and id(eff) not in seen:
             seen.add(id(eff))
             tgt = getattr(eff, "target", MISSING)
-            if _present(tgt) and tag_of(tgt) in ("Typed", "Or", "And"):
+            if resets_thread is not None and resets_thread(eff):
+                tracked = None
+            elif _present(tgt) and tag_of(tgt) in ("Typed", "Or", "And"):
                 tracked = tgt
             if tag_of(eff) == "GenericEffect" and tracked is not None:
                 nested = getattr(eff, "static_abilities", MISSING)
                 sts = nested if _present(nested) and isinstance(nested, list) else []
                 for st in sts:
-                    if tag_of(getattr(st, "affected", None)) == "ParentTarget":
+                    if tag_of(getattr(st, "affected", None)) == affected_tag:
                         yield tracked, st
             sub2 = getattr(eff, "sub_ability", MISSING)
             if isinstance(sub2, TypedMirrorNode):
@@ -3042,28 +3858,362 @@ def node_duration(node: object) -> str | None:
     return None
 
 
-def _find_owner_wrapper(
-    node: object, target: object, depth: int, seen: set[int]
-) -> TypedMirrorNode | None:
-    """The ability wrapper whose ``.effect`` IS ``target`` (same walk as
-    :func:`effect_owner_player_scope`'s), or ``None``."""
-    if depth > 40 or not isinstance(node, TypedMirrorNode) or id(node) in seen:
-        return None
-    seen.add(id(node))
-    if getattr(node, "effect", MISSING) is target:
-        return node
-    for fname in (*_EFFECT_CHILD_FIELDS, "mode_abilities"):
-        child = getattr(node, fname, MISSING)
-        if isinstance(child, TypedMirrorNode):
-            r = _find_owner_wrapper(child, target, depth + 1, seen)
-            if r is not None:
-                return r
-        elif _present(child) and isinstance(child, list):
-            for m in child:
-                r = _find_owner_wrapper(m, target, depth + 1, seen)
-                if r is not None:
-                    return r
-    return None
+def _player_scope_tag(ps: object) -> str | None:
+    """The actor tag of a ``player_scope`` value (tagged node / variant / string)."""
+    if isinstance(ps, TypedMirrorNode):
+        return tag_of(ps)
+    if isinstance(ps, MirrorVariant):
+        return ps.key
+    return ps if isinstance(ps, str) else None
+
+
+#: ``AllExcept.exclude`` tags naming the ability's own controller.
+_SELF_EXCLUDE_TAGS: frozenset[str] = frozenset({"Controller", "You"})
+
+
+#: "each other player": an ``AllExcept`` ``player_scope`` that excludes the
+#: ability's controller. CR 102.3 makes a teammate one of the other players, so
+#: each read decides what it means (reach: ``"each"``).
+OTHERS_SCOPE = "Others"
+
+#: every player's option ("any player may …"): reach reads it as ``"each"``; no
+#: one is forced, so it is no edict actor.
+ANY_PLAYER_SCOPE = "AnyPlayer"
+
+#: a player the card picks out — the players who chose a vote's outcome (Master of
+#: Ceremonies' "for each player who chose money"), a villainous choice's "that
+#: player" (Damocles Base). Nobody is targeted; reach reads it as ``"target"`` (a
+#: player the card chooses) and an edict as opponents.
+CHOSEN_PLAYER_SCOPE = "ChosenPlayer"
+
+
+def _owner_scope_tag(ps: object, root: object) -> str | None:
+    """A wrapper's ``player_scope`` tag, with "each other player" — an
+    ``AllExcept`` that excludes the ability's controller — resolved to
+    ``"Others"``. Phase v0.104.0 writes Oft-Nabbed Goat's "its owner draws … and
+    each other player loses that much life" as ``AllExcept{exclude:
+    ParentObjectTargetOwner}`` on the card's own dies trigger, whose parent
+    object is the card itself; on any other trigger that object is a target
+    (Fractured Identity), so it stays ``AllExcept``."""
+    if isinstance(ps, str):  # an actor the owner walk resolved (a choice, a label)
+        return None if ps == "You" else ps
+    tag = _player_scope_tag(ps)
+    if tag == "VotedFor":
+        # the players who chose a vote's outcome, outside friend-or-foe (whose
+        # side the owner walk reads off its label).
+        return CHOSEN_PLAYER_SCOPE
+    if tag != "AllExcept":
+        return tag
+    excluded = tag_of(getattr(ps, "exclude", None))
+    if excluded in _SELF_EXCLUDE_TAGS or (
+        excluded == "ParentObjectTargetOwner"
+        and tag_of(getattr(root, "valid_card", None)) == "SelfRef"
+    ):
+        return OTHERS_SCOPE
+    return tag
+
+
+# Effect nodes that pick one of several alternatives (``_EFFECT_LIST_FIELDS``
+# minus the modes): the alternatives are still the clause that holds the node,
+# so a branch wrapper with no ``player_scope`` of its own is done by whoever
+# does that clause.
+_BRANCHING_EFFECT_TAGS = frozenset(BRANCH_LISTS)
+_BRANCH_LIST_FIELDS = tuple(f for f in _EFFECT_LIST_FIELDS if f != "mode_abilities")
+
+_OWNER_INDEX_CACHE_ATTR = "_xw_owner_index"
+
+
+class _OwnerIndex(NamedTuple):
+    """id(effect node) → (owner wrapper, its actor: a ``player_scope`` node or an
+    actor tag string); id(any node) → the alternatives it sits in ({id of the
+    choosing node: which alternative})."""
+
+    owners: dict[int, tuple[TypedMirrorNode, object]]
+    paths: dict[int, dict[int, object]]
+    #: ids of the nodes inside a branch the controller doesn't decide, or only a
+    #: natural top die face reaches (``branches.uncertain_list`` /
+    #: ``branches.natural_top_only`` — the branches the certain records prune).
+    uncertain: set[int]
+    #: id(node) → the actor facing the choice it sits in, when another player
+    #: makes that choice (:data:`_CHOOSER_ACTORS`).
+    facing: dict[int, str]
+
+
+# The player facing a choice another player makes — a ``ChooseOneOf``'s
+# non-controller ``chooser`` (a villainous choice, CR 701.55a). Its branches name
+# that player as ``ScopedPlayer`` ("They sacrifice a nontoken creature of their
+# choice" — Damocles Base); :func:`effect_facing_player` hands the reads that
+# resolve ``ScopedPlayer`` this side. Damocles Base's "that player" and a target's
+# controller or owner are a player the card picks out (:data:`CHOSEN_PLAYER_SCOPE`);
+# a defending player (CR 506.2) and "each opponent who lost 3 or more life"
+# (Davros's ``PlayerAttribute``) are opponents.
+_CHOOSER_ACTORS: dict[str, str] = {
+    "Opponent": "Opponent",
+    "DefendingPlayer": "Opponent",
+    "PlayerAttribute": "Opponent",
+    "ChosenPlayer": CHOSEN_PLAYER_SCOPE,
+    "ParentObjectTargetController": CHOSEN_PLAYER_SCOPE,
+    "ParentObjectTargetOwner": CHOSEN_PLAYER_SCOPE,
+}
+# The actor of a choice its holding wrapper offers to more players than the
+# controller (``optional_for``): "any player may sacrifice two lands … or have this
+# deal 5 damage to that player" (Worms of the Earth) — every player's option, not an
+# each-player instruction (:data:`ANY_PLAYER_SCOPE`).
+_OPTION_ACTORS: dict[str, str] = {
+    "AnyPlayer": ANY_PLAYER_SCOPE,
+    "AnyOpponent": "Opponent",
+    "AnyOtherPlayer": OTHERS_SCOPE,
+}
+
+
+def _option_actor(holder: object, scope: object) -> object:
+    """The actor a ``ChooseOneOf``'s branches inherit: the "any player" option of
+    the wrapper holding it (:data:`_OPTION_ACTORS`), else the holding clause's."""
+    option = getattr(holder, "optional_for", None)
+    if isinstance(option, str) and option in _OPTION_ACTORS:
+        return _OPTION_ACTORS[option]
+    return scope
+
+
+def _owner_index(root: object) -> _OwnerIndex:
+    """One walk over ``root``'s effects (:func:`effect_child_items` — the same
+    branches and champion skip as every other effect walk), noting for each
+    effect node the wrapper that owns it (the one whose ``.effect`` IS it) with
+    that wrapper's actor, and for every node the alternatives it sits in.
+    Memoized on ``root``.
+
+    The actor is the wrapper's own ``player_scope`` or — for a branch wrapper that
+    carries none — the one of the clause whose ``effect`` holds the branching
+    node: Osseous Sticktwister's "each opponent may sacrifice a nonland permanent
+    or discard a card" hangs ``player_scope: Opponent`` on the trigger's
+    ``execute``, and its two branches carry none. A choice offered to "any player"
+    hands its branches that option (:func:`_option_actor`); a choice another player
+    makes notes the facing player (:func:`effect_facing_player`); a friend-or-foe
+    outcome its label's side (:func:`_friend_or_foe_actor`). A sequential
+    ``sub_ability`` or an ``else_ability`` is its own clause and inherits nothing.
+    An alternative is a conditional wrapper's ``"then"`` (its ``effect``) or
+    ``"else"`` (its ``else_ability``), or a branching node's list index."""
+    if isinstance(root, TypedMirrorNode):
+        cached = root.__dict__.get(_OWNER_INDEX_CACHE_ATTR)
+        if cached is not None:
+            return cached
+    owners: dict[int, tuple[TypedMirrorNode, object]] = {}
+    paths: dict[int, dict[int, object]] = {}
+    uncertain: set[int] = set()
+    facing: dict[int, str] = {}
+    seen: set[int] = set()
+
+    def walk(
+        node: object,
+        inherited: object,
+        path: dict,
+        depth: int,
+        *,
+        row: bool,
+        vote: object = None,
+        holder: object = None,
+        in_uncertain: bool = False,
+        facing_actor: str | None = None,
+    ) -> None:
+        if depth > 40 or not isinstance(node, TypedMirrorNode) or id(node) in seen:
+            return
+        seen.add(id(node))
+        paths.setdefault(id(node), path)
+        if in_uncertain:
+            uncertain.add(id(node))
+        if facing_actor is not None:
+            facing.setdefault(id(node), facing_actor)
+        own = getattr(node, "player_scope", MISSING)
+        scope = own if _present(own) else inherited
+        if vote is not None:
+            scope = _friend_or_foe_actor(vote, scope)
+        eff = getattr(node, "effect", MISSING)
+        if not row and isinstance(eff, TypedMirrorNode):
+            owners.setdefault(id(eff), (node, scope))
+        tag = tag_of(node)
+        branching = tag in _BRANCHING_EFFECT_TAGS
+        branch_scope = _option_actor(holder, scope) if tag == "ChooseOneOf" else scope
+        chooser = (
+            tag_of(getattr(node, "chooser", None)) if tag == "ChooseOneOf" else None
+        )
+        branch_facing = (
+            _CHOOSER_ACTORS.get(chooser, CHOSEN_PLAYER_SCOPE)
+            if tag == "ChooseOneOf" and chooser not in (None, "Controller")
+            else facing_actor
+        )
+        others_pick = branching and uncertain_list(node, holder)
+        has_else = isinstance(getattr(node, "else_ability", MISSING), TypedMirrorNode)
+        for fname, i, child in effect_child_items(node):
+            if fname == "effect":
+                # a d20 row's ``effect`` is the row's ability wrapper
+                keep = row or tag_of(child) in _BRANCHING_EFFECT_TAGS
+                passed = scope if keep else None
+            else:
+                in_branch = branching and fname in _BRANCH_LIST_FIELDS
+                passed = branch_scope if in_branch else None
+            step = path
+            if has_else and fname in ("effect", "else_ability"):
+                step = {**path, id(node): "else" if fname == "else_ability" else "then"}
+            elif branching and i is not None and fname in _BRANCH_LIST_FIELDS:
+                step = {**path, id(node): i}
+            walk(
+                child,
+                passed,
+                step,
+                depth + 1,
+                row=branching and fname == BRANCH_LISTS["RollDie"],
+                vote=node if fname == BRANCH_LISTS["Vote"] else None,
+                holder=node if fname == "effect" else None,
+                facing_actor=branch_facing
+                if branching and fname in _BRANCH_LIST_FIELDS
+                else facing_actor,
+                in_uncertain=in_uncertain
+                or (
+                    branching
+                    and fname in _BRANCH_LIST_FIELDS
+                    and (
+                        others_pick
+                        or (
+                            fname == BRANCH_LISTS["RollDie"]
+                            and natural_top_only(node, child)
+                        )
+                    )
+                ),
+            )
+
+    walk(root, None, {}, 0, row=False)
+    out = _OwnerIndex(owners, paths, uncertain, facing)
+    if isinstance(root, TypedMirrorNode):
+        object.__setattr__(root, _OWNER_INDEX_CACHE_ATTR, out)
+    return out
+
+
+# Friend-or-foe's two labels (``Vote.choices`` under ``voter_scope:
+# ControllerLabels``) and the side each lands on. The controller labels every
+# player, themselves included — "You make this choice for yourself as well as each
+# other player" (Pir's Whim's ruling) — so a friend reads as the controller and a
+# foe as an opponent: the lane's own decision (a friend "doesn't become your
+# teammate", the same ruling set says).
+_FRIEND_OR_FOE_ACTORS = {"friend": "You", "foe": "Opponent"}
+
+
+def _friend_or_foe_actor(vote: object, scope: object) -> object:
+    """A friend-or-foe outcome's actor: the branch's ``player_scope: VotedFor``
+    names its label by ``choice_index`` into the vote's ``choices`` (Pir's
+    Whim: ``["friend", "foe"]`` — the friends search for a land, the foes
+    sacrifice). Any other scope or vote is returned unchanged."""
+    if tag_of(getattr(vote, "voter_scope", None)) != "ControllerLabels":
+        return scope
+    if tag_of(scope) != "VotedFor":
+        return scope
+    index = getattr(scope, "choice_index", None)
+    choices = getattr(vote, "choices", None)
+    if not isinstance(choices, list):
+        return scope
+    i = index if isinstance(index, int) else 0
+    label = choices[i] if 0 <= i < len(choices) else None
+    return _FRIEND_OR_FOE_ACTORS.get(label, scope) if isinstance(label, str) else scope
+
+
+def _find_owner_wrapper(root: object, target: object) -> TypedMirrorNode | None:
+    """The ability wrapper whose ``.effect`` IS ``target``, or ``None``."""
+    found = _owner_index(root).owners.get(id(target))
+    return found[0] if found is not None else None
+
+
+def effect_owner_player_scope(root: object, effect_node: object) -> str | None:
+    """The actor tag on the ability wrapper that DIRECTLY owns ``effect_node``
+    (the wrapper whose ``.effect`` IS it — :func:`_owner_index`), or ``None``
+    when that wrapper names none (the controller).
+
+    phase hangs ``player_scope`` ("each player / an opponent <does X>") on the
+    wrapper whose ``effect`` is the resolving action — a trigger ``execute``, a
+    sequential ``sub_ability``, a modal ``mode_abilities`` arm, a vote's or a
+    ``ChooseOneOf``'s branch (which takes the actor of the choice when it carries
+    none: "each opponent may sacrifice … or discard …"), an "otherwise"
+    ``else_ability`` — NOT on the inner effect node the overlay decorates.
+    Reading the scope of the wrapper that owns THIS effect (not a sibling's)
+    tells a give-away / edict ("each player gains control", "each opponent
+    sacrifices an enchantment") from a you-effect that merely shares a unit with
+    an unrelated each-player action — Nihiloor's per-opponent tap loop (a
+    ``repeat_for`` on the OUTER trigger, not the gain-control's wrapper),
+    Garland's monarch vote. ``OTHERS_SCOPE`` == "each other player" and
+    ``CHOSEN_PLAYER_SCOPE`` == a player the card picks out
+    (:func:`_owner_scope_tag`): each lane decides what they mean."""
+    found = _owner_index(root).owners.get(id(effect_node))
+    return _owner_scope_tag(found[1], root) if found is not None else None
+
+
+def effect_owner_is_friend(root: object, effect_node: object) -> bool:
+    """Whether ``effect_node`` is a friend-or-foe outcome labelled friend — the
+    controller's side (:func:`_friend_or_foe_actor`): Pir's Whim's "each friend
+    searches their library for a land card"."""
+    found = _owner_index(root).owners.get(id(effect_node))
+    if found is None:
+        return False
+    owner, actor = found
+    return actor == "You" and tag_of(getattr(owner, "player_scope", None)) == "VotedFor"
+
+
+def effect_facing_player(root: object, node: object) -> str | None:
+    """The actor tag of the player facing the choice ``node`` sits in, when
+    another player makes it — the player a branch's ``ScopedPlayer`` names
+    ("That player sacrifices a creature of their choice" — Midnight Crusader
+    Shuttle's defending player, an opponent) — else ``None``."""
+    return _owner_index(root).facing.get(id(node))
+
+
+def in_uncertain_branch(root: object, node: object) -> bool:
+    """Whether ``node`` sits in a branch under ``root`` the controller doesn't
+    decide, or only a natural top die face reaches — what the certain records
+    prune (``_card_ir.branches``), read on a full tree."""
+    return id(node) in _owner_index(root).uncertain
+
+
+def effects_exclusive(root: object, a: object, b: object) -> bool:
+    """Whether two effects under ``root`` are alternatives that can't both
+    happen: one in a conditional's main branch and one in its "otherwise"
+    branch (Search for Survivors' "If it's a creature card, put it onto the
+    battlefield. Otherwise, exile it."), or in different branches of one
+    ``ChooseOneOf`` / vote / die-roll row. A lane pairing two effects of one
+    unit (an exile with its return) checks this now that the effect walk reads
+    every branch. ``False`` when either isn't under ``root``."""
+    paths = _owner_index(root).paths
+    pa, pb = paths.get(id(a)), paths.get(id(b))
+    if pa is None or pb is None:
+        return False
+    return any(k in pb and pb[k] != v for k, v in pa.items())
+
+
+def effect_owner_rebinds_kind(root: object, effect_node: object) -> bool:
+    """Whether the wrapper that owns ``effect_node`` carries phase's
+    ``iteration_kind_binding`` marker: a "for each kind of counter on target
+    permanent, put another counter of that kind on it or remove one from it"
+    branch (Quarry Hauler, Dramatist's Puppet), whose typed counter kind is a
+    loop placeholder, not the kind the card names."""
+    owner = _find_owner_wrapper(root, effect_node)
+    return _present(getattr(owner, "iteration_kind_binding", MISSING))
+
+
+def effect_owner_optional(root: object, effect_node: object) -> bool:
+    """Whether the wrapper that owns ``effect_node`` is optional — "that
+    permanent's controller MAY sacrifice a land" (Chain of Vapor), a choice the
+    actor can decline, not a forced action."""
+    owner = _find_owner_wrapper(root, effect_node)
+    return getattr(owner, "optional", None) is True
+
+
+def sacrifice_names_no_player(root: object, node: TypedMirrorNode) -> bool:
+    """Whether a ``Sacrifice`` effect of a typed permanent names no player at all:
+    no controller on the sacrificed filter, no ``player_scope`` on the wrapper
+    that owns it — the shape of a sacrifice you make yourself, and the shape phase
+    leaves when it drops the forcing player ("each opponent … sacrifices",
+    "…, then sacrifices")."""
+    return (
+        tag_of(getattr(node, "target", None)) == "Typed"
+        and filter_controller(effect_filter(node)) is None
+        and effect_owner_player_scope(root, node) is None
+    )
 
 
 def effect_owner_raw(root: object, effect_node: object) -> str:
@@ -3080,7 +4230,7 @@ def effect_owner_raw(root: object, effect_node: object) -> str:
     clause elsewhere in the same ability). ``""`` when the owner is
     unresolvable or carries no description of its own.
     """
-    owner = _find_owner_wrapper(root, effect_node, 0, set())
+    owner = _find_owner_wrapper(root, effect_node)
     return _node_raw(owner) if owner is not None else ""
 
 
@@ -3095,7 +4245,7 @@ def effect_owner_targets_per_opponent(root: object, effect_node: object) -> bool
     per-opponent CARDINALITY is unambiguous. CR 506.4's "each opponent"
     multiplayer default.
     """
-    owner = _find_owner_wrapper(root, effect_node, 0, set())
+    owner = _find_owner_wrapper(root, effect_node)
     if owner is None:
         return False
     mt = getattr(owner, "multi_target", MISSING)
@@ -3110,14 +4260,104 @@ def effect_owner_targets_per_opponent(root: object, effect_node: object) -> bool
     return tag_of(getattr(qty, "filter", None)) == "Opponent"
 
 
+def effect_owner_reads_chosen_group(root: object, effect_node: object) -> bool:
+    """Whether the wrapper that DIRECTLY owns ``effect_node`` acts on a group an
+    earlier clause chose (phase's ``reads_chosen_group`` index — The Eagles Are
+    Coming!'s "return each chosen creature")."""
+    owner = _find_owner_wrapper(root, effect_node)
+    return isinstance(getattr(owner, "reads_chosen_group", None), int)
+
+
 def effect_owner_duration(root: object, effect_node: object) -> str | None:
     """The ``duration`` tag on the wrapper that DIRECTLY owns ``effect_node``
     (Banisher Priest's exile execute carries ``UntilHostLeavesPlay`` on the
     Spell wrapper, not on the ``ChangeZone`` node itself), or ``None``.
     CR 611.2b.
     """
-    owner = _find_owner_wrapper(root, effect_node, 0, set())
+    owner = _find_owner_wrapper(root, effect_node)
     return node_duration(owner) if owner is not None else None
+
+
+# A chosen player the caster may aim anywhere — at an opponent, themself or
+# (in Two-Headed Giant) their teammate. ``TargetOpponent`` is deliberately
+# absent: "target opponent" can't be pointed at a teammate.
+_TARGET_PLAYER_TAGS = frozenset({"Player", "TargetPlayer"})
+# The mass/symmetric effect tags: "all"/"each" names no single chosen object
+# (the lanes read these through ``_analysis/lanes/_shared.py``).
+MASS_EFFECT_TAGS: frozenset[str] = frozenset(
+    {"DestroyAll", "ChangeZoneAll", "PutCounterAll", "DamageAll", "DamageEachPlayer"}
+)
+# The mass-effect tags whose object filter's controller decides who is hit —
+# :data:`MASS_EFFECT_TAGS` plus ``PumpAll`` ("creatures your opponents control
+# get -2/-2"; "all creatures get -3/-3").
+_MASS_REACH_TAGS = MASS_EFFECT_TAGS | {"PumpAll"}
+
+
+def effect_player_reach(root: object, effect_node: TypedMirrorNode) -> str | None:
+    """WHICH players an effect reaches, read from the structure around it:
+    ``"per_opponent"`` (a "for each opponent, <targeted effect>" loop),
+    ``"opponents"`` (each opponent / your opponents' permanents), ``"each"``
+    (each player / every permanent), ``"target"`` (a player the caster chooses),
+    ``"scoped"`` (a trigger's "that player" — resolve with
+    :func:`scoped_player_scope`), or ``None`` (you, or no player reach).
+
+    The concept node's own ``scope`` is unreliable for this question (Rank Rat's
+    discard and Gray Merchant's drain read "you"; Murder reads "each"), so the
+    read checks, in order: the owner wrapper's per-opponent ``multi_target``
+    (:func:`effect_owner_targets_per_opponent` — first, because the loop's
+    bound player reads ``TargetPlayer``); the owner wrapper's ``player_scope``
+    (Rank Rat → Opponent, Garruk's -2 → All); a ``player_filter`` (Pestilence
+    All, Witty Roastmaster Opponent); the recipient (target player / scoped
+    player); an object filter controlled by a target or scoped player (Twisted
+    Fates' "each creature target player controls", Face Yourself's
+    ``source_filter``, Braids); and, for a mass effect only, its object
+    filter's controller (Wrath of God → each; Massacre Wurm → opponents).
+    phase can't yet tell "each other player" from "each opponent" — both are
+    ``player_scope: Opponent`` (Grave Pact, Syphon Mind)."""
+    if effect_owner_targets_per_opponent(root, effect_node):
+        return "per_opponent"
+    actor = effect_owner_player_scope(root, effect_node)
+    if actor == CHOSEN_PLAYER_SCOPE:
+        return "target"
+    if actor == ANY_PLAYER_SCOPE:
+        return "each"
+    if actor in _OPPONENT_ACTOR_TAGS:
+        return "opponents"
+    # "each other player" (``Others``) reaches your teammate too (CR 102.3), the
+    # same call as twohg_scan's veto on phase's ``Opponent`` reading of it.
+    if actor in _EACH_ACTOR_TAGS or actor in ("All", OTHERS_SCOPE):
+        return "each"
+    pf = player_filter_tag(effect_node)
+    if pf == "All":
+        return "each"
+    if pf == "Opponent":
+        return "opponents"
+    rt = recipient_tag(effect_node)
+    if rt in _TARGET_PLAYER_TAGS:
+        return "target"
+    if rt == "ScopedPlayer":
+        return "scoped"
+    filt = effect_filter(effect_node)
+    for f in (filt, getattr(effect_node, "source_filter", None)):
+        ctrl = filter_controller(f)
+        if ctrl == "ScopedPlayer":
+            return "scoped"
+        if ctrl in _TARGET_PLAYER_TAGS:
+            return "target"
+    # Phase-misparse workaround: phase drops the narrowing clause of some mass
+    # effects and leaves a typeless filter, which would read as every
+    # permanent — v0.94.0's Predictive Preparations ("each of one or two target
+    # creatures"; a ``put_counter_tail`` residue since v0.104.0) and Saproling
+    # Burst's "destroy all tokens created with this enchantment" (a bare
+    # ``Token`` filter). Retire the ``filter_core_types`` condition when
+    # test_typeless_mass_filter_canary fails RETIRE-READY.
+    if tag_of(effect_node) in _MASS_REACH_TAGS and filter_core_types(filt):
+        ctrl = filter_controller(filt)
+        if ctrl is None:
+            return "each"
+        if ctrl in _OPPONENT_ACTOR_TAGS:
+            return "opponents"
+    return None
 
 
 def reveal_until_player(node: TypedMirrorNode) -> str | None:
@@ -3305,6 +4545,27 @@ def iter_condition_sites(root: object) -> Iterator[TypedMirrorNode]:
                     yield ar
 
 
+def requires_condition_inner(node: object) -> object | None:
+    """The condition a ``RequiresCondition`` activation restriction carries ("Activate
+    only if …", CR 602.5), unwrapped from its ``data`` variant; ``None`` for the
+    empty marker phase leaves when it couldn't structure the condition."""
+    data = getattr(node, "data", None)
+    return data.inner if isinstance(data, MirrorVariant) else data
+
+
+def activation_restriction_conditions(node: object) -> Iterator[object | None]:
+    """The condition of each ``RequiresCondition`` activation restriction on one
+    ability node (:func:`requires_condition_inner`; ``None`` for an empty marker).
+    Timing and per-turn restrictions ("as a sorcery", "once each turn") aren't
+    conditions and are skipped."""
+    ars = getattr(node, "activation_restrictions", MISSING)
+    if not (_present(ars) and isinstance(ars, list)):
+        return
+    for ar in ars:
+        if tag_of(ar) == "RequiresCondition":
+            yield requires_condition_inner(ar)
+
+
 def hand_size_scopes(root: object) -> tuple[str, ...]:
     """The player scope of every ``HandSize`` / ``HandSizeExact`` /
     ``HandSizeOneOf`` QTY operand under one unit node (Maro's dynamic-P/T
@@ -3322,3 +4583,1575 @@ def hand_size_scopes(root: object) -> tuple[str, ...]:
                 continue
             out.append(_scope_from_player_node(player) or "any")
     return tuple(out)
+
+
+# ── self searches (CR 701.23a) ────────────────────────────────────────────────
+# The shared search-your-library walks: the tutor / ramp lanes
+# (``tree_synthesis.mana_ramp_lands``) and card_classify's land-search reads both
+# go through them.
+
+_TUTOR_DIRECTED_PLAYER_TAGS = frozenset(
+    {
+        "ParentTarget",
+        "Player",
+        "Target",
+        "Opponent",
+        "Opponents",
+        "EachOpponent",
+        "TriggeringPlayer",
+        "ScopedPlayer",
+        "ParentTargetController",
+        "ParentObjectTargetController",
+    }
+)
+_TUTOR_NON_SELF_ABILITY_SCOPE = frozenset(
+    {
+        "All",
+        "AllExcept",
+        "EachPlayer",
+        "Opponent",
+        "Opponents",
+        "EachOpponent",
+        "ParentTargetController",
+        "ParentObjectTargetController",
+    }
+)
+_TUTOR_SIBLING_RECIPIENT_CONCEPTS = frozenset(
+    {"gain_life", "lose_life", "draw", "discard"}
+)
+# A bespoke non-SearchLibrary effect tag phase uses for a still-genuine own-
+# library search (Teacher's Pet's Augment-combine); mapped to concept "tutor"
+# in the crosswalk (crosswalk.EFFECT_CONCEPTS) alongside SearchLibrary.
+TUTOR_EFFECT_TAGS = frozenset({"SearchLibrary", "ChooseAugmentAndCombineWithHost"})
+
+
+def tutor_ability_body(unit: AbilityUnit) -> TypedMirrorNode | None:
+    """The execute-shaped ability body carrying ``ability_tag`` /
+    ``player_scope`` -- a trigger/replacement unit wraps its real ability body
+    one level down in ``.execute`` (``AbilityUnit.node`` is the OUTER trigger/
+    replacement wrapper for those origins); an ``ability``-origin unit's own
+    node already IS that body."""
+    if unit.origin in ("trigger", "replacement"):
+        ex = getattr(unit.node, "execute", MISSING)
+        return ex if isinstance(ex, TypedMirrorNode) else None
+    return unit.node
+
+
+def _searcher_is_self(tp: object) -> bool | None:
+    """Whose library a ``SearchLibrary``'s own ``target_player`` names: ``True``
+    for you (``Typed`` You/Controller), ``False`` for another player (Player/
+    Target/Opponent(s)/TriggeringPlayer/ScopedPlayer/ParentTarget(Controller)),
+    ``None`` when it names nobody (absent -- the default searcher is you) or an
+    unknown shape."""
+    if tp is MISSING or tp is None:
+        return None
+    t = tag_of(tp)
+    if t in _TUTOR_DIRECTED_PLAYER_TAGS:
+        return False
+    if t == "Typed":
+        return getattr(tp, "controller", None) in ("You", "Controller")
+    return None
+
+
+def _unit_search_vetoed(unit: AbilityUnit) -> bool:
+    """The whole-unit vetoes on a self search: a symmetric/opponent-scoped
+    ability (``player_scope`` on the execute body -- Old-Growth Dryads'
+    ``Opponent``, Weird Harvest's ``All``), or a sibling gain_life/lose_life/
+    draw/discard effect naming another player (Restorative Technique's "target
+    player gains 2 life, then searches their library" -- the search itself
+    carries no recipient, inheriting the preceding effect's)."""
+    body = tutor_ability_body(unit)
+    ps_tag = tag_of(getattr(body, "player_scope", None)) if body else None
+    if ps_tag in _TUTOR_NON_SELF_ABILITY_SCOPE:
+        return True
+    return any(
+        c.concept in _TUTOR_SIBLING_RECIPIENT_CONCEPTS
+        and explicit_recipient_scope(c.node) in ("opponents", "each", "any")
+        for c in unit.effects
+    )
+
+
+def _is_cycling_search(unit: AbilityUnit) -> bool:
+    """A Cycling/Landcycling/Typecycling reminder-granted search (``ability_tag``
+    Cycling -- CR 702.29e: "[Type]cycling" searches for a [type] card and puts it
+    into your hand; CR 702.29a: it functions only from your hand)."""
+    return tag_of(getattr(tutor_ability_body(unit), "ability_tag", None)) == "Cycling"
+
+
+def unit_is_self_tutor(unit: AbilityUnit) -> bool | None:
+    """Whether THIS unit's tutor concept(s) search YOUR OWN library (CR
+    701.23a), or ``None`` if the unit carries no tutor concept at all.
+
+    Four vetoes, all typed: (1) a Cycling/Landcycling/Typecycling reminder-
+    granted search (:func:`_is_cycling_search` -- a keyword reminder is not a
+    deliberate tutor); (2)/(3) :func:`_unit_search_vetoed`; (4) the search's
+    own ``target_player`` (:func:`_searcher_is_self`). A unit MAY carry more
+    than one SearchLibrary (Sadistic Sacrament's directed find-and-exile chains
+    a second, recipient-less SearchLibrary for "the rest") -- if ANY search in
+    the unit is directed, the WHOLE unit is (they share one targeted-player
+    action chain). :func:`land_searches` judges each search on its own."""
+    tutors = [
+        c
+        for c in unit.effects
+        if c.concept == "tutor" and tag_of(c.node) in TUTOR_EFFECT_TAGS
+    ]
+    if not tutors:
+        return None
+    if _is_cycling_search(unit) or _unit_search_vetoed(unit):
+        return False
+    saw_self = False
+    for c in tutors:
+        tp = getattr(c.node, "target_player", MISSING)
+        verdict = _searcher_is_self(tp)
+        if verdict is False:
+            return False
+        if verdict is True or tp is MISSING or tp is None:
+            saw_self = True
+        # unknown target_player shape -- never guess either way for THIS node
+    return saw_self or None
+
+
+#: CR 205.3i's full land-type list, lowercased. The one copy: the land-animate
+#: lanes' narrower set (``lanes/_shared._LAND_SUBTYPE_WORDS``) is derived from it.
+LAND_SUBTYPE_WORDS: frozenset[str] = frozenset(
+    {
+        "cave",
+        "desert",
+        "forest",
+        "gate",
+        "island",
+        "lair",
+        "locus",
+        "mine",
+        "mountain",
+        "plains",
+        "planet",
+        "power-plant",
+        "sphere",
+        "swamp",
+        "tower",
+        "town",
+        "urza's",
+    }
+)
+
+
+def _has_basic_supertype(filt: object) -> bool:
+    return any(
+        tag_of(p) == "HasSupertype" and getattr(p, "value", None) == "Basic"
+        for p in (getattr(filt, "properties", None) or ())
+    )
+
+
+def search_filter_land_facts(f: object) -> tuple[bool, bool] | None:
+    """``(can_fetch_land, fetches_only_lands)`` for a ``SearchLibrary``
+    filter, or ``None`` when phase left the filter unresolved (a bare ``Any``
+    -- Planar Engineering's "four basic land cards"; an empty ``Typed`` --
+    Wild Endeavor's dice-scaled count). Landish = a ``Land`` core type, a CR
+    205.3i land-subtype word, or a ``HasSupertype Basic`` property (CR
+    305.6); land-ONLY additionally requires no nonland core type / nonland
+    subtype disjunct (Archdruid's Charm's Or(Creature, Land) can fetch a
+    creature, so it is landish but never land-only)."""
+    t = tag_of(f)
+    if t in ("Or", "And"):
+        subs = [
+            search_filter_land_facts(x) for x in (getattr(f, "filters", None) or ())
+        ]
+        subs = [s for s in subs if s is not None]
+        if not subs:
+            return None
+        can = any(c for c, _ in subs)
+        only = all(o for _, o in subs) if t == "Or" else any(o for _, o in subs)
+        return can, only
+    if t != "Typed":
+        return None
+    cores = set(filter_core_types(f))
+    subtys = {s.lower() for s in filter_subtypes(f)}
+    basic = _has_basic_supertype(f)
+    if not cores and not subtys and not basic:
+        return None
+    landish = bool("Land" in cores or (subtys & LAND_SUBTYPE_WORDS) or basic)
+    only = (
+        landish and not (cores - {"Land", "Card"}) and not (subtys - LAND_SUBTYPE_WORDS)
+    )
+    return landish, only
+
+
+def iter_search_landings(unit: AbilityUnit) -> Iterator[tuple[str, bool]]:
+    """``(destination, enters_tapped)`` for every place the UNIT's searched
+    card(s) can land: the search node's own ``split`` (Cultivate's
+    one-to-battlefield-tapped / rest-to-hand) plus every ``ChangeZone`` in the
+    unit whose origin is ``Library`` (the plain "put that card into X"
+    continuation) or absent with an ``Any`` / ``ParentTarget`` target (the
+    conditional-continuation shape phase emits for "put it onto the battlefield
+    tapped if it's a land card" -- an origin-less ChangeZone chained onto the
+    search's own result)."""
+    for n in iter_typed_nodes(unit.node):
+        t = tag_of(n)
+        if t == "SearchLibrary":
+            split = getattr(n, "split", MISSING)
+            if split is not MISSING and split is not None:
+                primary = getattr(split, "primary_destination", None)
+                if isinstance(primary, str):
+                    yield primary, getattr(split, "primary_enter_tapped", None) is True
+                rest = getattr(split, "rest_destination", None)
+                if isinstance(rest, str):
+                    yield rest, False
+        elif t == "ChangeZone":
+            origin = getattr(n, "origin", MISSING)
+            if origin is not MISSING and origin is not None:
+                if origin != "Library":
+                    continue
+            elif tag_of(getattr(n, "target", None)) not in (
+                "Any",
+                "ParentTarget",
+            ):
+                continue
+            d = getattr(n, "destination", None)
+            if isinstance(d, str):
+                yield d, getattr(n, "enter_tapped", None) is True
+
+
+# ── land searches and mana colours (card_classify's IR reads) ─────────────────
+# ``card_classify.color_sources`` / ``land_fetch_profile`` / ``is_fixing_land``
+# and the tuner's fixing read go through these, never oracle text.
+
+#: The basic land types and the mana each one's intrinsic ability adds (CR 305.6:
+#: "An object with the land card type and a basic land type has the intrinsic
+#: ability '{T}: Add [mana symbol]'" -- Plains {W}, Island {U}, Swamp {B},
+#: Mountain {R}, Forest {G}).
+BASIC_LAND_TYPE_COLORS: dict[str, str] = {
+    "Plains": "W",
+    "Island": "U",
+    "Swamp": "B",
+    "Mountain": "R",
+    "Forest": "G",
+}
+_MANA_COLOR_LETTER: dict[str, str] = {
+    "White": "W",
+    "Blue": "U",
+    "Black": "B",
+    "Red": "R",
+    "Green": "G",
+    "Colorless": "C",
+}
+_FIVE_COLORS: frozenset[str] = frozenset("WUBRG")
+
+#: What a land search can find, colour-wise: the colours its basic land types
+#: name, ``"any_basic"`` for a basic land of any type (resolved against the
+#: deck's own basics), or ``"any"`` for any land card.
+type LandColors = frozenset[str] | Literal["any", "any_basic"]
+
+
+def _merge_land_colors(
+    parts: Iterable[LandColors],
+) -> LandColors:
+    """The union of several :data:`LandColors` (``"any"`` > ``"any_basic"`` > the
+    named colours)."""
+    named: set[str] = set()
+    basic = False
+    for p in parts:
+        if p == "any":
+            return "any"
+        if p == "any_basic":
+            basic = True
+        elif isinstance(p, frozenset):
+            named |= p
+    return "any_basic" if basic else frozenset(named)
+
+
+def land_search_colors(filt: object) -> LandColors | None:
+    """The colours of mana a land found by a ``SearchLibrary`` filter can make,
+    or ``None`` when the filter can't find a land (or phase left it unresolved
+    -- see :func:`search_filter_land_facts`).
+
+    A filter naming basic land types (Wood Elves' "Forest card", Farseek's
+    "Plains, Island, Swamp, or Mountain card", Krosan Verge's "a Forest card and
+    a Plains card") reads those types' colours (CR 305.6); a basic land with no
+    type named (Evolving Wilds, Cultivate) is ``"any_basic"`` (CR 205.4c: a basic
+    land is one with the basic supertype); any land card (Sylvan Scrying, Knight
+    of the Reliquary) is ``"any"``. A filter naming only non-basic land types
+    (a Gate, a Desert) names no colour: an empty set. ``Or`` / ``And`` widen to
+    the broadest arm (Archdruid's Charm's creature-or-land reads its land arm)."""
+    t = tag_of(filt)
+    if t in ("Or", "And"):
+        arms = [land_search_colors(x) for x in (getattr(filt, "filters", None) or ())]
+        found = [a for a in arms if a is not None]
+        return _merge_land_colors(found) if found else None
+    facts = search_filter_land_facts(filt)
+    if facts is None or not facts[0]:
+        return None
+    subtypes = filter_subtypes(filt)
+    if subtypes:
+        return frozenset(
+            BASIC_LAND_TYPE_COLORS[s] for s in subtypes if s in BASIC_LAND_TYPE_COLORS
+        )
+    return "any_basic" if _has_basic_supertype(filt) else "any"
+
+
+#: Phase's "any number" search count is i32::MAX (Nissa, Who Shakes the World's
+#: -8: "any number of Forest cards"); a read caps it at a whole deck's worth.
+SEARCH_COUNT_CAP = 99
+
+
+def _count_value(node: object, field: str = "count") -> int | None:
+    """``field``'s fixed magnitude (:func:`amount_factor`), unwrapping an ``UpTo``
+    to its ``max``; None when dynamic or absent."""
+    if not isinstance(node, TypedMirrorNode):
+        return None
+    if has_fixed_count(node, field):
+        return amount_factor(node, field)
+    q = getattr(node, field, MISSING)
+    if _present(q) and tag_of(q) == "UpTo":
+        return _count_value(q, "max")
+    return None
+
+
+def search_count(node: TypedMirrorNode) -> int:
+    """How many cards a ``SearchLibrary`` puts where it puts them: a ``split``'s
+    primary count when only the primary pile goes to the battlefield (Cultivate's
+    one of two), else the search's own count (``Fixed`` / ``UpTo`` max). A
+    dynamic count (Settle the Wreckage's "that many") reads 1; "any number"
+    reads :data:`SEARCH_COUNT_CAP`."""
+    split = getattr(node, "split", MISSING)
+    if _present(split) and getattr(split, "rest_destination", None) != getattr(
+        split, "primary_destination", None
+    ):
+        primary = getattr(split, "primary_count", None)
+        if isinstance(primary, int) and getattr(split, "primary_destination", None) == (
+            "Battlefield"
+        ):
+            return min(primary, SEARCH_COUNT_CAP)
+    n = _count_value(node)
+    return min(n, SEARCH_COUNT_CAP) if n is not None and n > 0 else 1
+
+
+def is_self_enters_trigger(unit: AbilityUnit) -> bool:
+    """Whether UNIT is a trigger that fires when the card ITSELF enters: an
+    enters event watching ``SelfRef`` -- never another permanent entering (Deep
+    Gnome Terramancer's "whenever one or more lands enter under an opponent's
+    control", a landfall trigger)."""
+    if unit.origin != "trigger" or unit.trigger_event not in ENTERS_EVENTS:
+        return False
+    return tag_of(getattr(unit.node, "valid_card", None)) == "SelfRef"
+
+
+class LandSearch(NamedTuple):
+    """One of YOUR land searches (CR 701.23a), one per ability unit."""
+
+    colors: LandColors  # what it can find (see land_search_colors)
+    count: int  # lands it puts onto your battlefield (see _battlefield_count)
+    to_battlefield: bool  # some found land can enter the battlefield
+    enters_tapped: bool  # a land it puts onto the battlefield enters tapped
+    on_self_etb: bool  # it rides the card's own enters trigger
+    cycling: bool  # a landcycling search: from your hand, into your hand
+
+
+def _self_searches(unit: AbilityUnit) -> list[TypedMirrorNode]:
+    """The unit's ``SearchLibrary`` effects that search YOUR library, judged one
+    search at a time along the effect chain. A search's own ``target_player``
+    decides (:func:`_searcher_is_self`); a recipient-less search is read off the
+    ``Shuffle`` that closes its leg (Demolition Field's "You may search your
+    library ..., then shuffle" closes on ``Controller``, after the opponent's
+    ``ParentTargetController`` leg); with neither it continues the leg before it
+    (Sadistic Sacrament's kicked "instead search that player's library" -- the
+    whole-unit continuation :func:`unit_is_self_tutor` describes). The first leg
+    with no recipient defaults to you."""
+    out: list[TypedMirrorNode] = []
+    verdict = True
+    current: TypedMirrorNode | None = None
+    pending: bool | None = None
+
+    def close() -> None:
+        nonlocal verdict
+        if current is None:
+            return
+        verdict = verdict if pending is None else pending
+        if verdict:
+            out.append(current)
+
+    for c in unit.effects:
+        t = tag_of(c.node)
+        if t == "SearchLibrary":
+            close()
+            current = c.node
+            pending = _searcher_is_self(getattr(c.node, "target_player", MISSING))
+        elif t == "Shuffle" and current is not None and pending is None:
+            tgt = tag_of(getattr(c.node, "target", None))
+            if tgt in _TUTOR_DIRECTED_PLAYER_TAGS:
+                pending = False
+            elif tgt in ("Controller", "You"):
+                pending = True
+    close()
+    return out
+
+
+def _rolled_battlefield_count(roll: TypedMirrorNode, found: int) -> int:
+    """The EXPECTED number of found lands a die roll's result rows put onto the
+    battlefield, rounded (Druid of the Emerald Grove's d20: 1-9 none, 10-19 one,
+    20 both -- 0.45x0 + 0.50x1 + 0.05x2 = 0.6, so 1). A row's single-card
+    ``ChangeZone`` moves one land, a ``ChangeZoneAll`` every land found. Rows
+    phase left unreadable count 1."""
+    sides = getattr(roll, "sides", None)
+    rows = getattr(roll, "results", None)
+    if not isinstance(sides, int) or sides <= 0 or not isinstance(rows, list):
+        return 1
+    expected = 0.0
+    for row in rows:
+        lo, hi = getattr(row, "min", MISSING), getattr(row, "max", MISSING)
+        lo = lo if isinstance(lo, int) else 1
+        if not isinstance(hi, int):
+            return 1
+        faces = max(0, min(hi, sides) - max(lo, 1) + 1)
+        landed = 0
+        for n in iter_typed_nodes(getattr(row, "effect", None)):
+            if getattr(n, "destination", None) != "Battlefield":
+                continue
+            if tag_of(n) == "ChangeZoneAll":
+                landed += found
+            elif tag_of(n) == "ChangeZone":
+                landed += 1
+        expected += faces / sides * min(landed, found)
+    return round(expected)
+
+
+#: Phase v0.94.0 loses Verdant Mastery's piles: "Put one of them onto the
+#: battlefield tapped under an opponent's control if the {3}{G} cost was paid.
+#: Put two of them onto the battlefield tapped under your control and the rest
+#: into your hand" parses as uncounted battlefield moves plus a ``ChangeZoneAll``
+#: of the revealed cards onto YOUR battlefield (the hand pile). The size of your
+#: pile survives only in the ability's own text. Gated on that shape;
+#: guarded by ``test_verdant_mastery_piles_are_still_lost_canary``.
+_YOUR_PILE_RE = re.compile(
+    r"\bput (one|two|three|four|five) of them onto the battlefield tapped "
+    r"under your control",
+    re.IGNORECASE,
+)
+_PILE_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+
+
+def lost_pile_count(unit: AbilityUnit) -> int | None:
+    """Your battlefield pile's size where phase lost it (see ``_YOUR_PILE_RE``):
+    a ``ChangeZoneAll`` of the revealed cards (``TrackedSet``) onto the
+    battlefield under you, beside a library ``ChangeZone`` onto the battlefield
+    under you, read from the ability's own description. None otherwise."""
+    nodes = list(iter_typed_nodes(unit.node))
+    rest_onto_yours = any(
+        tag_of(n) == "ChangeZoneAll"
+        and tag_of(getattr(n, "target", None)) == "TrackedSet"
+        and getattr(n, "destination", None) == "Battlefield"
+        and getattr(n, "enters_under", None) == "You"
+        for n in nodes
+    )
+    library_onto_yours = any(
+        tag_of(n) == "ChangeZone"
+        and getattr(n, "origin", None) == "Library"
+        and getattr(n, "destination", None) == "Battlefield"
+        and getattr(n, "enters_under", None) == "You"
+        for n in nodes
+    )
+    if not (rest_onto_yours and library_onto_yours):
+        return None
+    m = _YOUR_PILE_RE.search(str(getattr(unit.node, "description", "") or ""))
+    return _PILE_WORDS[m.group(1).lower()] if m else None
+
+
+def _battlefield_count(unit: AbilityUnit, search: TypedMirrorNode) -> int:
+    """How many found lands ``search`` puts onto YOUR battlefield: a die roll's
+    expected rows (:func:`_rolled_battlefield_count`), a pile phase lost
+    (:func:`lost_pile_count`), else :func:`search_count`."""
+    found = search_count(search)
+    roll = next(
+        (n for n in iter_typed_nodes(unit.node) if tag_of(n) == "RollDie"), None
+    )
+    if roll is not None:
+        return _rolled_battlefield_count(roll, found)
+    pile = lost_pile_count(unit)
+    return pile if pile is not None else found
+
+
+def land_searches(tree: ConceptTree) -> tuple[LandSearch, ...]:
+    """Every unit of TREE that searches YOUR library for a land.
+
+    Each search is judged on its own (:func:`_self_searches`): an opponent's
+    compensation search (Path to Exile, Assassin's Trophy, Ghost Quarter, Settle
+    the Wreckage) is not yours, while Demolition Field's own search after the
+    opponent's is. A symmetric or another-player-scoped ability is vetoed whole
+    (:func:`_unit_search_vetoed`). A landcycling search is yours but flagged
+    ``cycling`` (CR 702.29a/e: from your hand, into your hand). The count is the
+    unit's FIRST self search, the base clause: Primal Growth's "if this spell was
+    kicked, instead search for up to two" rides a later, condition-gated search."""
+    out: list[LandSearch] = []
+    for unit in tree.units:
+        if not any(tag_of(c.node) == "SearchLibrary" for c in unit.effects):
+            continue
+        if _unit_search_vetoed(unit):
+            continue
+        found = [
+            (node, colors)
+            for node in _self_searches(unit)
+            if (colors := land_search_colors(getattr(node, "filter", None))) is not None
+        ]
+        if not found:
+            continue
+        landings = list(iter_search_landings(unit))
+        out.append(
+            LandSearch(
+                colors=_merge_land_colors(colors for _n, colors in found),
+                count=_battlefield_count(unit, found[0][0]),
+                to_battlefield=any(d == "Battlefield" for d, _t in landings),
+                enters_tapped=any(d == "Battlefield" and t for d, t in landings),
+                on_self_etb=is_self_enters_trigger(unit),
+                cycling=_is_cycling_search(unit),
+            )
+        )
+    return tuple(out)
+
+
+def produced_colors(node: TypedMirrorNode) -> frozenset[str] | Literal["any"]:
+    """The mana a ``Mana`` effect's ``produced`` spec can add, as colour letters
+    (``"C"`` for colorless -- CR 106.1b's six types), or ``"any"``.
+
+    ``Fixed`` / ``Mixed`` name their colours; ``AnyOneColor`` / ``AnyCombination``
+    their ``color_options`` (Arcane Sanctum's {W}, {U}, or {B}; all five reads
+    ``"any"``); a filter land's ``ChoiceAmongCombinations`` (Cascade Bluffs'
+    {U}{U}, {U}{R}, or {R}{R}) the union of its options. A chosen colour and
+    every deck- or board-dependent kind (Command Tower's commander identity,
+    Exotic Orchard, Mox Amber, Chrome Mox, Reflecting Pool) read ``"any"``.
+    ``TriggerEventManaType`` (Mana Flare's "one mana of any type that land
+    produced") only repeats the triggering mana, so it names no colour."""
+    p = getattr(node, "produced", MISSING)
+    if not _present(p):
+        return frozenset()
+    t = tag_of(p)
+
+    def letters(names: object) -> frozenset[str]:
+        out = {
+            _MANA_COLOR_LETTER[n]
+            for n in (names if isinstance(names, list) else ())
+            if isinstance(n, str) and n in _MANA_COLOR_LETTER
+        }
+        return frozenset(out)
+
+    if t == "Fixed":
+        return letters(getattr(p, "colors", None))
+    if t == "Mixed":
+        cl = getattr(p, "colorless_count", 0)
+        return letters(getattr(p, "colors", None)) | (
+            frozenset("C") if isinstance(cl, int) and cl > 0 else frozenset()
+        )
+    if t == "Colorless":
+        return frozenset("C")
+    if t in ("AnyOneColor", "AnyCombination"):
+        got = letters(getattr(p, "color_options", None))
+        return "any" if got >= _FIVE_COLORS else got
+    if t == "ChoiceAmongCombinations":
+        opts = getattr(p, "options", None) or []
+        got = frozenset().union(*(letters(o) for o in opts if isinstance(o, list)))
+        return "any" if got >= _FIVE_COLORS else got
+    if t == "TriggerEventManaType":
+        return frozenset()
+    return "any"
+
+
+def mana_colors(tree: ConceptTree) -> frozenset[str] | Literal["any"]:
+    """Every colour of mana the card's own ``Mana`` effects add (see
+    :func:`produced_colors`). Reads each unit's resolved effects only, so an
+    activation cost's ``Mana`` payment (Cascade Bluffs' {U/R}) and a created
+    token's own ability are never the card's: a Treasure maker (Smothering Tithe,
+    Dockside Extortionist) is not a mana source of its own -- CR 111.10a: the
+    Treasure token is the object with the "Add one mana of any color" ability.
+    See :func:`_own_mana_effects`."""
+    out: set[str] = set()
+    for node in _own_mana_effects(tree):
+        got = produced_colors(node)
+        if got == "any":
+            return "any"
+        out |= got
+    if not out and any(CIRCLED_COLORS_RESIDUE in r for r in tree.residues()):
+        return "any"
+    return frozenset(out)
+
+
+#: Phase v0.94.0 parks Cryptic Spires' mana ability ("Add one mana of either of the
+#: circled colors") as an ``Unimplemented`` residue, so its trees carry no ``Mana``
+#: node. Its rulings: "You circle two colors as you put Cryptic Spires into your deck
+#: before any games begin" — a deck-dependent producer, read ``"any"`` like Command
+#: Tower. Guarded by ``test_cryptic_spires_mana_is_still_a_residue_canary``.
+CIRCLED_COLORS_RESIDUE = "Add one mana of either of the circled colors"
+
+
+def _unit_own_mana(
+    unit: AbilityUnit,
+) -> Iterator[tuple[TypedMirrorNode, TypedMirrorNode]]:
+    """``(Mana effect, the ability node carrying it)`` for one unit: the unit's own
+    effect chain (carried by ``unit.node``), plus a mana ability the card grants
+    ITSELF (a static def ``affected: SelfRef`` -- Urza's Saga's chapter I "This
+    Saga gains '{T}: Add {C}.'", carried by the granted body). A grant to other
+    permanents (The World Tree's lands, Sachi's Shamans) is theirs, not the
+    card's."""
+    for c in unit.effects:
+        if tag_of(c.node) == "Mana":
+            yield c.node, unit.node
+    for sdef in unit.static_defs():
+        if tag_of(getattr(sdef, "affected", None)) != "SelfRef":
+            continue
+        for kind, body in iter_nested_granted_bodies(sdef):
+            eff = getattr(body, "effect", None)
+            if (
+                kind == "ability"
+                and isinstance(eff, TypedMirrorNode)
+                and tag_of(eff) == "Mana"
+            ):
+                yield eff, body
+
+
+def _own_mana_effects(tree: ConceptTree) -> Iterator[TypedMirrorNode]:
+    """The ``Mana`` effects the card's own abilities resolve (:func:`_unit_own_mana`
+    over every unit)."""
+    for unit in tree.units:
+        for eff, _ability in _unit_own_mana(unit):
+            yield eff
+
+
+#: Phase v0.104.0 stops modelling a prevention whose TARGET is the damage source
+#: (or both source and recipient) and parks the effect as a residue named for the
+#: shape — Resistance Fighter's "Prevent all combat damage target creature would
+#: deal" (``prevent_damage_recipient_target_role``), Safeguard's "… dealt by
+#: target creature" (``prevent_damage_dealt_by_target``), Dovin, Hand of
+#: Control's "… dealt to and dealt by target permanent an opponent controls"
+#: (``bidirectional_prevent_declared_target``). Each is still a prevention effect
+#: (CR 615.1a: effects that use the word "prevent"), so the ``damage_prevention``
+#: lane and ``protection.protective_saves`` read the residue's name. Guarded by
+#: ``test_parked_prevention_residues_canary``.
+PARKED_PREVENTION_RESIDUES: frozenset[str] = frozenset(
+    {
+        "prevent_damage_recipient_target_role",
+        "prevent_damage_dealt_by_target",
+        "bidirectional_prevent_declared_target",
+    }
+)
+
+
+def parked_prevention(node: object) -> str | None:
+    """The :data:`PARKED_PREVENTION_RESIDUES` name ``node`` is parked under, or
+    ``None``."""
+    if tag_of(node) != "Unimplemented":
+        return None
+    name = getattr(node, "name", None)
+    return name if name in PARKED_PREVENTION_RESIDUES else None
+
+
+#: Phase v0.94.0 parks Boxing Ring's "Activate only if you control a creature that
+#: fought this turn" as an ``unparsed_condition`` residue in the ability's effect
+#: chain instead of an ``activation_restrictions`` entry, so the gate is invisible
+#: to the typed read. Guarded by ``test_boxing_ring_gate_is_still_a_residue_canary``.
+UNPARSED_ACTIVATION_GATE = "Activate only if"
+
+
+def _unit_activation_gated(unit: AbilityUnit) -> bool:
+    """Whether an ability may be activated only while a condition holds ("Activate
+    only if you control three or more artifacts", "… during an opponent's turn"):
+    a ``RequiresCondition`` activation restriction (CR 602.5 — a player can't begin
+    to activate a prohibited ability), or the residue phase parks one as
+    (:data:`UNPARSED_ACTIVATION_GATE`). Phase files a max speed ability the same
+    way; by the rules it is a static that grants the ability only while your speed
+    is 4 (CR 702.178a), which comes to the same thing here. Timing-only and per-turn
+    limits ("as a sorcery", "once each turn") aren't conditions."""
+    if next(activation_restriction_conditions(unit.node), MISSING) is not MISSING:
+        return True
+    return any(
+        tag_of(c.node) == "Unimplemented"
+        and residue_is(c.node, "unparsed_condition")
+        and (getattr(c.node, "description", "") or "").startswith(
+            UNPARSED_ACTIVATION_GATE
+        )
+        for c in unit.effects
+    )
+
+
+def mana_ability_gates(tree: ConceptTree) -> tuple[bool, ...]:
+    """One entry per ability of the card's that adds mana or makes a Treasure: whether
+    it is gated on a condition (:func:`_unit_activation_gated` — Mox Opal's
+    metalcraft, Mox Jasper's Dragon, Tablet of Compleation's oil counters). A card
+    whose every entry is gated (Mox Opal) ramps only when the condition holds; one
+    with an ungated sibling (Fanatic of Rhonas' {T}: Add {G}) always ramps. A mana
+    ability the card grants itself is one entry (:func:`_unit_own_mana`). A fact
+    about the card, no policy: the tuner's ramp SOURCING reads it
+    (``_tuner.issues._reliable_ramp``); COUNTING a deck's ramp (``roles.is_ramp``)
+    deliberately doesn't."""
+    out: list[bool] = []
+    for unit in tree.units:
+        abilities = {id(ab): ab for _eff, ab in _unit_own_mana(unit)}
+        if any(
+            c.concept == "make_token" and "Treasure" in c.subject for c in unit.effects
+        ):
+            abilities.setdefault(id(unit.node), unit.node)
+        out.extend(
+            _unit_activation_gated(unit)
+            if ab is unit.node
+            else next(activation_restriction_conditions(ab), MISSING) is not MISSING
+            for ab in abilities.values()
+        )
+    return tuple(out)
+
+
+# ── Mass land denial (Commander Brackets) ──────────────────────────────────────
+# Wizards' Commander Brackets define mass land denial as "cards that regularly
+# destroy, exile, and bounce other lands, keep lands tapped, or change what mana
+# is produced by four or more lands per player without replacing them" (examples:
+# Armageddon, Ruination, Sunder, Winter Orb, Blood Moon). The CR has no bracket
+# rule; this read is the definition's shapes over phase's trees, and its calls
+# (four lands, "regularly", "without replacing them") are the lane's own reading
+# of that definition.
+
+#: How a card denies lands in bulk — the ``mass_land_denial`` signal's subject.
+LandDenialKind = Literal[
+    "destroy", "exile", "bounce", "sacrifice", "untap_lock", "mana_change"
+]
+LAND_DENIAL_KINDS: tuple[LandDenialKind, ...] = get_args(LandDenialKind)
+
+#: The basic land types (CR 205.3i, 305.6).
+_BASIC_LAND_TYPES: frozenset[str] = frozenset(BASIC_LAND_TYPE_COLORS)
+# The filter properties a "lands as a class" filter may carry: a basic or
+# nonbasic restriction (Ruination's nonbasic lands) and the battlefield zone.
+# Anything narrower (Wake of Destruction's "same name", Tsabo's Web's lands
+# with an activated ability, Freyalise's Radiance's snow permanents) is not
+# every land a player controls.
+_MASS_LAND_SUPERTYPE_PROPS = frozenset({"NotSupertype", "HasSupertype"})
+_MASS_LAND_REMOVAL_KIND: dict[str, LandDenialKind] = {
+    "DestroyAll": "destroy",
+    "BounceAll": "bounce",
+    "ChangeZoneAll": "exile",
+}
+# The players a land sacrifice can reach and still be "other lands": every
+# player, each opponent, a chosen player (Epicenter's "target player").
+_DENIAL_REACH = frozenset({"each", "opponents", "per_opponent", "target", "scoped"})
+# The durations that end by the next turn (CR 514.2's "until end of turn", a next
+# step or turn): a lock that short is not "regularly" keeping lands tapped
+# (Nightcreep's one turn of Swamps). Any other duration lasts — and a resolving
+# effect that states none "lasts until the end of the game" (CR 611.2a).
+_SHORT_DURATIONS = frozenset(
+    {
+        "UntilEndOfTurn",
+        "UntilNextStepOf",
+        "UntilNextTurnOf",
+        "UntilControllersNextTurn",
+        "UntilEndOfNextTurnOf",
+    }
+)
+
+#: Phase drops the narrowing clause from two "permanents" sweeps and parses each as
+#: every permanent: Eye of Singularity ("each permanent with the same name as
+#: another permanent, except for basic lands") and Herald of Vengeance ("each
+#: permanent you don't control that has the same name as …"). (End Hostilities'
+#: "all permanents attached to creatures" was the third until v0.104.0, which
+#: parks it as an ``attached_to_qualifier`` residue.) Every other all-permanents
+#: sweep in the legal corpus is a true one (Apocalypse, Upheaval, Worldfire,
+#: Worldpurge, Dimensional Breach, Soulscour, Bearer of the Heavens). An
+#: every-permanent sweep on a card whose text names one of these narrowings is
+#: vetoed. Guarded by
+#: ``test_narrowed_permanent_sweeps_canary``.
+NARROWED_PERMANENT_SWEEPS = ("same name as",)
+
+
+def _land_class_arm(
+    filt: object, *, battlefield_default: bool, own_ok: bool, permanents: bool
+) -> bool:
+    """Whether one ``Typed`` filter arm names lands as a class: a ``Land`` core
+    type, a basic land type (Choke's Islands), or, with ``permanents``, every
+    permanent (Apocalypse, Upheaval) unless it excludes lands (a "nonland
+    permanent" sweep). ``battlefield_default``: whether an arm without an
+    ``InZone`` reads the battlefield (the effect's own origin is the battlefield
+    or unset)."""
+    if tag_of(filt) != "Typed":
+        return False
+    if not own_ok and getattr(filt, "controller", None) == "You":
+        return False
+    zone: object = None
+    for prop in getattr(filt, "properties", None) or ():
+        ptag = tag_of(prop)
+        if ptag == "InZone":
+            zone = getattr(prop, "zone", None)
+        elif not (
+            ptag in _MASS_LAND_SUPERTYPE_PROPS
+            and getattr(prop, "value", None) == "Basic"
+        ):
+            return False
+    if zone is None and not battlefield_default:
+        return False
+    if zone is not None and zone != "Battlefield":
+        return False
+    cores = set(filter_core_types(filt))
+    if "Land" in cores or set(filter_subtypes(filt)) & _BASIC_LAND_TYPES:
+        return True
+    return permanents and "Permanent" in cores and "Land" not in filter_non_types(filt)
+
+
+def _names_land_class(
+    filt: object,
+    *,
+    battlefield_default: bool = True,
+    own_ok: bool = False,
+    permanents: bool = True,
+) -> bool:
+    """Whether ``filt`` (or any arm of an ``Or``) names lands as a class on the
+    battlefield, not limited to your own (``own_ok`` lifts that last check for a
+    sacrifice whose player scope already says who sacrifices). ``permanents``
+    admits "all permanents", which take the lands with them (Apocalypse, Static
+    Orb); a sacrifice turns it off, since each player picks which permanents
+    (Smokestack). See :func:`_land_class_arm`."""
+    arms = (getattr(filt, "filters", None) or ()) if tag_of(filt) == "Or" else (filt,)
+    return any(
+        _land_class_arm(
+            f,
+            battlefield_default=battlefield_default,
+            own_ok=own_ok,
+            permanents=permanents,
+        )
+        for f in arms
+    )
+
+
+def _sacrifices_four_or_more(count: object) -> bool:
+    """Whether a sacrifice's ``count`` reaches the definition's "four or more
+    lands per player": a fixed four or more (Wildfire's four, not Ember
+    Swallower's three), or a count that grows with the board — X (Death Cloud,
+    Tectonic Break), every land (Epicenter's threshold, Keldon Firebombers), the
+    rest after a choice (Restore Balance). A fraction is not: Pox's "a third of
+    the lands they control, rounded up" reaches four only at ten lands."""
+    if isinstance(count, int):
+        return count >= 4
+    if tag_of(count) == "Fixed":
+        value = getattr(count, "value", 0)
+        return isinstance(value, int) and value >= 4
+    return tag_of(count) not in (None, "DivideRounded")
+
+
+def _gives_lands_back(unit: AbilityUnit) -> bool:
+    """Whether the same ability lets the players who lost lands search for lands
+    to put back (From the Ashes, Wave of Vitriol: "its controller may search
+    their library for a basic land card") — the definition's "without replacing
+    them". Fall of the Thran's returns sit on later chapters, two lands each,
+    and do not count."""
+    for n in unit.iter_typed():
+        if tag_of(n) != "SearchLibrary":
+            continue
+        facts = search_filter_land_facts(getattr(n, "filter", None))
+        searcher = _searcher_is_self(getattr(n, "target_player", MISSING))
+        if facts is not None and facts[0] and searcher is False:
+            return True
+    return False
+
+
+def _lasting_static_defs(
+    unit: AbilityUnit, *, permanent_card: bool
+) -> Iterator[TypedMirrorNode]:
+    """The static defs of ``unit`` that last: a permanent's own statics, and a
+    resolving effect's statics unless its duration ends by the next turn
+    (:data:`_SHORT_DURATIONS`). An instant's or sorcery's top-level static is its
+    one-shot effect (CR 113.6: its abilities function on the stack) — phase
+    v0.94.0 parses Exhaustion's and Mana Vapors' "don't untap during their next
+    untap step" that way, without the duration; guarded by
+    ``test_one_shot_untap_statics_canary``."""
+    if unit.origin == "static":
+        if permanent_card:
+            yield from unit.static_defs()
+        return
+    for n in unit.iter_typed():
+        if tag_of(n) != "GenericEffect" or node_duration(n) in _SHORT_DURATIONS:
+            continue
+        for sdef in getattr(n, "static_abilities", None) or ():
+            if isinstance(sdef, TypedMirrorNode):
+                yield sdef
+
+
+def _unit_land_denial(
+    unit: AbilityUnit, *, permanent_card: bool, oracle: str
+) -> LandDenialKind | None:
+    """The mass-land-denial shape one ability carries, or ``None``."""
+    for sdef in _lasting_static_defs(unit, permanent_card=permanent_card):
+        mode = static_mode_tag(sdef)
+        affected = getattr(sdef, "affected", None)
+        if mode == "CantUntap" and _names_land_class(affected):
+            return "untap_lock"  # Back to Basics, Choke, Mist of Stagnation
+        if mode == "MaxUntapPerType" and _names_land_class(
+            static_mode_field(sdef, "filter")
+        ):
+            return "untap_lock"  # Winter Orb, Static Orb
+        if (
+            mode == "SkipStep"
+            and static_mode_field(sdef, "step") == "Untap"
+            and _present(affected)
+            and _scope_from_player_node(affected) != "you"
+        ):
+            return "untap_lock"  # Stasis: players skip their untap steps
+        if mode == "Continuous" and _names_land_class(affected, permanents=False):
+            mods = getattr(sdef, "modifications", None) or ()
+            if any(tag_of(m) == "SetBasicLandType" for m in mods):
+                # Blood Moon: a land set to a basic land type loses its other
+                # abilities and makes only that type's mana (CR 305.7).
+                return "mana_change"
+    if (
+        unit.origin == "replacement"
+        and permanent_card
+        and replacement_event_tag(unit.node) == "ProduceMana"
+        and tag_of(getattr(unit.node, "mana_modification", None)) == "ReplaceWith"
+        and _names_land_class(getattr(unit.node, "valid_card", None), permanents=False)
+    ):
+        return "mana_change"  # Contamination, Ritual of Subdual
+    if _gives_lands_back(unit):
+        return None
+    narrowed = any(phrase in oracle for phrase in NARROWED_PERMANENT_SWEEPS)
+    found: list[LandDenialKind] = []
+    for n in unit.iter_typed():
+        tag = tag_of(n)
+        if tag in _MASS_LAND_REMOVAL_KIND:
+            destination = getattr(n, "destination", None)
+            if destination == "Battlefield":
+                continue  # Planar Birth, Second Sunrise put lands back
+            target = getattr(n, "target", None)
+            origin_ok = getattr(n, "origin", None) in (None, "Battlefield")
+            if _names_land_class(
+                target, battlefield_default=origin_ok, permanents=not narrowed
+            ):
+                if tag == "ChangeZoneAll" and destination == "Hand":
+                    found.append("bounce")
+                else:
+                    found.append(_MASS_LAND_REMOVAL_KIND[tag])
+        elif tag == "Sacrifice":
+            if (
+                effect_player_reach(unit.node, n) in _DENIAL_REACH
+                and _names_land_class(
+                    getattr(n, "target", None), own_ok=True, permanents=False
+                )
+                and _sacrifices_four_or_more(getattr(n, "count", None))
+            ):
+                found.append("sacrifice")
+        elif tag == "ChooseAndSacrificeRest":
+            if "Land" in (getattr(n, "categories", None) or ()):
+                found.append("sacrifice")  # Cataclysm: one land kept, the rest go
+    # The removal first, in LAND_DENIAL_KINDS order (the deep walk's order is not
+    # the card's): Omen of Fire bounces every Island before its Plains sacrifice.
+    return min(found, key=LAND_DENIAL_KINDS.index, default=None)
+
+
+def mass_land_denial(tree: ConceptTree) -> LandDenialKind | None:
+    """How the card denies lands in bulk, per the Commander Brackets' definition
+    of mass land denial (see the section comment), or ``None``:
+
+    * ``"destroy"`` / ``"exile"`` / ``"bounce"`` — removes lands as a class, not
+      only your own (Armageddon, Ruination, Boil, Ajani Vengeant's "all lands
+      target player controls"; Apocalypse's and Worldfire's exile; Sunder's,
+      Upheaval's and Omen of Fire's bounce);
+    * ``"sacrifice"`` — makes players sacrifice four or more lands each, or every
+      land but a few (Wildfire, Death Cloud's X, Cataclysm, Restore Balance);
+    * ``"untap_lock"`` — keeps lands tapped, lastingly (Winter Orb, Static Orb,
+      Back to Basics, Choke, Stasis) — not for one untap step (Exhaustion);
+    * ``"mana_change"`` — changes the mana lands produce, lastingly (Blood Moon,
+      Contamination) — not for one turn (Nightcreep).
+
+    The lane's own readings of the definition: a one-land edict is not mass
+    denial (Yawning Fissure, Tremble), nor a destruction its own ability gives
+    back (From the Ashes), nor a lock on your own lands only (Mungha Wurm,
+    Celestial Dawn)."""
+    permanent_card = not is_spell_card(tree)
+    for unit in tree.units:
+        kind = _unit_land_denial(
+            unit, permanent_card=permanent_card, oracle=tree.oracle or ""
+        )
+        if kind is not None:
+            return kind
+    return None
+
+
+# ── Closers: game wins and reach ───────────────────────────────────────────────
+
+
+def ends_the_game(tree: ConceptTree) -> bool:
+    """Whether the card can end the game in your favour by its own effect: you win
+    (CR 104.2b — Felidar Sovereign, Thassa's Oracle, Laboratory Maniac) or
+    another player loses (CR 104.3e — Door to Nothingness, Phage's combat-damage
+    trigger). A loss aimed at you is a drawback (Pact of Negation's upkeep
+    payment, Phage's own enters trigger), and "can't win / can't lose" statics
+    (Platinum Angel) are protection, not effects."""
+    for n in tree.iter_typed():
+        tag = tag_of(n)
+        if tag not in ("WinTheGame", "LoseTheGame"):
+            continue
+        target = getattr(n, "target", MISSING)
+        who = _scope_from_player_node(target) if _present(target) else "you"
+        if (tag == "WinTheGame") == (who == "you"):
+            return True
+    return False
+
+
+def _hits_one_other_player(node: TypedMirrorNode) -> bool:
+    """Whether a life loss is directed at another player (a target or relative
+    player — :func:`lifeloss_recipient_scope`) or a damage effect can be aimed at a
+    player (:func:`damage_recipient_is_player` with ``aimed``)."""
+    if tag_of(node) == "LoseLife":
+        return lifeloss_recipient_scope(node) == "opponents"
+    if tag_of(node) == "DealDamage":
+        target = _unwrap_role_target(getattr(node, "target", MISSING))
+        return damage_recipient_is_player(target, aimed=True)
+    return False
+
+
+#: The effects that take life from players: life loss (CR 119.3) and damage.
+_REACH_EFFECT_TAGS: frozenset[str] = frozenset(
+    {"LoseLife", "DealDamage", "DamageEachPlayer", "DamageAll"}
+)
+
+
+def reach_amount(
+    root: object, node: TypedMirrorNode
+) -> tuple[Literal["group", "single"], int | None] | None:
+    """Who a burn / drain effect reaches and how much it takes, or ``None``.
+
+    ``"group"`` — each opponent (Exsanguinate, Gray Merchant of Asphodel,
+    Kokusho, Fanatic of Mogis); ``"single"`` — one chosen player or any target
+    (Blood Artist, Sanguine Bond's target opponent, Aetherflux Reservoir,
+    Fireball). A symmetric "each player" effect (Earthquake, Crypt Rats) and a
+    loss you take are neither. The amount is the fixed number, or ``None`` when
+    it scales — X, a count, a devotion, a doubled X (Debt to the Deathless), or a
+    fixed loss repeated X times (Torment of Hailfire)."""
+    tag = tag_of(node)
+    if tag not in _REACH_EFFECT_TAGS:
+        return None
+    scope: Literal["group", "single"]
+    if effect_player_reach(root, node) in ("opponents", "per_opponent"):
+        scope = "group"
+    elif _hits_one_other_player(node):
+        scope = "single"
+    else:
+        return None
+    owner = _find_owner_wrapper(root, node)
+    repeated = owner is not None and _present(getattr(owner, "repeat_for", MISSING))
+    if repeated or amount_is_scaling(node):
+        return scope, None
+    return scope, amount_factor(node)
+
+
+#: Phase v0.94.0 replaces an effect whose amount is "X, where X is <a count>" with
+#: a ``where_x_binding`` residue that keeps only the binding (Insatiable
+#: Hemophage's "each opponent loses X life …, where X is the number of times ~ has
+#: mutated", Zenith Flare's "deals X damage to any target …"), so no LoseLife /
+#: DealDamage node is left to read. Gated on that residue, the card's own "where X
+#: is" line says who loses the X; its amount scales. Guarded by
+#: ``test_unbound_x_reach_canary``.
+_UNBOUND_X_GROUP_RE = re.compile(
+    r"each opponent loses X life|deals X damage to each opponent", re.IGNORECASE
+)
+_UNBOUND_X_SINGLE_RE = re.compile(
+    r"deals X damage to (?:any target|target (?:player|opponent))"
+    r"|target (?:player|opponent) loses X life",
+    re.IGNORECASE,
+)
+
+
+def unbound_x_reach(tree: ConceptTree) -> Literal["group", "single"] | None:
+    """The reach scope of an effect phase parked as a ``where_x_binding`` residue
+    (see :data:`_UNBOUND_X_GROUP_RE`), or ``None``; its amount always scales."""
+    if next(tree.effect_residues("where_x_binding"), None) is None:
+        return None
+    lines = [ln for ln in (tree.oracle or "").splitlines() if "where X is" in ln]
+    if any(_UNBOUND_X_GROUP_RE.search(ln) for ln in lines):
+        return "group"
+    if any(_UNBOUND_X_SINGLE_RE.search(ln) for ln in lines):
+        return "single"
+    return None
+
+
+def parked_search_puts_onto_battlefield(tree: ConceptTree) -> bool:
+    """Whether phase parked a library search as a ``where_x_binding`` residue and
+    kept only its put: an ability holding the residue whose searched card lands
+    on the battlefield (:func:`iter_search_landings`). Surveyor's Scope's "Search
+    your library for up to X basic land cards, where X is … Put those cards onto
+    the battlefield" (phase v0.104.0): the ``SearchLibrary`` node is gone, so the
+    put is the only structure left. A workaround: ``test_parked_search_put_canary``
+    fails once phase reads the search."""
+    if next(tree.effect_residues("where_x_binding"), None) is None:
+        return False
+    return any(
+        any(residue_is(c.node, "where_x_binding") for c in unit.effects)
+        and any(dest == "Battlefield" for dest, _ in iter_search_landings(unit))
+        for unit in tree.iter_units()
+    )
+
+
+#: The blocking restrictions an attacker can carry on itself — evasion abilities
+#: in CR 509.1b's sense: "can't be blocked" (Phantom Warrior), "can't be blocked
+#: except by three or more creatures" (Pathrazer of Ulamog), "can't be blocked
+#: unless all creatures defending player controls block it" (Tromokratis).
+_SELF_EVASION_MODES: frozenset[str] = frozenset(
+    {"CantBeBlocked", "CantBeBlockedExceptBy", "CantBeBlockedUnlessAllBlock"}
+)
+
+
+def is_evasive_body(tree: ConceptTree) -> bool:
+    """Whether the card restricts what can block it by a static on itself (see
+    :data:`_SELF_EVASION_MODES`) — the static half of "an evasive body"; the keyword
+    half is ``card_classify.EVASION_KEYWORDS``. Not the ``evasion_self`` lane: that
+    one also fires on cards that GRANT evasion to others, and leaves flying out as
+    soft evasion, so it can't say whether the card itself is hard to block."""
+    return any(
+        static_mode_tag(sdef) in _SELF_EVASION_MODES
+        and tag_of(getattr(sdef, "affected", None)) == "SelfRef"
+        for unit in tree.units
+        for sdef in unit.static_defs()
+    )
+
+
+# ── Team buffs ──────────────────────────────────────────────────────────────
+
+# Evergreen team-anthem keywords (CR 702) — mirrors the deleted ``_signals_ir``'s
+# identically-named ``_TEAM_BUFF_GRANT_KW`` (phase's spaceless spelling normalized via
+# lower+strip).
+_TEAM_BUFF_GRANT_KW: frozenset[str] = frozenset(
+    {
+        "flying",
+        "trample",
+        "menace",
+        "hexproof",
+        "indestructible",
+        "protection",
+        "deathtouch",
+        "lifelink",
+        "doublestrike",
+        "firststrike",
+        "vigilance",
+        "haste",
+        "ward",
+        "reach",
+    }
+)
+# Predicates a GENERIC your-team anthem subject may carry (Always Watching's
+# NonToken, "each OTHER creature you control") — mirrors ``_TEAM_BUFF_OK_PREDS``.
+_TEAM_BUFF_OK_PREDS: frozenset[str] = frozenset({"NonToken", "Another", "Other"})
+
+
+def _is_team_buff_filter(filt: object) -> bool:
+    """The team_buff anthem subject (CR 604.3): GENERIC creatures YOU control
+    — no subtypes (tribal is type_matters), predicates at most
+    NonToken/Another/Other (Always Watching stays in; an Attacking/color/
+    equipped narrowing fails). Mirrors the deleted ``_signals_ir``'s
+    ``_is_team_buff_grant``."""
+    return (
+        filter_controller(filt) == "You"
+        and "Creature" in filter_core_types(filt)
+        and not filter_subtypes(filt)
+        and set(filter_predicates(filt)) <= _TEAM_BUFF_OK_PREDS
+    )
+
+
+def team_buff_sites(
+    tree: ConceptTree,
+) -> Iterator[tuple[AbilityUnit, TypedMirrorNode]]:
+    """Every ``(unit, static def)`` granting the team an evergreen keyword — the
+    one walk behind the ``team_buff`` lane and the tuner's closer read, which asks
+    the unit's ``origin`` (a one-shot pump vs a static anthem)."""
+    for unit in tree.units:
+        for sdef, mod in iter_mod_sites(unit.node):
+            if tag_of(mod) not in ("AddKeyword", "AddKeywordUntilEndOfTurn"):
+                continue
+            kw = getattr(mod, "keyword", None)
+            if not isinstance(kw, str):
+                continue
+            if kw.lower().replace(" ", "") not in _TEAM_BUFF_GRANT_KW:
+                continue
+            if _is_team_buff_filter(getattr(sdef, "affected", None)):
+                yield unit, sdef
+
+
+def static_def_adds_power(sdef: object) -> bool:
+    """Whether a static def's modifications raise power: a positive ``AddPower``
+    (Overrun's +3, Triumph of the Hordes' +1) or an ``AddDynamicPower``
+    (Craterhoof Behemoth's +X, X the number of creatures you control) — CR
+    613.4c's power-changing effects."""
+    for mod in getattr(sdef, "modifications", None) or ():
+        tag = tag_of(mod)
+        if tag == "AddDynamicPower":
+            return True
+        if tag == "AddPower" and (mod_value(mod) or 0) > 0:
+            return True
+    return False
+
+
+# ── Keyword grants and protective keywords ─────────────────────────────────────
+# Shared by the AddKeyword grant lanes (``lanes.triggers_damage``) and the
+# board-protection reads (``crosswalk.protection``), so the two walk one way.
+
+#: The protective keywords (normalised — :func:`normalised_keyword_name`):
+#: hexproof (CR 702.11b-c), shroud (702.18a), indestructible (702.12b),
+#: protection (702.16b) and ward (702.21a).
+PROTECTIVE_KEYWORDS: frozenset[str] = frozenset(
+    {"hexproof", "shroud", "indestructible", "ward", "protection"}
+)
+
+
+def normalised_keyword_name(kw: str) -> str:
+    """A phase keyword spelling folded for set membership: lower case, no
+    spaces, no hyphens (``JumpStart`` → ``jumpstart``, ``TotemArmor`` →
+    ``totemarmor``)."""
+    return kw.lower().replace(" ", "").replace("-", "")
+
+
+def normalised_keyword(mod: object) -> str:
+    """The normalised keyword name an ``AddKeyword`` modification carries (``""``
+    for none) — :func:`mod_keyword_name` folded by
+    :func:`normalised_keyword_name`."""
+    if not isinstance(mod, TypedMirrorNode) or tag_of(mod) != "AddKeyword":
+        return ""
+    return normalised_keyword_name(mod_keyword_name(mod) or "")
+
+
+def protective_keyword(mod: object) -> str | None:
+    """The protective keyword an ``AddKeyword`` modification grants (one of
+    :data:`PROTECTIVE_KEYWORDS`), or ``None``. "Hexproof from [quality]" is a
+    hexproof ability (CR 702.11d), so it reads as ``"hexproof"``."""
+    name = normalised_keyword(mod)
+    if name == "hexprooffrom":
+        name = "hexproof"
+    return name if name in PROTECTIVE_KEYWORDS else None
+
+
+_TRACKED_SET_PRODUCER_TAGS: frozenset[str] = frozenset({"Token", "CopyTokenOf"})
+#: Every ``*All`` Effect variant phase declares (v0.94.0) — each acts on EVERY
+# object its filter matches, never on a chosen target, so a "those creatures"
+# after one names a board filter, not the chain's targets. Wider than
+# :data:`MASS_EFFECT_TAGS` (the mass effects whose object filter decides who a
+# removal / reach read hits): this set only ends a target thread.
+ALL_VARIANT_EFFECT_TAGS: frozenset[str] = frozenset(
+    {
+        "BounceAll",
+        "ChangeZoneAll",
+        "CounterAll",
+        "DamageAll",
+        "DestroyAll",
+        "DoublePTAll",
+        "ExploreAll",
+        "GainControlAll",
+        "GoadAll",
+        "PumpAll",
+        "PutCounterAll",
+        "UnattachAll",
+    }
+)
+_THREAD_ENDING_TAGS: frozenset[str] = (
+    _TRACKED_SET_PRODUCER_TAGS | ALL_VARIANT_EFFECT_TAGS
+)
+
+
+def ends_target_thread(eff: TypedMirrorNode) -> bool:
+    """A token producer or a mass effect ends the chosen-target thread."""
+    return tag_of(eff) in _THREAD_ENDING_TAGS
+
+
+def iter_tracked_set_target_grants(
+    ability_like: object,
+) -> Iterator[tuple[object, TypedMirrorNode]]:
+    """``(threaded_target_filter, AddKeyword_mod)`` pairs for a keyword grant
+    whose nested static's ``affected`` is ``TrackedSet`` — "those creatures
+    gain X" back-referencing the chain's own TARGETS.
+
+    phase v0.94.0 parses Arm the Cathars ("target creature gets +3/+3, up to
+    one other target creature gets +2/+2, … Those creatures gain vigilance")
+    as a Pump chain ending in a ``GenericEffect`` whose static is
+    ``TrackedSet``-affected; v0.86.0 wrote ``ParentTarget``, which
+    :func:`iter_single_target_grants` threads. Same thread
+    (:func:`iter_threaded_target_statics`), but a token producer or a mass
+    effect ends it (:func:`ends_target_thread`) — "create a token. It gains
+    haste" tracks the made token, and "put a +1/+1 counter on each creature
+    you control. Those creatures gain vigilance" (Ajani Goldmane, a
+    ``PutCounterAll``) tracks a board filter, never a chosen target.
+    CR 115.1 / 613.1f.
+    """
+    for tracked, st in iter_threaded_target_statics(
+        ability_like, affected_tag="TrackedSet", resets_thread=ends_target_thread
+    ):
+        for mod in getattr(st, "modifications", None) or ():
+            if tag_of(mod) == "AddKeyword":
+                yield tracked, mod
+
+
+def unit_keyword_grants(
+    unit: AbilityUnit,
+) -> list[tuple[object, TypedMirrorNode]]:
+    """``(chosen_target_filter, AddKeyword_mod)`` for every keyword grant to a
+    chosen target in one unit: the DEEP local-target leaf on any unit (a
+    trigger, a modal arm, a Saga chapter — :func:`iter_deep_target_grants`),
+    plus, on an ability or trigger, the threaded "It gains X" walk
+    (:func:`iter_single_target_grants`) and the "those creatures" walk
+    (:func:`iter_tracked_set_target_grants`). The ``keyword_grant_target`` /
+    ``protection_grant`` lane and ``crosswalk.protection`` read this one walk.
+    CR 613.1f (layer 6, ability-adding effects)."""
+    grants = list(iter_deep_target_grants(unit.node))
+    if unit.origin in ("ability", "trigger"):
+        grants.extend(iter_single_target_grants(unit.node))
+        grants.extend(iter_tracked_set_target_grants(unit.node))
+    return grants
+
+
+def is_spell_card(tree: ConceptTree) -> bool:
+    """Whether the card is an instant or sorcery (no permanent face)."""
+    return bool(tree.card_types) and set(tree.card_types) <= {"Instant", "Sorcery"}
+
+
+def redirects_stack_object(node: object) -> bool:
+    """Whether a ``ChangeTargets`` node retargets a spell or ability on the stack
+    (CR 115.7: "Some effects allow a player to change the target(s) of a spell
+    or ability"): Misdirection, Deflecting Swat, Spellskite, Reroute's "Change
+    the target of target activated ability with a single target". A follow-on
+    retarget of a stolen spell (Commandeer — its target is a back-reference, no
+    stack leaf; :func:`steals_stack_spell` reads that case) and
+    copy-with-new-targets (Fork — a field on its ``CopySpell``, CR 707.10c) are
+    not."""
+    if tag_of(node) != "ChangeTargets":
+        return False
+    return any(
+        tag_of(x) in ("StackSpell", "StackAbility")
+        for x in iter_typed_nodes(getattr(node, "target", None))
+    )
+
+
+def steals_stack_spell(unit: AbilityUnit) -> bool:
+    """Whether a unit takes control of a spell on the stack — "Gain control of
+    target noncreature spell. You may choose new targets for it" (Commandeer;
+    its ruling: "After Commandeer resolves, you control the targeted spell"),
+    Aethersnatch's "Gain control of target spell", and Perplexing Chimera's
+    "exchange control of ~ and that spell" off its opponent-casts trigger, and
+    Invert Polarity's "Choose target spell … gain control of that spell" (a
+    back-reference to the spell the unit chose). A removal spell aimed at your
+    board is answered by taking it."""
+    nodes = list(iter_typed_nodes(unit.node))
+    chooses_spell = any(
+        tag_of(getattr(n, "target", None)) == "StackSpell" for n in nodes
+    )
+    for n in nodes:
+        tag = tag_of(n)
+        target = getattr(n, "target", None)
+        if tag == "GainControl" and (
+            any(tag_of(x) == "StackSpell" for x in iter_typed_nodes(target))
+            or (
+                chooses_spell and tag_of(target) in ("ParentTarget", "TriggeringSource")
+            )
+        ):
+            return True
+        if (
+            tag == "ExchangeControl"
+            and unit.origin == "trigger"
+            and getattr(unit.node, "mode", None) == "SpellCast"
+            and "TriggeringSource"
+            in (
+                tag_of(getattr(n, "target_a", None)),
+                tag_of(getattr(n, "target_b", None)),
+            )
+        ):
+            return True
+    return False
+
+
+# ── Activated abilities, blocking limits, combat-damage triggers ────────────────
+
+
+def activation_zone(node: object) -> str | None:
+    """The zone an activated ability says it works from (``activation_zone``:
+    ``"Hand"`` for cycling, ``"Graveyard"`` for unearth or embalm), or ``None``
+    when it names none — CR 113.6b: "An ability that states which zones it
+    functions in functions only from those zones"."""
+    zone = getattr(node, "activation_zone", MISSING)
+    return zone if isinstance(zone, str) else None
+
+
+def unit_zones(unit: AbilityUnit) -> frozenset[str]:
+    """The zones a unit functions from when it says so (:func:`ability_zones` of
+    its node)."""
+    return ability_zones(unit.node)
+
+
+def ability_zones(node: object) -> frozenset[str]:
+    """The zones an ability functions from when it says so (CR 113.6b): a
+    trigger's ``trigger_zones``, an activated ability's :func:`activation_zone`,
+    and an "if this card is in your graveyard" ``SourceInZone`` condition
+    (Ichorid) — on the ability, or as an activation restriction (Loathsome Troll's
+    "Activate only if this card is in your graveyard"). Takes a granted ability's
+    body as well as a unit's node."""
+    zones: set[str] = set()
+    tz = getattr(node, "trigger_zones", None)
+    if isinstance(tz, list):
+        for raw in tz:
+            z = raw.key if isinstance(raw, MirrorVariant) else raw
+            if isinstance(z, str):
+                zones.add(z)
+    if (az := activation_zone(node)) is not None:
+        zones.add(az)
+    for cond in (
+        getattr(node, "condition", None),
+        *activation_restriction_conditions(node),
+    ):
+        zone = getattr(cond, "zone", None)
+        if tag_of(cond) == "SourceInZone" and isinstance(zone, str):
+            zones.add(zone)
+    return frozenset(zones)
+
+
+def functions_off_battlefield(unit: AbilityUnit) -> bool:
+    """Whether a unit says it works only from zones other than the battlefield
+    (:func:`unit_zones` — a graveyard trigger, a graveyard-only activation):
+    "this card" there is a card, never a permanent (Loathsome Troll)."""
+    zones = unit_zones(unit)
+    return bool(zones) and "Battlefield" not in zones
+
+
+def _functions_on_battlefield(unit: AbilityUnit) -> bool:
+    """Whether an activated ability can be activated while its object is on the
+    battlefield: no other :func:`activation_zone` (cycling, CR 702.29a, "functions
+    only while the card with cycling is in a player's hand"), and not ninjutsu,
+    which names no zone but "functions only while the card with ninjutsu is in a
+    player's hand" (CR 702.49a). Phase's synthesized suspend unit is a special
+    action, not an ability at all (CR 116.2f), and carries the hand zone too."""
+    if activation_zone(unit.node) not in (None, "Battlefield"):
+        return False
+    return tag_of(getattr(unit.node, "cost", None)) != "NinjutsuFamily"
+
+
+def activated_ability_units(
+    tree: ConceptTree, *, include_mana: bool = True
+) -> Iterator[AbilityUnit]:
+    """The card's activated abilities ("[Cost]: [Effect.]", CR 602.1) that work on
+    the battlefield (:func:`_functions_on_battlefield`) — what a copier of the
+    object's abilities or a commander borrowing them can use. Loyalty abilities are
+    activated abilities (CR 606.1) and Equip is one (CR 702.6a), so both stay in.
+    ``include_mana=False`` leaves out mana abilities (CR 605.1a), the caller's
+    choice: an ability copier can't copy one (Rings of Brighthearth: "if it isn't
+    a mana ability"), while a borrowed mana ability is often the best tool."""
+    for unit in tree.iter_units("ability"):
+        if unit.kind != "Activated" or not _functions_on_battlefield(unit):
+            continue
+        if not include_mana and getattr(unit.node, "is_mana_ability", None) is True:
+            continue
+        yield unit
+
+
+def limits_blockers_to_one(tree: ConceptTree) -> bool:
+    """Whether the card says a creature "can't be blocked by more than one
+    creature" — on itself (Charging Rhino) or granted (Full Steam Ahead's
+    quoted grant). Beside menace ("can't be blocked except by two or more
+    creatures", CR 702.111b) no block is legal: the restrictions are cumulative
+    (CR 509.1b)."""
+    for unit in tree.units:
+        for sdef in unit.static_defs():
+            if (
+                static_mode_tag(sdef) == "CantBeBlockedByMoreThan"
+                and static_mode_field(sdef, "max") == 1
+            ):
+                return True
+        for _sdef, mod in iter_mod_sites(unit.node, deep=True):
+            if (
+                tag_of(mod) == "AddStaticMode"
+                and static_mode_tag(mod) == "CantBeBlockedByMoreThan"
+                and static_mode_field(mod, "max") == 1
+            ):
+                return True
+    return False
+
+
+def _is_combat_damage_trigger(trig: object) -> bool:
+    """Whether a trigger definition fires on combat damage ("whenever ~ deals
+    combat damage"): a ``DamageDone`` event phase marks ``CombatOnly``."""
+    return (
+        isinstance(trig, TypedMirrorNode)
+        and _trigger_event(trig) == "deals_damage"
+        and trigger_damage_kind(trig) == "CombatOnly"
+    )
+
+
+def has_combat_damage_trigger(tree: ConceptTree) -> bool:
+    """Whether the card has, or grants (Sword of Fire and Ice's equipped creature
+    trigger, a quoted grant), a combat-damage trigger — the trigger double strike
+    fires twice, since a double striker deals combat damage in both combat damage
+    steps (CR 702.4b)."""
+    for unit in tree.units:
+        if unit.origin == "trigger" and _is_combat_damage_trigger(unit.node):
+            return True
+        if any(
+            _is_combat_damage_trigger(d) for d in iter_nested_trigger_defs(unit.node)
+        ):
+            return True
+    return False
+
+
+#: Every name :func:`trigger_kinds` gives (cut-check's ``--trigger-type`` choices).
+TRIGGER_KINDS: tuple[str, ...] = (
+    "upkeep",
+    "attack",
+    "combat-damage",
+    "death",
+    "etb",
+    "endstep",
+)
+#: The step a "beginning of [step]" trigger fires at (:func:`trigger_phase`) → its
+#: :func:`trigger_kinds` name.
+_STEP_KINDS = {"Upkeep": "upkeep", "End": "endstep"}
+
+
+def trigger_kinds(unit: AbilityUnit) -> tuple[str, ...]:
+    """What a trigger unit fires on, in cut-check's words: an enters trigger
+    (CR 603.6a, :data:`ENTERS_EVENTS`) is ``etb``, "enters or attacks" (Sun Titan)
+    both ``etb`` and ``attack``; a dies trigger (CR 700.4: put into a graveyard from
+    the battlefield) is ``death``; a combat-damage trigger ``combat-damage``; "at
+    the beginning of [your / each] upkeep / end step" ``upkeep`` / ``endstep``."""
+    event = unit.trigger_event
+    out: list[str] = []
+    if event in ENTERS_EVENTS:
+        out.append("etb")
+    if event in ("attacks", "entersorattacks"):
+        out.append("attack")
+    if event == "dies":
+        out.append("death")
+    if _is_combat_damage_trigger(unit.node):
+        out.append("combat-damage")
+    if event == "phase":
+        step = _STEP_KINDS.get(trigger_phase(unit.node) or "")
+        if step:
+            out.append(step)
+    return tuple(out)
+
+
+def has_structural_legend_rule_off(tree: ConceptTree) -> bool:
+    """CR 704.5j: a ``LegendRuleDoesntApply`` static mode phase types directly
+    (Mirror Gallery, Mirror Box, Sakashima; the Cadric-style bounded forms too)."""
+    return tree.has_static_mode("LegendRuleDoesntApply")
+
+
+def bypasses_legend_rule(tree: ConceptTree) -> bool:
+    """Whether the card gets around the legend rule (CR 704.5j) for a copy: a copy
+    "except it isn't legendary" (Helm of the Host, Spark Double, Double Major — a
+    ``RemoveSupertype`` of Legendary, which becomes part of the copiable values,
+    CR 707.9b), or a static saying the legend rule doesn't apply
+    (:func:`has_structural_legend_rule_off`)."""
+    if has_structural_legend_rule_off(tree):
+        return True
+    return any(
+        tag_of(n) == "RemoveSupertype" and getattr(n, "supertype", None) == "Legendary"
+        for n in tree.iter_typed()
+    )
+
+
+def is_every_creature_type(tree: ConceptTree) -> bool:
+    """Whether the card is every creature type by its own static ability:
+    changeling ("This object is every creature type", CR 702.73a — phase expands
+    the keyword to this static) or Mistform Ultimus's printed ability. A
+    characteristic-defining ability, so it works in every zone (CR 604.3) — a
+    changeling card in a graveyard is an Elf card too. The card itself only: the
+    ``has_changeling`` and ``type_changers`` lanes also read grants of every
+    creature type to other objects (Maskwood Nexus, Mirror Entity's ability)."""
+    for unit in tree.iter_units("static"):
+        for sdef, mod in iter_mod_sites(unit.node):
+            if (
+                tag_of(mod) == "AddAllCreatureTypes"
+                and tag_of(getattr(sdef, "affected", None)) == "SelfRef"
+            ):
+                return True
+    return False

@@ -22,15 +22,23 @@ knobs there.
 from __future__ import annotations
 
 import json
-import os
+import sys
 from pathlib import Path
 
+from mtg_utils._http import cache_root, default_cache_root
 from mtg_utils._sidecar import load_pickle_sidecar, write_pickle_sidecar
 
 # Bump when the on-disk payload shape changes so old sidecars are
 # rejected and rebuilt. v2: records are MTGJSON-sourced (adapter-translated to the
-# Scryfall shape, with new types/subtypes/supertypes arrays).
-SIDECAR_VERSION = 2
+# Scryfall shape, with new types/subtypes/supertypes arrays). v3: records carry
+# ``arena_available`` (oracle-level) and ``reprint``; legalities are no longer rewritten
+# by the retired adapter Arena gate (``formats.Format.legality`` gates instead). v4:
+# records carry printing style (``full_art`` / ``border_color`` / ``frame_effects`` /
+# ``promo`` / ``promo_types``) for the special-basic-printing rule (ADR-0058). v5:
+# records carry ``arena_id`` (MTGJSON ``identifiers.mtgArenaId``), which mtga-import
+# resolves Player.log card ids through (``CardPool.by_arena_id``). v6: legalities carry
+# ``competitivebrawl`` (MTGJSON's Competitive Brawl key).
+SIDECAR_VERSION = 6
 SIDECAR_SUFFIX = ".idx.pkl"
 
 
@@ -123,12 +131,31 @@ def load_bulk_cards(bulk_path: Path) -> list[dict]:
         sidecar,
         version_tag=SIDECAR_VERSION,
         value_key="cards",
-        build_fn=lambda: _read_source(bulk_path),
+        build_fn=(
+            (lambda: _rebuild_notice(bulk_path))
+            if sidecar.exists()
+            else (lambda: _read_source(bulk_path))
+        ),
         source_mtime=_source_mtime(bulk_path),
         validate=lambda v: isinstance(v, list),
     )
     _MEM_CACHE[key] = (bulk_mtime(bulk_path), cards)
     return cards
+
+
+def _rebuild_notice(bulk_path: Path) -> list[dict]:
+    """Rebuild a stale or outdated card index, saying so on stderr: replacing an
+    existing index takes a minute and would otherwise pause silently — once after an
+    upgrade changes the record shape (``SIDECAR_VERSION``), or when the card data
+    changed without ``download-mtgjson`` rebuilding the index eagerly. (A first build
+    is ``download-mtgjson``'s, which reports its own progress.)"""
+    print(
+        f"Building the card index from {bulk_path.name} — a one-time rebuild after a "
+        "card-data download or an mtg-skills update; this takes about a minute.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return _read_source(bulk_path)
 
 
 def build_sidecar(bulk_path: Path) -> Path:
@@ -154,15 +181,8 @@ def default_bulk_path() -> Path | None:
     survives ``/tmp`` cleanup), then ``/tmp`` (ephemeral).
     Returns ``None`` if none exists.
     """
-    cache_root = os.environ.get("MTG_SKILLS_CACHE_DIR")
-    home = os.environ.get("HOME")
-    roots: list[Path] = []
-    if cache_root:
-        roots.append(Path(cache_root))
-    if home:
-        roots.append(Path(home) / ".cache" / "mtg-skills")
-    roots.append(Path("/tmp"))
-
+    # dict.fromkeys: with no override the first two roots are the same directory.
+    roots = dict.fromkeys((cache_root(), default_cache_root(), Path("/tmp")))
     for root in roots:
         p = root / "mtgjson" / "AllPrintings.json"
         if p.is_file():

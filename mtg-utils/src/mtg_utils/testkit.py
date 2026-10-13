@@ -19,6 +19,11 @@ both halves of the production call:
     a test asserts what production actually emits. Pre-seeds
     ``_ir_lookup``'s trees memo from the same stored records (:func:`_seed_trees`), so
     the structural merge runs for real in CI — no phase cache, no network.
+  * :func:`test_phase_records` — the stored raw phase face records themselves, for a
+    test of the layer BELOW the trees (strict-load, the concept overlay, the
+    correction / recovery stages, the sidecar builder). The one store of real phase
+    records: the crosswalk suites' own ``crosswalk_fixture_cards.json`` merged in
+    here (ADR-0056).
 
 (``test_legacy_card_ir`` — the LEGACY ``project_card`` IR — died with the
 builder in ADR-0039 task #80 step 7.)
@@ -43,6 +48,7 @@ agnostic Scryfall re-source is signal-identical).
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from functools import lru_cache
@@ -52,9 +58,17 @@ from typing import TYPE_CHECKING, Any
 from mtg_utils._card_ir.compat import compat_card_from_records
 from mtg_utils._card_ir.load import CROSSWALK_SIDECAR_VERSION
 from mtg_utils._card_ir.mirror.build import load_committed_schema
-from mtg_utils._deck_forge._ir_lookup import build_trees, seed_trees
+from mtg_utils._card_ir.trees import (
+    build_trees,
+    has_memoized_trees,
+    seed_records,
+    seed_trees,
+)
 from mtg_utils._phase import PHASE_TAG
 from mtg_utils.card_ir import Card
+from mtg_utils.deck import split_type_line
+from mtg_utils.ownership import printing_rows
+from mtg_utils.theme_presets import forget_signal_keys
 
 if TYPE_CHECKING:
     from mtg_utils._card_ir.mirror.schema import MirrorSchema
@@ -115,20 +129,131 @@ def _schema() -> MirrorSchema:
     return load_committed_schema()
 
 
+@lru_cache(maxsize=1)
+def _by_printed_name() -> dict[str, str]:
+    """A stored card's full printed name → its snapshot key, for the few keys a
+    test wrote as a face or an unaccented name (``"Commit"`` for ``Commit //
+    Memory``, ``"Cirdan the Shipwright"``) — so a corpus sweep that iterates
+    :func:`snapshot_records` can look each record up by its own ``name``."""
+    return {
+        entry["scryfall"].get("name") or key: key
+        for key, entry in _snapshot()["cards"].items()
+    }
+
+
 def _entry(name: str) -> dict[str, Any]:
     cards = _snapshot()["cards"]
     entry = cards.get(name)
+    if entry is None and name in _by_printed_name():
+        entry = cards[_by_printed_name()[name]]
     if entry is None:
         raise KeyError(
             f"{name!r} is not in the card snapshot. Add it via `build-card-snapshot` "
-            "(it scans the tests for test_card/test_card_ir/test_signals literals)."
+            "(it scans the tests for testkit-helper literals)."
         )
     return entry
 
 
 def test_card(name: str) -> dict[str, Any]:
-    """The minimal Scryfall record for *name* (a copy — safe for callers to mutate)."""
+    """The minimal Scryfall record for *name* (a copy — safe for callers to mutate).
+
+    Seeds *name*'s concept trees first, like every accessor here: a real card handed
+    to production code (the hub, the tuner, a role read) must see the trees it would
+    in production, in CI too. Otherwise the first signal read in a process with no
+    phase cache memoizes an empty answer that no later seed would correct."""
+    _seed_trees(name)
     return dict(_entry(name)["scryfall"])
+
+
+#: A printing's style facts with nothing special about it (per-printing: the snapshot
+#: stores gameplay facts only). ``test_printing`` overlays these, then the caller's.
+_PLAIN_PRINTING = {
+    "full_art": False,
+    "border_color": "black",
+    "frame_effects": [],
+    "promo": False,
+    "promo_types": [],
+}
+
+
+def test_printing(
+    name: str, set_code: str, collector_number: str, **style: object
+) -> dict[str, Any]:
+    """*name*'s real record as one printing: ``set`` / ``collector_number`` / ``id``
+    and a plain style, overlaid with *style* (``full_art=True``, ``promo_types=[…]``,
+    …) — per-printing facts the snapshot omits (ADR-0056)."""
+    return {
+        **test_card(name),
+        **_PLAIN_PRINTING,
+        "id": f"{set_code}-{collector_number}",
+        "set": set_code,
+        "collector_number": collector_number,
+        **style,
+    }
+
+
+def printing_row(
+    set_code: str, collector_number: str, *, quantity: int = 0, foil_quantity: int = 0
+) -> dict[str, Any]:
+    """One collection ``printings`` row — ``ownership.printing_rows``'s stored shape —
+    for copies of a printing a collection holds."""
+    (row,) = printing_rows({(set_code, collector_number): (quantity, foil_quantity)})
+    return row
+
+
+def mtgjson_printing(
+    name: str,
+    set_code: str,
+    rarity: str,
+    availability: list[str],
+    *,
+    reprint: bool = True,
+    arena_id: int | None = None,
+) -> dict[str, Any]:
+    """One MTGJSON ``AllPrintings`` printing of the real card *name* (its card data
+    from the snapshot); only the per-printing fields — set, rarity, availability,
+    reprint, Arena id — are the test's. For a test that must run the real MTGJSON
+    adapter (a whole-file :func:`mtgjson_sets` document loaded by ``CardPool``)."""
+    record = test_card(name)
+    types, _ = split_type_line(record["type_line"])
+    identifiers = {
+        "scryfallOracleId": record["oracle_id"],
+        "scryfallId": f"s-{set_code}-{record['oracle_id']}",
+    }
+    if arena_id is not None:
+        identifiers["mtgArenaId"] = str(arena_id)  # MTGJSON stores it as a string
+    return {
+        "name": record["name"],
+        "uuid": f"u-{set_code}-{record['oracle_id']}",
+        "identifiers": identifiers,
+        "type": record["type_line"],
+        "types": [t.title() for t in types],
+        "manaValue": record["cmc"],
+        "colorIdentity": record["color_identity"],
+        "layout": record["layout"],
+        "text": record["oracle_text"],
+        "availability": availability,
+        "legalities": {
+            fmt: status
+            for fmt, status in record["legalities"].items()
+            if status != "not_legal"
+        },
+        "setCode": set_code,
+        "rarity": rarity,
+        "isReprint": reprint,
+    }
+
+
+def mtgjson_sets(*printings: dict[str, Any]) -> dict[str, Any]:
+    """An ``AllPrintings`` document holding *printings*, one set per set code."""
+    sets: dict[str, dict[str, Any]] = {}
+    for printing in printings:
+        code = printing["setCode"]
+        sets.setdefault(
+            code,
+            {"code": code, "name": code, "type": "expansion", "cards": []},
+        )["cards"].append(printing)
+    return {"data": sets}
 
 
 def snapshot_records() -> list[dict[str, Any]]:
@@ -153,10 +278,14 @@ def _seed_trees(name: str) -> None:
     the IR always warms the SAME oracle_id's trees first."""
     entry = _entry(name)
     oid = entry["scryfall"].get("oracle_id") or ""
-    if not oid:
-        return
+    if oid:
+        seed_records(oid, entry["phase_records"])
+    if not oid or has_memoized_trees(oid):
+        return  # already seeded (building trees is the costly part)
     trees = build_trees(oid, entry["phase_records"], bulk=entry["scryfall"])
     seed_trees(oid, trees)
+    # Signal keys read before this seed (from no trees) must not outlive it.
+    forget_signal_keys(oid)
 
 
 def test_card_ir(name: str) -> Card:
@@ -181,11 +310,27 @@ def _compat_card_ir(name: str) -> Card:
     return card if card is not None else Card(oracle_id=oid, name=name, faces=())
 
 
+def test_phase_records(name: str) -> list[dict[str, Any]]:
+    """The raw phase face records the snapshot stores for *name* — phase's own
+    ``card-data.json`` parse, one record per face phase emits (a DFC / split card
+    has two, an Aftermath back half none; a folded object such as a dungeon has
+    none at all), in stored order. Deep copies, safe to mutate.
+
+    For a test of the layer below the concept trees — ``strict_load_card``,
+    ``build_concept_tree``, the correction / recovery stages, the sidecar and
+    ``trees_for`` resolvers — that needs the INPUT production reads, not the trees
+    or signals built from it. *name* is a snapshot key (the name a test asks for;
+    a back-face name resolves to its card, so ``"Howlpack Alpha"`` returns both
+    Mayor of Avabruck faces) or a stored card's full printed name. Picking the
+    face is the caller's job: match on each record's ``name``."""
+    return copy.deepcopy(_entry(name)["phase_records"])
+
+
 def test_signals(name: str) -> list:
     """``extract_signals(test_card(name), test_card_ir(name))`` — exactly what
     production emits for *name* (real Scryfall record, real Card IR, real concept
     trees — CI-safe via the snapshot's stored phase records)."""
-    from mtg_utils._deck_forge.signals import extract_signals
+    from mtg_utils._analysis.signals import extract_signals
 
     _seed_trees(name)
     return extract_signals(test_card(name))
@@ -195,5 +340,11 @@ def test_signals(name: str) -> list:
 # prefix (chosen so a fixture reads ``test_card("Sol Ring")``). ``__test__ = False`` is
 # pytest's documented opt-out and travels with the function when imported into a test
 # module. Set via ``setattr`` (the attribute isn't declared on the function type).
-for _helper in (test_card, test_card_ir, test_signals):
+for _helper in (
+    test_card,
+    test_card_ir,
+    test_signals,
+    test_phase_records,
+    test_printing,
+):
     setattr(_helper, "__test__", False)  # noqa: B010 — dynamic set dodges ty's undeclared-attr check

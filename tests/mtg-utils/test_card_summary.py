@@ -5,6 +5,7 @@ import json
 from click.testing import CliRunner
 
 from mtg_utils.card_summary import card_summary, main
+from mtg_utils.testkit import test_card
 
 
 class TestCardSummary:
@@ -47,13 +48,7 @@ class TestCardSummary:
     def test_filters_none_entries(self):
         hydrated = [
             None,
-            {
-                "name": "Sol Ring",
-                "mana_cost": "{1}",
-                "cmc": 1.0,
-                "type_line": "Artifact",
-                "oracle_text": "{T}: Add {C}{C}.",
-            },
+            test_card("Sol Ring"),
             None,
         ]
         output = card_summary(hydrated)
@@ -140,8 +135,8 @@ class TestCLI:
 
 
 class TestSideboard:
-    """--sideboard joins through a HydratedDeck (from_paths) and shows only the
-    sideboard zone — the replacement for the deleted _filter_to_section helper."""
+    """--sideboard joins through the acquisition seam and shows only the sideboard
+    zone — the replacement for the deleted _filter_to_section helper."""
 
     def _write(self, tmp_path, deck, hydrated):
         deck_path = tmp_path / "deck.json"
@@ -156,52 +151,44 @@ class TestSideboard:
             "cards": [{"name": "Sol Ring", "quantity": 1}],
             "sideboard": [{"name": "Smash", "quantity": 3}],
         }
-        hydrated = [
-            {
-                "name": "Sol Ring",
-                "mana_cost": "{1}",
-                "cmc": 1.0,
-                "type_line": "Artifact",
-                "oracle_text": "{T}: Add {C}{C}.",
-            },
-            {
-                "name": "Smash",
-                "mana_cost": "{1}{R}",
-                "cmc": 2.0,
-                "type_line": "Instant",
-                "oracle_text": "Destroy target artifact.\nDraw a card.",
-            },
-        ]
+        hydrated = [test_card("Sol Ring"), test_card("Smash")]
         deck_path, hydrated_path = self._write(tmp_path, deck, hydrated)
         runner = CliRunner()
         result = runner.invoke(
-            main, [str(hydrated_path), "--deck", str(deck_path), "--sideboard"]
+            main, [str(deck_path), "--bulk-data", str(hydrated_path), "--sideboard"]
         )
         assert result.exit_code == 0, result.output
         assert "Smash" in result.output
         assert "Sol Ring" not in result.output
 
-    def test_requires_deck(self, hydrated_cards, tmp_path):
-        hydrated_path = tmp_path / "hydrated.json"
-        hydrated_path.write_text(json.dumps(hydrated_cards))
-        runner = CliRunner()
-        result = runner.invoke(main, [str(hydrated_path), "--sideboard"])
-        assert result.exit_code != 0
-        assert "--sideboard requires --deck" in result.output
 
-    def test_rejects_stub_hydrated_file(self, tmp_path):
-        """A stale/stub hydrated file (deck entries where records belong) now RAISEs
-        via from_paths, where the old _filter_to_section silently produced junk."""
-        deck = {
-            "commanders": [],
-            "cards": [],
-            "sideboard": [{"name": "Smash", "quantity": 1}],
-        }
-        stub_hydrated = [{"name": "Smash", "quantity": 1}]  # no type_line -> a stub
-        deck_path, hydrated_path = self._write(tmp_path, deck, stub_hydrated)
-        runner = CliRunner()
-        result = runner.invoke(
-            main, [str(hydrated_path), "--deck", str(deck_path), "--sideboard"]
-        )
-        assert result.exit_code != 0
-        assert isinstance(result.exception, ValueError)
+class TestStatsColumn:
+    """A Stats column (limited P3): creature size is the stat that matters most in
+    limited, so the table shows power/toughness, a planeswalker's loyalty and a
+    battle's defense — per face for a multi-face card."""
+
+    def _row(self, name: str) -> str:
+        table = card_summary([test_card(name)])
+        header, _rule, row = table.splitlines()
+        assert "Stats" in header
+        return row
+
+    def test_creature_power_and_toughness(self):
+        assert " 2/2 " in self._row("Grizzly Bears")
+
+    def test_characteristic_defining_stats_keep_their_stars(self):
+        assert " */1+* " in self._row("Tarmogoyf")
+
+    def test_planeswalker_loyalty(self):
+        assert " Loyalty 3 " in self._row("Liliana of the Veil")
+
+    def test_adventure_creature_shows_its_creature_face(self):
+        assert " 3/1 " in self._row("Brazen Borrower")
+
+    def test_battle_defense_and_back_face_size(self):
+        assert " Defense 3 // 4/4 " in self._row("Invasion of Zendikar")
+
+    def test_noncreature_has_an_empty_cell(self):
+        # Near miss: an artifact that makes mana, no stats at all.
+        row = self._row("Sol Ring")
+        assert "/" not in row.split("|")[4]

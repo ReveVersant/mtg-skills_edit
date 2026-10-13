@@ -12,30 +12,40 @@ from __future__ import annotations
 
 import functools
 import json
-import uuid
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable, Collection
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, Response
+import click
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from mtg_utils._deck_forge import collection, engine, views
-from mtg_utils._deck_forge.budgets import slot_budgets
-from mtg_utils._deck_forge.exporters import export_as
+from mtg_utils._arena_meta import meta as arena_meta
+from mtg_utils._arena_meta import untapped
+from mtg_utils._deck_forge import collection, discovery, engine, views
+from mtg_utils._deck_forge.engine import DeckRuleError
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
-from mtg_utils._tuner.tune import TuneParams
 from mtg_utils._tuner.tune import tune as run_tune
-from mtg_utils.companion import is_companion
+from mtg_utils.deck_cli import parse_wildcards
 from mtg_utils.deck_stats import deck_stats
-from mtg_utils.format_config import is_arena_only_format
-from mtg_utils.mana_audit import mana_audit, reconcile_basic_lands
+from mtg_utils.export_deck import export_as
+from mtg_utils.mana_audit import mana_audit
 from mtg_utils.parse_deck import parse_deck_text
 from mtg_utils.theme_presets import list_presets
 
 VERSION = "0.1.0"
+
+# The Host names the hub answers to on its default loopback bind; see
+# ``_guard_rejection``. ``ANY_HOST`` is for a wildcard bind (``--host 0.0.0.0``).
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+ANY_HOST = "*"
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 _PLACEHOLDER_INDEX = """<!doctype html>
 <html lang="en">
@@ -62,6 +72,13 @@ class RemovePayload(BaseModel):
     zone: str = "cards"
 
 
+class MovePayload(BaseModel):
+    name: str
+    from_zone: str
+    to_zone: str
+    qty: int = 1
+
+
 class FormatPayload(BaseModel):
     format: str
 
@@ -71,7 +88,7 @@ class MediumPayload(BaseModel):
 
 
 class DeckSizePayload(BaseModel):
-    deck_size: int  # 60 | 100 (paper Historic Brawl)
+    deck_size: int  # a Commander-family choice (60 | 100) or a constructed floor
 
 
 class SetPrintingPayload(BaseModel):
@@ -113,6 +130,12 @@ class ImportDeckPayload(BaseModel):
     text: str
     format: str = "commander"
     name: str | None = None
+    # Sealed / draft: the whole list is the opened pool (no deck built yet).
+    pool_only: bool = False
+
+
+class SeedPayload(BaseModel):
+    colors: str  # one or more of WUBRG, e.g. "WG"
 
 
 class ImportCollectionPayload(BaseModel):
@@ -127,7 +150,7 @@ class ClearCollectionPayload(BaseModel):
 class DiscoverCommandersPayload(BaseModel):
     sort: str = "support"  # "support" (owned-support depth) | "novelty" (signal rarity)
     colors: str | None = None  # color-identity subset filter (e.g. "BG")
-    theme: str | None = None  # a theme_presets lane to require
+    themes: list[str] = []  # theme_presets lanes a commander must ALL match (as Find)
     limit: int = 24
 
 
@@ -157,6 +180,9 @@ class SearchPayload(BaseModel):
     sort: str = "cmc-asc"
     limit: int = 25
     offset: int = 0
+    # ADR-0059: the meta archetype Tune reads (TunePayload.meta_archetype), whose
+    # card share breaks Find's synergy ties on a digital build.
+    meta_archetype: str | None = None
 
 
 class TunePayload(BaseModel):
@@ -167,6 +193,18 @@ class TunePayload(BaseModel):
     max_swaps: int = 0  # 0 = diagnose only
     shape_override: str | None = None
     suggest_commander: bool = False
+    # Adds the builder rejected (Tune's Reject button): never proposed; the slot a
+    # rejected card held goes to the next-ranked candidate on the re-run.
+    exclude: list[str] = []
+    # ADR-0059: the build's Arena meta archetype — None matches the deck from the
+    # arena-meta cache, "off" skips it, anything else names one.
+    meta_archetype: str | None = None
+
+
+class MetaRefreshPayload(BaseModel):
+    previous: bool = False
+    # False: fetch only when the cache is stale (the panel's on-open check).
+    force: bool = True
 
 
 def _autosave(state: ForgeState) -> None:
@@ -174,16 +212,37 @@ def _autosave(state: ForgeState) -> None:
         state.store.save(state.build_id, state.build_name, state.session.to_deck_dict())
 
 
-def _reset_runtime_lanes(state: ForgeState) -> None:
-    """Clear per-build runtime lane state on a build switch.
+def _commit(
+    state: ForgeState, *, persist: bool = True, readout: dict | None = None
+) -> dict:
+    """The tail of every state-changing route, written once: persist the build (a
+    DECK change — ``persist=False`` for runtime-only state like lanes and
+    Collections, and for a load, which must not rewrite the file it just read), take
+    the snapshot, broadcast it to every open browser, return it. ``readout`` is a
+    land-plan result that rides on the broadcast snapshot (``balanced`` /
+    ``trimmed``)."""
+    if persist:
+        _autosave(state)
+    snap = {**engine.snapshot(state), **(readout or {})}
+    state.hub.publish(json.dumps(snap))
+    return snap
 
-    ``agent_avenues`` (lanes the session-agent posted) and ``focused_avenue_ids``
-    (the human's focus pins) are scoped to one deck. Carrying them across a
-    new/import/load would surface the prior commander's lanes and scope candidate
-    scoring (``engine.scoring_basis``) to focus pins from another build.
-    """
-    state.agent_avenues.clear()
-    state.focused_avenue_ids.clear()
+
+def busy_reporter(state: ForgeState) -> Callable[[str, str, int, int], None]:
+    """The transport side of the busy meter: what a long hub job calls (from its
+    own thread) as it moves — fold the step into the state (``engine.record_busy``)
+    and broadcast it to every open tab, the same way ``_commit`` broadcasts a
+    snapshot. The production entry installs it as ``state.report_busy`` and as the
+    signals-index build's process hook; ``build_app`` never touches either, so a
+    test's app is side-effect free."""
+
+    def report(job: str, label: str, done: int, total: int) -> None:
+        before = state.busy
+        busy = engine.record_busy(state, job, label, done, total)
+        if state.busy is not before:  # an ignored report (another job's) is silent
+            state.hub.publish_threadsafe(json.dumps({"busy": busy}))
+
+    return report
 
 
 def _find_params(payload: SearchPayload) -> engine.FindParams:
@@ -207,58 +266,12 @@ def _find_params(payload: SearchPayload) -> engine.FindParams:
         sort=payload.sort,
         limit=payload.limit,
         offset=payload.offset,
+        meta_archetype=payload.meta_archetype,
     )
 
 
 def _clamp_timeout(timeout: float) -> float:
     return max(0.0, min(timeout, 30.0))
-
-
-def _zone_error(zone: str) -> JSONResponse | None:
-    if zone not in views.VALID_ZONES:
-        return JSONResponse({"error": f"unknown zone {zone!r}"}, status_code=400)
-    return None
-
-
-def _companion_add_error(state: ForgeState, name: str, qty: int) -> JSONResponse | None:
-    """Zone rules for adding to the companion zone, or None when the add is legal.
-
-    (a) At most ONE card may occupy the zone (CR 103.2b: a player may reveal at
-    most one companion) — an occupied zone 400s; the user removes/moves the old
-    occupant first, it is never silently replaced. (b) The card must actually
-    carry the companion ability (CR 702.139a), validated against the hydrated
-    record.
-    """
-    occupied = state.session.to_deck_dict().get("companion") or []
-    if occupied:
-        holder = occupied[0]["name"]
-        return JSONResponse(
-            {
-                "error": (
-                    f"companion zone already holds {holder}; a player may reveal "
-                    f"at most one companion (CR 103.2b) — remove it first"
-                )
-            },
-            status_code=400,
-        )
-    if qty != 1:
-        return JSONResponse(
-            {
-                "error": (
-                    "the companion zone holds exactly one card "
-                    "(CR 103.2b: at most one companion)"
-                )
-            },
-            status_code=400,
-        )
-    record = state.by_name.get(name)
-    if record is None or not is_companion(record):
-        return JSONResponse(
-            {"error": f"{name} has no companion ability (CR 702.139a)"},
-            status_code=400,
-        )
-    return None
-    return None
 
 
 def _no_bulk() -> JSONResponse:
@@ -268,9 +281,73 @@ def _no_bulk() -> JSONResponse:
     )
 
 
-def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAPI:
-    """Build the FastAPI app from an injected ``ForgeState``."""
+def _guard_rejection(
+    method: str, host_header: str, origin: str | None, hosts: frozenset[str]
+) -> str | None:
+    """Why the local-only guard turns a request away, or None to let it in.
+
+    The Host check stops DNS rebinding: a page whose own domain now resolves
+    to 127.0.0.1 is same-origin with the hub as far as the browser knows, so
+    without it the page could read every response and post to the agent
+    bridge. The Origin check stops a plain cross-site POST. A request with no
+    Origin (the session agent's ``requests`` calls, curl) is not a browser's
+    cross-site request and passes."""
+    host = urlsplit(f"//{host_header}").hostname
+    any_host = ANY_HOST in hosts
+    if not any_host and host not in hosts:
+        return f"deck-forge does not answer to Host {host_header!r}"
+    if origin is None or method in _SAFE_METHODS:
+        return None
+    trusted = {host} if any_host else hosts
+    if urlsplit(origin).hostname not in trusted:
+        return f"cross-site request from {origin!r} rejected"
+    return None
+
+
+class _LocalOnly:
+    """Pure-ASGI wrapper for ``_guard_rejection`` (no BaseHTTPMiddleware, so
+    the SSE stream and background tasks pass through untouched)."""
+
+    def __init__(self, app: ASGIApp, hosts: frozenset[str]) -> None:
+        self.app = app
+        self.hosts = hosts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = Headers(scope=scope)
+            reason = _guard_rejection(
+                scope["method"],
+                headers.get("host", ""),
+                headers.get("origin"),
+                self.hosts,
+            )
+            if reason is not None:
+                await JSONResponse({"error": reason}, status_code=403)(
+                    scope, receive, send
+                )
+                return
+        await self.app(scope, receive, send)
+
+
+def build_app(
+    state: ForgeState,
+    *,
+    frontend_dist: Path | None = None,
+    allowed_hosts: Collection[str] | None = None,
+) -> FastAPI:
+    """Build the FastAPI app from an injected ``ForgeState``.
+
+    ``allowed_hosts`` is the set of Host names the hub answers to (default
+    ``LOOPBACK_HOSTS``, read at call time); ``{ANY_HOST}`` answers to any
+    Host but still requires a browser's Origin to match it."""
     app = FastAPI(title="deck-forge", version=VERSION)
+    hosts = frozenset(LOOPBACK_HOSTS if allowed_hosts is None else allowed_hosts)
+    app.add_middleware(_LocalOnly, hosts=hosts)
+
+    @app.exception_handler(DeckRuleError)
+    async def _deck_rule_error(_request: Request, exc: DeckRuleError) -> JSONResponse:
+        # Every engine rule breach (ADR-0013) is one 400 with the rule's message.
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
     # --- Cross-site request protection (local-server CSRF) --------------------
     # The server has no auth and is meant for loopback use, so while it runs any
@@ -306,11 +383,14 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.get("/api/deck")
     async def deck() -> dict:
+        owned = engine.owned_quantities(state)
         return {
             "deck": views.deck_view(
                 state,
-                engine.owned_quantities(state),
+                owned,
                 functools.partial(engine.printing_owned, state),
+                functools.partial(engine.copy_limit, state),
+                functools.partial(engine.coverage, state, owned),
             )
         }
 
@@ -328,105 +408,85 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.post("/api/deck/add", response_model=None)
     async def add(payload: AddPayload) -> dict | JSONResponse:
-        bad_zone = _zone_error(payload.zone)
-        if bad_zone is not None:
-            return bad_zone
         if payload.name not in state.by_name:
             return JSONResponse(
                 {"error": f"card not found: {payload.name!r}"}, status_code=404
             )
-        if payload.zone == "companion":
-            bad_companion = _companion_add_error(state, payload.name, payload.qty)
-            if bad_companion is not None:
-                return bad_companion
-        state.session.add(payload.name, payload.qty, zone=payload.zone)
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        engine.add_card(state, payload.name, payload.qty, zone=payload.zone)
+        return _commit(state)
 
-    @app.post("/api/deck/remove", response_model=None)
-    async def remove(payload: RemovePayload) -> dict | JSONResponse:
-        bad_zone = _zone_error(payload.zone)
-        if bad_zone is not None:
-            return bad_zone
-        state.session.remove(payload.name, payload.qty, zone=payload.zone)
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+    @app.post("/api/deck/move")
+    async def move(payload: MovePayload) -> dict:
+        """Move copies between zones in one step (``engine.move_card`` is the rule);
+        returns the new snapshot."""
+        engine.move_card(
+            state,
+            payload.name,
+            from_zone=payload.from_zone,
+            to_zone=payload.to_zone,
+            qty=payload.qty,
+        )
+        return _commit(state)
 
-    @app.post("/api/deck/format", response_model=None)
-    async def set_format(payload: FormatPayload) -> dict | JSONResponse:
-        """Change the current build's format (any Commander-family format:
-        commander / brawl / historic_brawl / competitive_brawl).
-        The deck's cards are kept; everything format-dependent (deck size, land floor,
-        legality, commander eligibility) re-derives on the next snapshot."""
-        if payload.format not in engine.SUPPORTED_FORMATS:
-            return JSONResponse(
-                {"error": f"unsupported format: {payload.format!r}"}, status_code=400
-            )
-        state.session.format = payload.format
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+    @app.post("/api/deck/remove")
+    async def remove(payload: RemovePayload) -> dict:
+        engine.remove_card(state, payload.name, payload.qty, zone=payload.zone)
+        return _commit(state)
 
-    @app.post("/api/deck/medium", response_model=None)
-    async def set_medium(payload: MediumPayload) -> dict | JSONResponse:
-        """Set paper vs digital for the build (Brawl / Historic Brawl). Drives the
-        active Collection slot and the cost mode — digital → Arena slot + wildcards;
-        paper → paper slot + USD (ADR-0018, amended)."""
-        if payload.medium not in ("paper", "digital"):
-            return JSONResponse(
-                {"error": f"unknown medium: {payload.medium!r}"}, status_code=400
-            )
-        if payload.medium == "digital" and state.session.format == "commander":
-            return JSONResponse({"error": "commander is paper-only"}, status_code=400)
-        if payload.medium == "paper" and is_arena_only_format(state.session.format):
-            return JSONResponse(
-                {"error": f"{state.session.format} is Arena-only"}, status_code=400
-            )
-        state.session.set_medium(payload.medium)
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+    @app.post("/api/deck/seed")
+    async def seed(payload: SeedPayload) -> dict:
+        """Seed a first 40 from a sealed / draft pool in the chosen colours
+        (``engine.seed_build`` is the rule); returns the new snapshot."""
+        seeded = engine.seed_build(state, payload.colors)
+        return {"seeded": seeded, **_commit(state)}
 
-    @app.post("/api/deck/deck-size", response_model=None)
-    async def set_deck_size(payload: DeckSizePayload) -> dict | JSONResponse:
-        """Choose 60 or 100 cards. Only paper Historic Brawl honors it (both are legal
-        for paper "Brawl"); every other format/medium keeps its fixed size, so the
-        override lies dormant until it applies."""
-        if payload.deck_size not in (60, 100):
+    @app.post("/api/deck/seed/undo")
+    async def seed_undo() -> dict:
+        """Put back the main deck the last seed replaced (``engine.undo_seed`` is
+        the rule); returns the new snapshot."""
+        engine.undo_seed(state)
+        return _commit(state)
+
+    @app.get("/api/set-scan", response_model=None)
+    async def set_scan(code: str) -> dict | JSONResponse:
+        """What a set holds — removal by rarity, sweepers, evasion, the biggest
+        bodies (``set_scan.set_scan`` over the pool's set index). Pure compute."""
+        if not state.bulk_available or state.bulk_path is None:
+            return _no_bulk()
+        scan = await run_in_threadpool(engine.set_scan_for, state, code)
+        if scan is None:
             return JSONResponse(
-                {"error": "deck size must be 60 or 100"}, status_code=400
+                {"error": f"no cards found for set {code!r}"}, status_code=404
             )
-        state.session.set_deck_size(payload.deck_size)
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        return scan
+
+    @app.post("/api/deck/format")
+    async def set_format(payload: FormatPayload) -> dict:
+        """Change the build's format (``engine.set_format`` is the rule); returns the
+        new snapshot."""
+        engine.set_format(state, payload.format)
+        return _commit(state)
+
+    @app.post("/api/deck/medium")
+    async def set_medium(payload: MediumPayload) -> dict:
+        """Set paper vs digital for the build (``engine.set_medium`` is the rule);
+        returns the new snapshot."""
+        engine.set_medium(state, payload.medium)
+        return _commit(state)
+
+    @app.post("/api/deck/deck-size")
+    async def set_deck_size(payload: DeckSizePayload) -> dict:
+        """Choose the deck size (``engine.set_deck_size`` is the rule); returns the
+        new snapshot."""
+        engine.set_deck_size(state, payload.deck_size)
+        return _commit(state)
 
     @app.post("/api/deck/balance-lands")
     async def balance_lands() -> dict:
         """Fix the mana base: add basics to reach the FAIL floor and rebalance the
         basics to match color demand (swapping over- for under-produced colors at the
         current count when already at/above the floor)."""
-        plan = reconcile_basic_lands(engine.hydrate_session(state))
-        applied: dict[str, dict[str, int]] = {"add": {}, "remove": {}}
-        for name, qty in plan["remove"].items():
-            state.session.remove(name, qty, zone="cards")
-            applied["remove"][name] = qty
-        for name, qty in plan["add"].items():
-            if name in state.by_name:  # only add basics the loaded index can hydrate
-                state.session.add(name, qty, zone="cards")
-                applied["add"][name] = qty
-        _autosave(state)
-        snap = engine.snapshot(state)
-        snap["balanced"] = applied
-        state.hub.publish(json.dumps(snap))
-        return snap
+        return _commit(state, readout={"balanced": engine.balance_lands(state)})
 
     @app.post("/api/deck/trim-lands")
     async def trim_lands() -> dict:
@@ -434,25 +494,9 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         (max of Burgess/Karsten), removing over-produced colors first. No-op when the
         deck is already at/under recommended. Soft — never blocks finalize, because an
         all-lands combo deck is a legitimate build (see CONTEXT Flood line)."""
-        audit = mana_audit(engine.hydrate_session(state))
-        recommended = audit["recommended_land_count"]
-        applied: dict[str, dict[str, int]] = {"add": {}, "remove": {}}
-        if audit["land_count"] > recommended:
-            plan = reconcile_basic_lands(
-                engine.hydrate_session(state), target_total=recommended
-            )
-            for name, qty in plan["remove"].items():
-                state.session.remove(name, qty, zone="cards")
-                applied["remove"][name] = qty
-            for name, qty in plan["add"].items():
-                if name in state.by_name:  # only basics the index can hydrate
-                    state.session.add(name, qty, zone="cards")
-                    applied["add"][name] = qty
-            _autosave(state)
-        snap = engine.snapshot(state)
-        snap["trimmed"] = applied
-        state.hub.publish(json.dumps(snap))
-        return snap
+        applied = engine.trim_lands(state)
+        changed = bool(applied["add"] or applied["remove"])
+        return _commit(state, persist=changed, readout={"trimmed": applied})
 
     @app.post("/api/handoff/goldfish", response_model=None)
     async def handoff_goldfish() -> dict | JSONResponse:
@@ -512,8 +556,9 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         return {
             "card": views.result_view(
                 rec,
-                state.session.format,
+                state.session.fmt,
                 unreleased=rec.get("oracle_id") in state.unreleased_ids,
+                copy_limit=engine.copy_limit(state, rec),
             )
         }
 
@@ -527,26 +572,10 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         ``card_owned_qty``. Empty for an unknown name / no bulk."""
         if not state.bulk_available:
             return _no_bulk()
-        record = state.by_name.get(name)
-        oracle_id = record.get("oracle_id") if record else None
-        prints = state.printings_by_oracle.get(oracle_id, []) if oracle_id else []
-        detail = engine.owned_printing_detail(state, name) or {}
-        rows = []
-        for p in prints:
-            view = views.printing_view(p)
-            key = ((p.get("set") or "").lower(), str(p.get("collector_number") or ""))
-            nonfoil, foil = detail.get(key, (0, 0))
-            view["owned_qty"] = nonfoil
-            view["owned_foil_qty"] = foil
-            rows.append(view)
-        # Stable sort over the newest-first base order: owned block first (by total
-        # owned desc, ties stay newest-first), then unowned newest-first unchanged.
-        rows.sort(
-            key=lambda v: (
-                0 if v["owned_qty"] + v["owned_foil_qty"] > 0 else 1,
-                -(v["owned_qty"] + v["owned_foil_qty"]),
-            )
-        )
+        rows = [
+            {**views.printing_view(p), "owned_qty": nonfoil, "owned_foil_qty": foil}
+            for p, nonfoil, foil in engine.printings_for(state, name)
+        ]
         owned_total = engine.owned_of(state, name)
         return {
             "name": name,
@@ -555,57 +584,21 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
             "printings": rows,
         }
 
-    @app.post("/api/deck/printing", response_model=None)
-    async def set_printing(payload: SetPrintingPayload) -> dict | JSONResponse:
+    @app.post("/api/deck/printing")
+    async def set_printing(payload: SetPrintingPayload) -> dict:
         """Pin (or clear, with a null id) the printing for a card in the deck (C). The
         chosen printing drives the card's image / price / export set, never its gameplay
         text. Validated against the card's own printings so a stray id can't pin a wrong
         card's art."""
-        bad_zone = _zone_error(payload.zone)
-        if bad_zone is not None:
-            return bad_zone
-        chosen: dict | None = None
-        if payload.printing_id is not None:
-            record = state.by_name.get(payload.name)
-            oracle_id = record.get("oracle_id") if record else None
-            chosen = next(
-                (
-                    p
-                    for p in state.printings_by_oracle.get(oracle_id or "", [])
-                    if p.get("id") == payload.printing_id
-                ),
-                None,
-            )
-            if chosen is None:
-                return JSONResponse(
-                    {"error": f"not a printing of {payload.name!r}"}, status_code=400
-                )
-        if payload.finish is not None:
-            # A finish only makes sense riding a pinned printing, and only one the
-            # printing was actually produced in (its Scryfall `finishes` list).
-            if chosen is None:
-                return JSONResponse(
-                    {"error": "finish requires a chosen printing"}, status_code=400
-                )
-            if payload.finish not in ("foil", "etched") or payload.finish not in (
-                chosen.get("finishes") or []
-            ):
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"printing {payload.printing_id!r} has no "
-                            f"{payload.finish!r} finish"
-                        )
-                    },
-                    status_code=400,
-                )
-        state.session.set_printing(
-            payload.name, payload.printing_id, zone=payload.zone, finish=payload.finish
+        engine.check_zone(payload.zone)
+        engine.choose_printing(
+            state,
+            payload.name,
+            payload.printing_id,
+            zone=payload.zone,
+            finish=payload.finish,
         )
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        return _commit(state)
 
     @app.get("/api/events")
     async def events() -> StreamingResponse:
@@ -621,8 +614,10 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.get("/api/signals")
     async def signals() -> dict:
-        sigs = engine.ranked_deck_signals(state, engine.hydrate_session(state).records)
-        return {"signals": [engine.signal_dict(s) for s in sigs]}
+        sigs = engine.ranked_deck_signals(
+            state, engine.hydrate_session(state).deck_records()
+        )
+        return {"signals": [views.signal_view(s) for s in sigs]}
 
     @app.get("/api/presets")
     async def presets() -> dict:
@@ -636,22 +631,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.get("/api/budgets")
     async def budgets() -> dict:
-        hd = engine.hydrate_session(state)
-        # ADR-0041 (Fix 2): pass mana_audit's OWN already-derived land band
-        # directly — the standalone budgets read must not disagree with
-        # /api/snapshot or the mana section's own verdict (single source).
-        land_band_info = mana_audit(hd).get("land_band")
-        return {
-            "budgets": slot_budgets(
-                hd.expanded(),
-                deck_size=state.session.deck_size,
-                land_band=(
-                    (land_band_info["floor"], land_band_info["top"])
-                    if land_band_info
-                    else None
-                ),
-            )
-        }
+        return {"budgets": engine.budgets(state)}
 
     @app.get("/api/builds")
     async def builds() -> dict:
@@ -662,84 +642,27 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.post("/api/builds/new")
     async def builds_new(payload: NewBuildPayload) -> dict:
-        state.session = DeckSession(payload.format)
-        state.build_id = uuid.uuid4().hex[:8]
-        state.build_name = payload.name or "Untitled"
-        _reset_runtime_lanes(state)
-        _autosave(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return {"build_id": state.build_id, **snap}
+        engine.check_format(payload.format)
+        engine.switch_build(
+            state, DeckSession(payload.format), name=payload.name or "Untitled"
+        )
+        return {"build_id": state.build_id, **_commit(state)}
 
-    @app.post("/api/builds/import", response_model=None)
-    async def builds_import(payload: ImportDeckPayload) -> dict | JSONResponse:
+    @app.post("/api/builds/import")
+    async def builds_import(payload: ImportDeckPayload) -> dict:
         """Import an existing list as a NEW build (ADR-0017). Parse the raw pasted /
         uploaded text IN-PROCESS (pure compute — `parse_deck_text`, no LLM, no API key),
         seed a fresh session, switch to it. Never overwrites the live build; never
         guesses a commander — an unmarked list lands as a pile in ``cards`` that the
         user promotes from (the DeckList ★)."""
-        if payload.format not in engine.SUPPORTED_FORMATS:
-            return JSONResponse(
-                {"error": f"unsupported format: {payload.format!r}"}, status_code=400
-            )
-        try:
-            parsed = parse_deck_text(payload.text, format=payload.format)
-        except Exception as exc:  # noqa: BLE001 — a bad paste is a 400, never a 500
-            return JSONResponse(
-                {"error": f"could not parse deck list: {exc}"}, status_code=400
-            )
-        # Route the parsed companion zone: the FIRST plausible companion (unknown
-        # names stay — they surface as `unknown` like any other zone) keeps the
-        # zone; overflow entries (max one companion, CR 103.2b), extra copies, and
-        # cards the bulk index PROVES have no companion ability (CR 702.139a) are
-        # demoted to ``cards`` with a warning rather than dropped.
-        import_warnings: list[str] = []
-        kept_companion: list[dict] = []
-        demoted: list[dict] = []
-        for entry in parsed.get("companion") or []:
-            record = state.by_name.get(entry.get("name", ""))
-            if record is not None and not is_companion(record):
-                demoted.append(entry)
-                import_warnings.append(
-                    f"{entry['name']} has no companion ability (CR 702.139a); "
-                    f"moved to the deck"
-                )
-            elif kept_companion:
-                demoted.append(entry)
-                import_warnings.append(
-                    f"more than one companion listed; {entry['name']} moved to the "
-                    f"deck (CR 103.2b: at most one companion)"
-                )
-            else:
-                qty = int(entry.get("quantity", 1))
-                if qty > 1:
-                    demoted.append({**entry, "quantity": qty - 1})
-                    import_warnings.append(
-                        f"{entry['name']}: {qty} copies listed as companion; kept 1, "
-                        f"moved {qty - 1} to the deck (CR 103.2b)"
-                    )
-                kept_companion.append({**entry, "quantity": 1})
-        parsed["companion"] = kept_companion
-        if demoted:
-            parsed["cards"] = list(parsed.get("cards") or []) + demoted
-        session = DeckSession.from_deck_dict(parsed)
-        if not session.card_names():
-            return JSONResponse(
-                {"error": "no cards found in the imported list"}, status_code=400
-            )
-        # Entries that carried a "(SET) 123" suffix (and optional *F*/*E* finish
-        # marker) auto-pin the matching printing; unresolvable pairs stay unpinned.
-        engine.pin_imported_printings(state, session, parsed)
-        state.session = session
-        state.build_id = uuid.uuid4().hex[:8]
-        state.build_name = payload.name or "Imported deck"
-        _reset_runtime_lanes(state)
-        _autosave(state)
-        # Names the bulk index can't hydrate (typos, un-owned tokens, Arena-only cards
-        # when no bulk) surface as `unknown` cards; report them so the UI can warn.
-        unknown = sorted(n for n in session.card_names() if n not in state.by_name)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
+        imported = engine.import_deck(
+            state, payload.text, fmt=payload.format, pool_only=payload.pool_only
+        )
+        engine.switch_build(
+            state, imported.session, name=payload.name or "Imported deck"
+        )
+        snap = _commit(state)
+        parsed = imported.parsed
         return {
             "build_id": state.build_id,
             "imported": {
@@ -747,9 +670,17 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
                 "cards": sum(
                     int(e.get("quantity", 1)) for e in (parsed.get("cards") or [])
                 ),
-                "companion": len(kept_companion),
-                "unknown": unknown,
-                "warnings": import_warnings,
+                "companion": len(parsed.get("companion") or []),
+                "sideboard": sum(
+                    int(e.get("quantity", 1)) for e in (parsed.get("sideboard") or [])
+                ),
+                "pool": sum(
+                    int(e.get("quantity", 1)) for e in (parsed.get("pool") or [])
+                ),
+                # Names the index can't hydrate (typos, un-owned tokens, Arena-only
+                # cards when no bulk) surface as `unknown` cards for the UI to warn.
+                "unknown": imported.unknown,
+                "warnings": imported.warnings,
             },
             **snap,
         }
@@ -763,28 +694,26 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
             return JSONResponse(
                 {"error": f"build not found: {payload.id}"}, status_code=404
             )
-        state.session = DeckSession.from_deck_dict(record.get("deck") or {})
-        state.build_id = payload.id
-        state.build_name = record.get("name", "Untitled")
-        _reset_runtime_lanes(state)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return {"build_id": state.build_id, **snap}
+        engine.switch_build(
+            state,
+            DeckSession.from_deck_dict(record.get("deck") or {}),
+            name=record.get("name", "Untitled"),
+            build_id=payload.id,
+        )
+        return {"build_id": state.build_id, **_commit(state, persist=False)}
 
     @app.post("/api/builds/rename")
     async def builds_rename(payload: RenameBuildPayload) -> dict:
-        if payload.id == state.build_id:
+        live = payload.id == state.build_id
+        if live:
             # Rename the live deck and persist it under the new name immediately
             # (even if it had no file yet), so the name isn't lost without a mutation.
             state.build_name = payload.name
-            _autosave(state)
         elif state.store is not None:
             record = state.store.load(payload.id)
             if record is not None:
                 state.store.save(payload.id, payload.name, record.get("deck") or {})
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        return _commit(state, persist=live)
 
     @app.delete("/api/builds/{build_id}")
     async def delete_build(build_id: str) -> dict:
@@ -792,11 +721,10 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         if deleted and build_id == state.build_id:
             # The live build's file was just deleted. Reset to a fresh build so the
             # next mutation's _autosave doesn't silently re-create the deleted id.
-            state.session = DeckSession(state.session.format)
-            state.build_id = uuid.uuid4().hex[:8]
-            state.build_name = "Untitled"
-            _reset_runtime_lanes(state)
-            _autosave(state)
+            engine.switch_build(
+                state, DeckSession(state.session.format), name="Untitled"
+            )
+            _commit(state)
         return {
             "deleted": deleted,
             "current": state.build_id,
@@ -822,8 +750,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
                 {"error": f"could not parse collection: {exc}"}, status_code=400
             )
         engine.set_collection(state, payload.slot, pile)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
+        snap = _commit(state, persist=False)  # a Collection is not the build
         # Warm the discovery caches for the just-imported slot in the background:
         # Starlette runs sync background tasks in the threadpool, so the ~65s cold cost
         # is paid there (off the event loop), not by the user's first discover. The
@@ -831,7 +758,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         # changed, which would warm eligibility for the wrong format.
         if state.bulk_available:
             background.add_task(
-                engine.warm_discovery_caches,
+                discovery.warm,
                 state,
                 payload.slot,
                 fmt=state.session.format,
@@ -849,9 +776,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
                 {"error": f"unknown collection slot: {payload.slot!r}"}, status_code=400
             )
         engine.clear_collection(state, payload.slot)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        return _commit(state, persist=False)
 
     @app.post("/api/commanders/discover", response_model=None)
     async def commanders_discover(
@@ -859,29 +784,33 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
     ) -> dict | JSONResponse:
         """Intent-ranked owned commanders from the active Collection slot (ADR-0018) —
         support-depth or novelty, theme/color filters, never EDHREC. Pure compute."""
+        engine.check_commander_family(state)
         if not state.bulk_available:
             return _no_bulk()
-        # Validate the theme like the sibling slot/format guards (a clean 400, not a
+        # Validate the themes like the sibling slot/format guards (a clean 400, not a
         # 500): theme_presets.matches raises KeyError on an unknown preset name.
-        if payload.theme and payload.theme not in list_presets():
+        unknown = [t for t in payload.themes if t not in list_presets()]
+        if unknown:
             return JSONResponse(
-                {"error": f"unknown theme preset: {payload.theme!r}"}, status_code=400
+                {"error": f"unknown theme preset: {unknown[0]!r}"}, status_code=400
             )
         slot = engine.active_slot(state)
         # discover_commanders is heavy CPU (scores every owned commander).
         # Offload it to a worker thread so it never blocks the event loop;
         # a blocking call here froze the whole hub for the run (~30s on a big
-        # collection). Same pattern as tune/goldfish. Pure read, thread-safe.
+        # collection). Same pattern as tune/goldfish. It fills discovery's caches
+        # from this worker thread; ``DiscoveryCache`` carries the lock.
         results = await run_in_threadpool(
-            engine.discover_commanders,
+            discovery.discover_commanders,
             state,
             sort=payload.sort,
             colors=payload.colors,
-            theme=payload.theme,
+            themes=tuple(payload.themes),
             limit=max(1, payload.limit),
         )
+        fmt = state.session.fmt
         return {
-            "results": results,
+            "results": [views.commander_view(row, fmt) for row in results],
             "sort": payload.sort,
             "active_slot": slot,
             "slot_size": collection.slot_sizes(state.collections).get(slot, 0),
@@ -889,15 +818,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.get("/api/export", response_model=None)
     async def export(fmt: str = "json") -> dict | JSONResponse:
-        deck = state.session.to_deck_dict()
-        # Resolve each chosen printing to its set/collector so the exporters can add the
-        # "(SET) <collector#>" suffix (printing picker, C). No-op for defaults.
-        for zone in views.VALID_ZONES:
-            for entry in deck.get(zone) or []:
-                record = state.printing_by_id.get(entry.get("printing_id") or "")
-                if record is not None:
-                    entry["set"] = record.get("set")
-                    entry["collector_number"] = record.get("collector_number")
+        deck = engine.export_deck_dict(state)
         if fmt == "json":
             return {"format": "json", "deck": deck}
         text = export_as(deck, fmt)
@@ -910,41 +831,25 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
     @app.post("/api/avenues")
     async def add_avenue(payload: AvenuePayload) -> dict:
         state.bridge.touch()
-        state.agent_avenue_seq += 1
-        avenue = {
-            "id": f"agent:{state.agent_avenue_seq}",
-            "label": payload.label,
-            "description": payload.description,
-            "scope": "",
-            "source": "agent",
-            "search": payload.search,
-        }
-        state.agent_avenues.append(avenue)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return {"avenue": avenue, **snap}
+        avenue = engine.add_agent_avenue(
+            state,
+            label=payload.label,
+            description=payload.description,
+            search=payload.search,
+        )
+        return {"avenue": avenue, **_commit(state, persist=False)}
 
     @app.delete("/api/avenues/{avenue_id}")
     async def remove_avenue(avenue_id: str) -> dict:
-        state.agent_avenues[:] = [
-            a for a in state.agent_avenues if a["id"] != avenue_id
-        ]
-        state.focused_avenue_ids.discard(avenue_id)  # a removed lane can't stay focused
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        engine.remove_avenue(state, avenue_id)
+        return _commit(state, persist=False)
 
     @app.post("/api/avenues/{avenue_id}/focus")
     async def focus_avenue(avenue_id: str) -> dict:
         """Toggle a lane as 'focused' (#2): the candidate ✦ score then counts only the
         focused lanes. Idempotent toggle so the pin button can flip it either way."""
-        if avenue_id in state.focused_avenue_ids:
-            state.focused_avenue_ids.discard(avenue_id)
-        else:
-            state.focused_avenue_ids.add(avenue_id)
-        snap = engine.snapshot(state)
-        state.hub.publish(json.dumps(snap))
-        return snap
+        engine.toggle_avenue_focus(state, avenue_id)
+        return _commit(state, persist=False)
 
     @app.post("/api/find", response_model=None)
     async def find(payload: SearchPayload) -> dict | JSONResponse:
@@ -962,13 +867,16 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         page = await run_in_threadpool(
             engine.find_candidates, state, _find_params(payload)
         )
-        fmt = state.session.format
+        fmt = state.session.fmt
+
         results = [
             views.candidate_view(
                 row,
                 fmt,
                 owned_qty=engine.owned_of(state, row["card"].get("name", "")),
                 unreleased=row["card"].get("oracle_id") in state.unreleased_ids,
+                copy_limit=engine.copy_limit(state, row["card"]),
+                coverage=engine.candidate_coverage(state, row["card"].get("name", "")),
             )
             for row in page.rows
         ]
@@ -976,11 +884,7 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
 
     @app.get("/api/audit")
     async def audit() -> dict:
-        return {
-            "warnings": engine.legality_warnings(
-                engine.hydrate_session(state), max_cards=state.session.deck_size
-            )
-        }
+        return {"warnings": engine.legality_warnings(engine.hydrate_session(state))}
 
     @app.post("/api/tune", response_model=None)
     async def tune(payload: TunePayload) -> dict | JSONResponse:
@@ -993,29 +897,29 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
         rarity, gated per tier (wildcards aren't interchangeable)."""
         if not state.bulk_available:
             return _no_bulk()
-        fmt = state.session.format
-        is_digital = state.session.medium == "digital"
-        params = TuneParams(
-            # Paper budgets in dollars; digital in per-rarity wildcards (a missing
-            # wildcard_budget on a digital build → all-zero → owned-only pass).
-            budget=None if is_digital else payload.budget,
-            wildcard_budget=(payload.wildcard_budget or {}) if is_digital else None,
-            # Cap high enough to FILL a near-empty deck (an under-sized build can need
-            # ~40+ adds to reach 100); the old 25 cap silently clamped large requests
-            # and starved the fill pass.
-            max_swaps=max(0, min(payload.max_swaps, 99)),
+        hd = engine.hydrate_session(state)
+        params = engine.tune_params(
+            state,
+            budget=payload.budget,
+            wildcard_budget=payload.wildcard_budget,
+            max_swaps=payload.max_swaps,
             shape_override=payload.shape_override,
             suggest_commander=payload.suggest_commander,
-            paper_only=engine.paper_only(fmt),
-            medium=state.session.medium,
+            exclude=payload.exclude,
+            # Read from the cache in the threadpool: a cold read parses the
+            # snapshot, which must not stall the event loop.
+            meta=await run_in_threadpool(
+                engine.meta_context, state, hd, payload.meta_archetype
+            ),
         )
         # run_tune does blocking work (a Commander Spellbook combos call + heavy bulk
         # searches); offload it to a worker thread so a slow combo lookup can't stall
         # the event loop and wedge the whole hub. Pure read of state, so thread-safe.
         return await run_in_threadpool(
             run_tune,
-            engine.hydrate_session(state),
-            search_fn=state.search_fn,
+            hd,
+            # A pool-bounded build searches its opened pool (and owns all of it).
+            search_fn=engine.search_for(state, hd),
             params=params,
             # The WHOLE active Collection slot, not the deck-scoped owned map: the tuner
             # costs CANDIDATE adds (not in the deck yet), so it must see every card you
@@ -1026,17 +930,98 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
             # ADR-0025: the tune scorecard must rank the SAME commander lanes
             # the avenues panel shows — folded-object signals included.
             resolve_object=state.object_resolver,
+            pool=engine.pool_owned(state),
         )
+
+    @app.get("/api/meta", response_model=None)
+    async def meta(
+        archetype: str | None = None,
+        ranks: str = "platinum+",
+        wildcards: str | None = None,
+        *,
+        previous: bool = False,
+    ) -> dict | JSONResponse:
+        """The Meta panel (ADR-0059): the arena-meta cache for this build's Arena
+        queue — ranking, field, the deck's meta archetype and its core, and the lists
+        the active Collection can build. Reads only the cache; Refresh fetches."""
+        try:
+            parsed = arena_meta.parse_ranks(ranks)
+            allowance = parse_wildcards(None, None, wildcards)
+        except (ValueError, click.BadParameter) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        hd = engine.hydrate_session(state)
+        return await run_in_threadpool(
+            engine.meta_report,
+            state,
+            hd,
+            archetype=archetype,
+            ranks=parsed,
+            previous=previous,
+            wildcards=allowance,
+        )
+
+    @app.post("/api/meta/refresh", response_model=None)
+    async def meta_refresh(payload: MetaRefreshPayload) -> dict | JSONResponse:
+        """Fetch this build's queue from Untapped (a headless browser, seconds), then
+        answer like ``GET /api/meta``. A 409 names what to do (sign in, install the
+        browser)."""
+        hd = engine.hydrate_session(state)
+        try:
+            await run_in_threadpool(
+                engine.refresh_meta,
+                state,
+                hd,
+                previous=payload.previous,
+                force=payload.force,
+            )
+        except untapped.MetaError as exc:
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "sign_in": isinstance(exc, untapped.SignInRequiredError),
+                },
+                status_code=409,
+            )
+        return await run_in_threadpool(
+            engine.meta_report, state, hd, previous=payload.previous
+        )
+
+    @app.get("/api/arena-wildcards")
+    async def arena_wildcards() -> dict:
+        """The player's Arena wildcard counts from this machine's ``Player.log``
+        (``wildcards: None`` when there's no log or it holds none) — the SPA seeds
+        its wildcard budget from them once per session (ADR-0059)."""
+        return await run_in_threadpool(engine.arena_wildcards)
+
+    @app.post("/api/meta/login")
+    async def meta_login() -> dict:
+        """Open the visible Untapped sign-in browser on this machine (the hub runs
+        locally) — ``arena-meta --login``'s window, without the terminal trip."""
+        if not state.meta_login_open:
+            state.meta_login_open = True
+
+            def run() -> None:
+                try:
+                    untapped.login()
+                except untapped.MetaError:
+                    pass
+                finally:
+                    state.meta_login_open = False
+
+            threading.Thread(target=run, daemon=True).start()
+        return {"started": True}
 
     @app.post("/api/finalize")
     async def finalize(payload: FinalizePayload) -> dict:
         fs = engine.finalize_state(state)
         land_fail = fs["land_status"] == "FAIL"
-        gated = land_fail and not payload.override
+        # Below the CR minimum is illegal, never overridable; the land gate is.
+        gated = fs["below_minimum"] or (land_fail and not payload.override)
         return {
             "finalized": not gated,
             "gated": gated,
-            "overridden": land_fail and payload.override,
+            # An override that could not lift the gate overrode nothing.
+            "overridden": land_fail and payload.override and not gated,
             **fs,
         }
 
@@ -1095,23 +1080,13 @@ def build_app(state: ForgeState, *, frontend_dist: Path | None = None) -> FastAP
             return JSONResponse(
                 {"error": f"combo lookup failed: {exc}"}, status_code=502
             )
-        # Enrich each combo's cards with hydrated views (image/type/price) + an in-deck
-        # flag, so the UI can render them as the same CardTiles as search/synergies.
-        in_deck = set(state.session.card_names())
-        fmt = state.session.format
-
-        def _card_views(names: list[str]) -> list[dict]:
-            return [
-                views.combo_card_view(
-                    name, state.by_name.get(name), in_deck=name in in_deck, fmt=fmt
-                )
-                for name in (names or [])
-            ]
-
-        for group in ("combos", "near_misses"):
-            for combo in result.get(group) or []:
-                combo["card_views"] = _card_views(combo.get("cards", []))
-        return result
+        return views.enrich_combos(
+            result,
+            state.by_name,
+            in_deck=engine.deck_names(state),
+            fmt=state.session.fmt,
+            coverage=functools.partial(engine.candidate_coverage, state),
+        )
 
     _register_frontend(app, frontend_dist)
     return app

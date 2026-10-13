@@ -37,7 +37,7 @@ keep their real diacritics, since that is the card's actual name.
 - **Knobs:** the `reduce` cost-mode (paper `keep_cheaper` USD vs Arena `_keep_lowest_rarity`
   wildcards — the *same* "what it costs to acquire", switched by medium; plus `deck`'s
   prefer-has-oracle tiebreak and first-seen), the `value` payload shape (full record vs
-  `{rarity, exempt_from_4cap}`), and the `prefilter` (layout / legality / set-type / draft-set).
+  `{rarity, free}` — was `{rarity, exempt_from_4cap}` until 2026-09-23, when the any-number exemption was found to contradict Arena's real 4-copies-is-unlimited rule), and the `prefilter` (layout / legality / set-type; the draft-set filter was dropped the same day, when ADR-0057 made the local Arena card database the rarity source).
 - **Collapsed (behavior-changing, on purpose):** the 3-pass alias mechanic, **every-face DFC
   handling** (front-face is now a deduped tier key everywhere), universal **NFKD folding**, the
   en-gate, and the `None`-price handling (priced beats price-less, deterministic among
@@ -62,7 +62,7 @@ MDFC / "prepare" card (e.g. `"Reflection of Kiki-Jiki"` of `"Emeritus of Woe // 
 silently missed; every-face, both-direction keying via `alias_keys` fixed it, pinned by a
 regression test.
 
-deck-forge's `production.build_by_name` folds too — `build_name_index(reduce=keep_cheaper)` → a
+deck-forge's name index (now `CardPool.by_name`, ADR-0046) folds too — `build_name_index(reduce=keep_cheaper)` → a
 `NameIndex`, so `ForgeState.by_name` is typed `Mapping[str, dict]`. `engine._signal_freq` dedups
 by card name, since a folding index yields the same record under several keys.
 

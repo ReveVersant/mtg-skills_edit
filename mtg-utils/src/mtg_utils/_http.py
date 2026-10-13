@@ -21,15 +21,35 @@ to GitHub) — a shared default doesn't mean every caller must use it.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 import urllib.request
-from typing import TYPE_CHECKING, Protocol
+from pathlib import Path
+from typing import Protocol
 
 import requests
 
-if TYPE_CHECKING:
-    from pathlib import Path
+# --- Cache root ----------------------------------------------------------------
+
+
+def cache_root() -> Path:
+    """The shared on-disk cache root: ``$MTG_SKILLS_CACHE_DIR`` when set (and
+    non-empty), else :func:`default_cache_root`. Each consumer keeps its own
+    subdirectory under it (``untapped/``, ``card-images/``, ``phase/``, …). The one
+    place this lookup lives; read the environment at call time, so a test's
+    ``monkeypatch.setenv`` takes effect."""
+    base = os.environ.get("MTG_SKILLS_CACHE_DIR")
+    return Path(base) if base else default_cache_root()
+
+
+def default_cache_root() -> Path:
+    """``~/.cache/mtg-skills``: the cache root when ``$MTG_SKILLS_CACHE_DIR`` is
+    unset. Only a search path that also looks past an override (``bulk_loader.
+    default_bulk_path``) reads it directly; everything else asks
+    :func:`cache_root`."""
+    return Path.home() / ".cache" / "mtg-skills"
+
 
 # --- User agent --------------------------------------------------------------
 

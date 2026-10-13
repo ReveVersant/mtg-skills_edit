@@ -1,0 +1,570 @@
+"""Tests for ``mtg_utils.formats`` — the one module that answers every format question.
+
+Legality runs against REAL cards from the committed snapshot (``testkit.test_card``),
+so the table-driven rules are proven on the record shape production reads, never on a
+hand-built ``legalities`` dict that can drift from it. Statuses below were verified
+against the MTGJSON bulk when the cards were added; a snapshot regen after a B&R
+change re-pins them.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from mtg_utils.formats import (
+    COMMANDER_FORMATS,
+    FORMATS,
+    Format,
+    Game,
+    family_size_choices,
+    format_options,
+    get_format,
+    is_special_basic_request,
+    medium_is_digital,
+)
+from mtg_utils.testkit import test_card, test_printing
+
+HB = FORMATS["historic_brawl"]
+CB = FORMATS["competitive_brawl"]
+CMD = FORMATS["commander"]
+
+
+# ---------- table ----------
+
+
+class TestTable:
+    def test_commander_family_is_every_format_with_a_command_zone(self):
+        assert COMMANDER_FORMATS == (
+            "commander",
+            "brawl",
+            "historic_brawl",
+            "competitive_brawl",
+        )
+        for name in COMMANDER_FORMATS:
+            assert FORMATS[name].has_commander
+            assert FORMATS[name].is_singleton
+            assert FORMATS[name].family == "commander"
+        assert FORMATS["modern"].family == "constructed"
+
+    def test_get_format_fails_loud(self):
+        assert get_format("brawl") is FORMATS["brawl"]
+        with pytest.raises(ValueError, match="Unknown format"):
+            get_format("made_up_format")
+
+    def test_competitive_brawl_table_row(self):
+        assert CB.legality_key == "competitivebrawl"
+        assert CB.is_arena_only
+        assert CB.arena_pool
+        assert not CB.free_mulligan
+        assert FORMATS["brawl"].free_mulligan
+        assert CB.multiplayer_life_total is None  # no multiplayer variant
+
+    def test_arena_pool_is_exactly_the_arena_defined_legality_keys(self):
+        gated = {f.name for f in FORMATS.values() if f.arena_pool}
+        assert gated == {
+            "brawl",
+            "historic_brawl",
+            "competitive_brawl",
+            "alchemy",
+            "historic",
+            "timeless",
+        }
+        # Standard / Pioneer are Arena formats whose pool is defined in paper.
+        assert FORMATS["standard"].is_arena
+        assert not FORMATS["standard"].arena_pool
+
+    def test_family_is_the_shape_rule_switch(self):
+        # Every family decision reads ``family`` — never a format name.
+        assert {f.family for f in FORMATS.values()} == {
+            "commander",
+            "constructed",
+            "limited",
+        }
+        assert format_options(()) == []
+        assert family_size_choices("commander") == (60, 100)
+        assert family_size_choices("constructed") == (60,)
+        assert family_size_choices("limited") == (40,)
+
+    def test_family_is_declared_and_validated_against_the_facts(self):
+        import dataclasses
+
+        assert FORMATS["modern"].family == "constructed"
+        assert FORMATS["sealed"].family == "limited"
+        assert FORMATS["commander"].family == "commander"
+        # A declared family the format's own facts contradict fails loud.
+        with pytest.raises(ValueError, match="family"):
+            dataclasses.replace(FORMATS["modern"], family="limited")
+        with pytest.raises(ValueError, match="family"):
+            dataclasses.replace(FORMATS["commander"], family="constructed")
+
+    def test_limited_is_pool_bounded(self):
+        # CR 100.2b: a 40-card minimum, as many duplicates as the product included,
+        # built from the opened product plus basic lands — so legality is pool
+        # membership (the audit's question), the sideboard is the unused pool, and
+        # there is no copy limit.
+        for name in ("sealed", "draft"):
+            fmt = FORMATS[name]
+            assert fmt.family == "limited"
+            assert fmt.pool_bounded is True
+            assert fmt.has_commander is False
+            assert fmt.max_copies is None
+            assert fmt.is_singleton is False
+            assert fmt.sideboard_size is None
+            assert (fmt.deck_size, fmt.min_deck_size, fmt.size_cap) == (40, 40, None)
+            assert fmt.size_is_minimum is True
+            assert fmt.media == ("digital", "paper")
+            assert fmt.legality({"name": "Anything", "legalities": {}}) == "legal"
+            assert fmt.is_legal({"name": "Anything"})
+            assert fmt.commander_eligibility(test_card("Thranduil, the Elvenking")) == {
+                "eligible": False,
+                "requires_partner": False,
+            }
+        assert Format.for_deck({"format": "sealed", "deck_size": 45}).deck_size == 45
+        # A build's size is its TARGET; the 40-card floor is the audit's
+        # (deck_minimum), so a smaller target is accepted, then audited short.
+        assert (
+            Format.for_deck({"format": "sealed", "deck_size": 30}).min_deck_size == 40
+        )
+        row = {r["id"]: r for r in format_options()}["sealed"]
+        assert row["family"] == "limited"
+        assert row["pool_bounded"] is True
+        assert row["max_copies"] is None
+        assert row["sideboard_size"] is None
+        assert [r["id"] for r in format_options()][-2:] == ["sealed", "draft"]
+
+    def test_a_larger_constructed_size_is_a_target_never_the_floor(self):
+        # An 80-card Yorion deck is still a 60-minimum Standard deck (CR 100.2a);
+        # Commander's size is exact, so its floor and cap are the size itself.
+        yorion = Format.for_deck({"format": "standard", "deck_size": 80})
+        assert (yorion.deck_size, yorion.min_deck_size, yorion.size_cap) == (
+            80,
+            60,
+            None,
+        )
+        assert (CMD.deck_size, CMD.min_deck_size, CMD.size_cap) == (100, 100, 100)
+
+    def test_medium_flags_must_agree(self):
+        with pytest.raises(ValueError, match="is_arena_only requires is_arena"):
+            replace(FORMATS["modern"], is_arena_only=True)
+        with pytest.raises(ValueError, match="primary_medium"):
+            replace(FORMATS["modern"], primary_medium="digital")
+        for name in COMMANDER_FORMATS:
+            assert FORMATS[name].family == "commander"
+            assert FORMATS[name].size_is_minimum is False
+        for name in ("standard", "modern", "vintage"):
+            assert FORMATS[name].family == "constructed"
+            assert FORMATS[name].has_commander is False
+            assert FORMATS[name].max_copies == 4
+            assert FORMATS[name].sideboard_size == 15
+            # CR 100.2a sets only a minimum for constructed.
+            assert FORMATS[name].size_is_minimum is True
+
+
+# ---------- legality (real cards) ----------
+
+
+class TestLegality:
+    def test_brawl_banned_card_is_legal_in_competitive_brawl(self):
+        # Mana Drain: ordinary Brawl bans it, Competitive Brawl's own key allows it.
+        drain = test_card("Mana Drain")
+        assert drain["legalities"]["brawl"] == "banned"
+        assert HB.legality(drain) == "banned"
+        assert CB.legality(drain) == "legal"
+        assert HB.is_legal(drain) is False
+        assert CB.is_legal(drain) is True
+
+    def test_competitive_brawl_bans_come_from_its_own_key(self):
+        # Ragavan is legal in ordinary Brawl but on Competitive Brawl's own list.
+        ragavan = test_card("Ragavan, Nimble Pilferer")
+        assert HB.legality(ragavan) == "legal"
+        assert CB.legality(ragavan) == "banned"
+        # A DFC banned by its front face — the by-name list this key replaced matched
+        # the record's "Front // Back" name and missed it.
+        assert CB.legality(test_card("Ajani, Nacatl Pariah")) == "banned"
+        assert CMD.legality(test_card("Oko, Thief of Crowns")) == "legal"
+        assert CB.legality(test_card("Oko, Thief of Crowns")) == "banned"
+
+    def test_paper_nadu_is_banned_after_the_rebalance_reversion(self):
+        # Arena reverted every rebalanced card on 2026-09-22; the paper Nadu took
+        # the A- card's place on Competitive Brawl's list, and the key says so.
+        assert CB.legality(test_card("Nadu, Winged Wisdom")) == "banned"
+
+    def test_restricted_and_banned_are_distinct_statuses(self):
+        lotus = test_card("Black Lotus")
+        assert FORMATS["vintage"].legality(lotus) == "restricted"
+        assert FORMATS["vintage"].is_legal(lotus) is True
+        assert CMD.legality(lotus) == "banned"
+        assert HB.legality(lotus) == "not_legal"
+
+    def test_a_card_not_on_arena_is_not_legal_in_competitive_brawl(self):
+        # Sol Ring has no Arena printing: not_legal under both Brawl keys.
+        ring = test_card("Sol Ring")
+        assert ring["arena_available"] is False
+        assert HB.legality(ring) == "not_legal"
+        assert CB.legality(ring) == "not_legal"
+        assert CMD.legality(ring) == "legal"
+
+    def test_unreleased_is_reported_only_with_the_oracle_set(self):
+        ring = test_card("Sol Ring")
+        assert HB.legality(ring) == "not_legal"
+        pre = frozenset({ring["oracle_id"]})
+        assert HB.legality(ring, unreleased=pre) == "unreleased"
+        # Never widens a card that carries a real status.
+        assert CMD.legality(ring, unreleased=pre) == "legal"
+        lotus = test_card("Black Lotus")
+        assert (
+            CMD.legality(lotus, unreleased=frozenset({lotus["oracle_id"]})) == "banned"
+        )
+        # ``is_legal`` stays strict: pre-release is a widening callers opt into.
+        assert HB.is_legal(ring, unreleased=pre) is False
+
+    def test_arena_pool_gate_reads_oracle_level_availability(self):
+        # A record the adapter marks as having NO Arena printing is not legal in an
+        # Arena-pool format even when MTGJSON's key says legal; a paper-pool format
+        # (Commander) ignores availability. No real card exercises this today — the
+        # bulk has zero oracles that are `brawl`-legal without an Arena printing
+        # (MTGJSON has cleaned up the pw24 Lord of Atlantis case the adapter's gate
+        # was written for) — so the gate is proven on a real record with the field
+        # flipped, and the no-evidence contract on a hand-built one.
+        drain = test_card("Mana Drain")
+        assert CB.legality(drain) == "legal"
+        assert CB.legality({**drain, "arena_available": False}) == "not_legal"
+        assert CMD.legality({**drain, "arena_available": False}) == "legal"
+        no_evidence = {"name": "X", "legalities": {"brawl": "legal"}}
+        assert HB.legality(no_evidence) == "legal"
+
+    def test_unreleased_flag_form(self):
+        # ``unreleased=True`` is the per-record form the hub's views use once the
+        # caller has established the card is pre-release.
+        ring = test_card("Sol Ring")
+        assert HB.legality(ring, unreleased=True) == "unreleased"
+        vehicle = {**ring, "type_line": "Legendary Artifact — Vehicle"}
+        assert HB.commander_eligibility(vehicle, unreleased=True)["eligible"]
+
+    def test_real_records_carry_the_availability_field(self):
+        # The snapshot projection keeps ``arena_available`` so the gate is live on
+        # real records, not only on hand-built ones.
+        assert test_card("Sol Ring")["arena_available"] is False
+        assert test_card("Mana Drain")["arena_available"] is True
+
+
+# ---------- commander eligibility ----------
+
+
+class TestCommanderEligibility:
+    def test_legal_legend_is_eligible(self):
+        thranduil = test_card("Thranduil, the Elvenking")
+        assert HB.commander_eligibility(thranduil)["eligible"] is True
+        assert CMD.commander_eligibility(thranduil)["eligible"] is True
+
+    def test_planeswalker_rule_is_the_formats(self):
+        chandra = test_card("Chandra, Torch of Defiance")
+        # Brawl family: any legendary planeswalker; Commander needs the text.
+        assert HB.commander_eligibility(chandra)["eligible"] is True
+        assert CMD.commander_eligibility(chandra)["eligible"] is False
+
+    def test_legality_gates_eligibility(self):
+        # Ashiok, Dream Render isn't Standard-legal, so it can't lead a (Standard)
+        # Brawl deck. (Chandra, Torch of Defiance served here until a reprint made her
+        # Standard-legal.)
+        ashiok = test_card("Ashiok, Dream Render")
+        assert FORMATS["brawl"].commander_eligibility(ashiok)["eligible"] is False
+        # A banned legend is never eligible, however legendary.
+        assert (
+            CB.commander_eligibility(test_card("Oko, Thief of Crowns"))["eligible"]
+            is False
+        )
+
+    def test_no_command_zone_means_nothing_is_eligible(self):
+        # Ragavan is Modern-legal and legendary; Modern has no commanders.
+        ragavan = test_card("Ragavan, Nimble Pilferer")
+        assert FORMATS["modern"].legality(ragavan) == "legal"
+        assert FORMATS["modern"].commander_eligibility(ragavan) == {
+            "eligible": False,
+            "requires_partner": False,
+        }
+
+    def test_unreleased_legend_is_eligible_with_the_set(self):
+        # Pre-release brewing: a spoiled legend reads not_legal everywhere until
+        # release day; the widening admits exactly it.
+        legend = {
+            "name": "Spoiled Legend",
+            "oracle_id": "oid-pre",
+            "type_line": "Legendary Creature — Elf",
+            "legalities": {"brawl": "not_legal"},
+        }
+        assert HB.commander_eligibility(legend)["eligible"] is False
+        out = HB.commander_eligibility(legend, unreleased=frozenset({"oid-pre"}))
+        assert out["eligible"] is True
+
+
+# ---------- medium & size ----------
+
+
+class TestMediumAndSize:
+    def test_media_and_default(self):
+        assert CMD.media == ("paper",)
+        assert CMD.default_medium == "paper"
+        assert HB.media == ("digital", "paper")
+        assert HB.default_medium == "digital"
+        assert CB.media == ("digital",)
+        assert CB.default_medium == "digital"
+        assert FORMATS["modern"].media == ("paper",)
+        # Paper-defined formats Arena also hosts default to paper; the Arena-only
+        # constructed formats never offer paper.
+        for name in ("standard", "pioneer"):
+            assert FORMATS[name].media == ("paper", "digital"), name
+            assert FORMATS[name].default_medium == "paper", name
+        for name in ("alchemy", "historic", "timeless"):
+            assert FORMATS[name].media == ("digital",), name
+            assert FORMATS[name].is_arena_only, name
+
+    def test_resolve_medium_honours_only_allowed_overrides(self):
+        assert HB.resolve_medium("paper") == "paper"
+        assert HB.resolve_medium(None) == "digital"
+        assert CMD.resolve_medium("digital") == "paper"  # commander is paper-only
+        assert CB.resolve_medium("paper") == "digital"  # Arena-only
+
+    def test_multiplayer_and_starting_life_follow_medium(self):
+        # Arena is one-on-one for every format; a paper table is multiplayer iff the
+        # format has a multiplayer variant, at that variant's life total.
+        assert CMD.is_multiplayer("paper") is True
+        assert CMD.starting_life("paper") == 40
+        assert HB.is_multiplayer("digital") is False
+        assert HB.starting_life("digital") == 25
+        assert HB.is_multiplayer("paper") is True
+        assert HB.starting_life("paper") == 30
+        assert CB.is_multiplayer("digital") is False
+        assert CB.starting_life("digital") == 25
+        assert FORMATS["standard"].is_multiplayer("paper") is False
+        assert FORMATS["standard"].starting_life("paper") == 20
+
+    def test_game_resolves_life_table_and_commander_damage(self):
+        # Commander damage is Commander's extra loss rule (CR 903.10a); Brawl games do
+        # not use it in any medium (CR 903.12h).
+        assert CMD.game("paper") == Game(
+            medium="paper", life=40, multiplayer=True, commander_damage=True
+        )
+        assert HB.game("digital") == Game(
+            medium="digital", life=25, multiplayer=False, commander_damage=False
+        )
+        assert HB.game("paper") == Game(
+            medium="paper", life=30, multiplayer=True, commander_damage=False
+        )
+        assert CB.game(None).commander_damage is False
+        # An override the format cannot honour resolves like resolve_medium.
+        assert CMD.game("digital").medium == "paper"
+        assert FORMATS["standard"].game("paper").life == 20
+
+    def test_medium_is_digital_is_the_one_string_compare(self):
+        assert medium_is_digital("digital") is True
+        assert medium_is_digital("paper") is False
+
+    def test_cost_mode_follows_medium(self):
+        assert Format.cost_mode("digital") == "wildcards"
+        assert Format.cost_mode("paper") == "usd"
+
+    def test_arena_playset_covers_any_quantity_of_an_any_number_card(self):
+        # Four Hare Apparent ("any number") fill all seventeen slots on Arena; paper
+        # buys the thirteen it lacks.
+        assert Format.copies_short("digital", "Hare Apparent", 17, 4) == 0
+        assert Format.copies_short("paper", "Hare Apparent", 17, 4) == 13
+
+    def test_arena_playset_covers_an_up_to_n_card(self):
+        assert Format.copies_short("digital", "Seven Dwarves", 7, 4) == 0
+        assert Format.copies_short("paper", "Seven Dwarves", 7, 4) == 3
+
+    def test_below_a_playset_arena_covers_only_what_you_own(self):
+        # The near miss: three Hare Apparent are three copies, not a playset.
+        assert Format.copies_short("digital", "Hare Apparent", 17, 3) == 14
+        # A four-of with three owned is one short in either medium.
+        assert Format.copies_short("digital", "Lightning Bolt", 4, 3) == 1
+        assert Format.copies_short("paper", "Lightning Bolt", 4, 3) == 1
+
+    def test_basics_are_owned_in_every_medium(self):
+        for medium in ("paper", "digital"):
+            assert Format.copies_short(medium, "Forest", 20, 0) == 0
+            assert Format.copies_short(medium, "Wastes", 3, 0) == 0
+            # Snow-Covered basics are different cards, collected like any other.
+            assert Format.copies_short(medium, "Snow-Covered Forest", 2, 0) == 2
+
+    def test_a_special_basic_printing_counts_only_its_own_copies_in_paper(self):
+        # requested_owned: copies of the special printing the entry asks for.
+        assert Format.copies_short("paper", "Forest", 2, 30, requested_owned=0) == 2
+        assert Format.copies_short("paper", "Forest", 2, 30, requested_owned=2) == 0
+        # Arena's basic styles are cosmetic: any Forest is free.
+        assert Format.copies_short("digital", "Forest", 2, 0, requested_owned=0) == 0
+        # The request matters only for a basic land type.
+        assert Format.copies_short("paper", "Opt", 1, 1, requested_owned=0) == 0
+
+    def test_paper_only_follows_the_medium_not_is_arena(self):
+        # The search pool is the MEDIUM's: a paper Historic Brawl table buys paper
+        # printings even though the format `is_arena`.
+        assert HB.paper_only("paper") is True
+        assert HB.paper_only("digital") is False
+        assert HB.paper_only(None) is False  # defaults digital
+        # An override the format cannot honour resolves first (Commander is paper).
+        assert CMD.paper_only("digital") is True
+        assert CMD.paper_only() is True
+
+    def test_size_choices_only_paper_historic_brawl_may_choose(self):
+        assert HB.size_choices("paper") == (60, 100)
+        assert HB.size_choices("digital") == (100,)
+        assert CMD.size_choices("paper") == (100,)
+        assert FORMATS["brawl"].size_choices("digital") == (60,)
+
+    def test_resolve_deck_size_override_lies_dormant_unless_choosable(self):
+        assert HB.resolve_deck_size(60, "paper") == 60
+        assert HB.resolve_deck_size(60, "digital") == 100
+        assert HB.resolve_deck_size(None, "paper") == 100
+        assert CMD.resolve_deck_size(60, "paper") == 100
+        # Constructed sizes are minimums, not a choice list: any valid size holds.
+        assert FORMATS["standard"].resolve_deck_size(80, "paper") == 80
+        assert CMD.resolve_deck_size(80, "paper") == 100  # exact-size family
+        assert FORMATS["standard"].resolve_deck_size(0, "paper") == 60
+        assert FORMATS["standard"].resolve_deck_size(None, "digital") == 60
+
+    def test_size_rule_citations(self):
+        for name in COMMANDER_FORMATS:
+            assert FORMATS[name].size_rule, name
+        assert FORMATS["brawl"].size_rule == "CR 903.12d"
+        assert CB.size_rule == "CR 903.5a"
+        assert FORMATS["standard"].size_rule is None
+
+
+# ---------- for_deck ----------
+
+
+class TestSpecialBasicRequest:
+    def test_a_plain_set_pin_is_not_special(self):
+        # "Forest (M21) 274" from an export.
+        m21 = test_printing("Forest", "m21", "274")
+        assert not is_special_basic_request("Forest", {}, m21)
+        assert not is_special_basic_request("Forest", {"finish": "nonfoil"}, None)
+
+    def test_product_and_distribution_tags_are_not_special(self):
+        # Near misses: ordinary black-bordered basics MTGJSON tags with where they
+        # were sold — they must stay owned in paper.
+        for set_code, number, tags in (
+            ("ltr", "270", ["universesbeyond"]),
+            ("fdn", "280", ["beginnerbox", "startercollection"]),
+            ("mh3", "318", ["bundle"]),
+        ):
+            plain = test_printing("Forest", set_code, number, promo_types=tags)
+            assert not is_special_basic_request("Forest", {}, plain), set_code
+
+    def test_a_foil_or_etched_finish_is_special(self):
+        assert is_special_basic_request("Forest", {"finish": "foil"}, None)
+        m21 = test_printing("Forest", "m21", "274")
+        assert is_special_basic_request("Forest", {"finish": "etched"}, m21)
+
+    def test_a_visually_special_printing_is_special(self):
+        for style in (
+            {"full_art": True},
+            {"border_color": "borderless"},
+            {"frame_effects": ["showcase"]},
+            {"frame_effects": ["extendedart"]},
+            {"promo": True},
+            {"promo_types": ["boosterfun"]},
+            {"promo_types": ["surgefoil"]},
+        ):
+            printing = test_printing("Forest", "xxx", "1", **style)
+            assert is_special_basic_request("Forest", {}, printing), style
+
+    def test_only_a_basic_land_type_qualifies(self):
+        # Snow-Covered Forest is its own card; a foil one is just a foil card.
+        snow = test_printing("Snow-Covered Forest", "khm", "285", full_art=True)
+        assert not is_special_basic_request(
+            "Snow-Covered Forest", {"finish": "foil"}, snow
+        )
+
+
+class TestForDeck:
+    def test_defaults_to_commander(self):
+        assert Format.for_deck({}) is CMD
+
+    def test_applies_a_legal_explicit_size(self):
+        fmt = Format.for_deck({"format": "historic_brawl", "deck_size": 60})
+        assert fmt.deck_size == 60
+        assert fmt.name == "historic_brawl"
+        # Everything else is the table's row.
+        assert fmt.legality_key == "brawl"
+        assert Format.for_deck({"format": "historic_brawl", "deck_size": 100}) is HB
+
+    def test_all_size_choices_spans_every_medium(self):
+        assert HB.all_size_choices == (60, 100)
+        assert CMD.all_size_choices == (100,)
+        assert FORMATS["brawl"].all_size_choices == (60,)
+
+    def test_commander_family_rejects_an_impossible_size(self):
+        with pytest.raises(ValueError, match="deck_size 73 is not legal for commander"):
+            Format.for_deck({"format": "commander", "deck_size": 73})
+        with pytest.raises(ValueError, match="expected \\[60, 100\\]"):
+            Format.for_deck({"format": "historic_brawl", "deck_size": 99})
+
+    def test_constructed_accepts_any_size(self):
+        # An 80-card Yorion deck and a 40-card limited pool both label themselves
+        # with the constructed format whose legality they borrow.
+        assert Format.for_deck({"format": "standard", "deck_size": 80}).deck_size == 80
+        assert Format.for_deck({"format": "timeless", "deck_size": 40}).deck_size == 40
+
+    def test_unknown_format_raises(self):
+        with pytest.raises(ValueError, match="Unknown format"):
+            Format.for_deck({"format": "made_up_format"})
+
+    def test_values_are_frozen(self):
+        with pytest.raises(AttributeError):
+            CMD.deck_size = 99  # type: ignore[misc]
+        assert replace(CMD, deck_size=99).deck_size == 99
+        assert CMD.deck_size == 100
+
+
+# ---------- SPA table ----------
+
+
+class TestSpaTable:
+    def test_format_options_is_every_format_in_table_order(self):
+        rows = format_options()
+        assert [r["id"] for r in rows] == list(FORMATS)
+        assert [r["id"] for r in format_options(COMMANDER_FORMATS)] == list(
+            COMMANDER_FORMATS
+        )
+        by_id = {r["id"]: r for r in rows}
+        assert by_id["commander"] == {
+            "id": "commander",
+            "label": "Commander",
+            "family": "commander",
+            "family_label": "Commander",
+            "has_commander": True,
+            "pool_bounded": False,
+            "max_copies": 1,
+            "sideboard_size": 0,
+            "size_is_minimum": False,
+            "media": ["paper"],
+            "arena_meta": False,
+            "medium_labels": {"paper": "Paper"},
+            "default_medium": "paper",
+            "deck_size": 100,
+            "size_choices": {"paper": [100]},
+        }
+        assert by_id["historic_brawl"]["size_choices"] == {
+            "digital": [100],
+            "paper": [60, 100],
+        }
+        assert by_id["competitive_brawl"]["media"] == ["digital"]
+        # Only a format with an Arena queue Untapped tracks gets the Meta panel.
+        assert by_id["competitive_brawl"]["arena_meta"] is True
+        assert by_id["brawl"]["arena_meta"] is False
+        assert by_id["sealed"]["arena_meta"] is False
+        # The family facts the SPA keys its zones, stepper and pills off.
+        modern = by_id["modern"]
+        assert modern["family"] == "constructed"
+        assert modern["has_commander"] is False
+        assert modern["max_copies"] == 4
+        assert modern["sideboard_size"] == 15
+        assert modern["size_is_minimum"] is True
+        assert modern["media"] == ["paper"]
+        assert by_id["standard"]["media"] == ["paper", "digital"]
+        assert by_id["alchemy"]["media"] == ["digital"]

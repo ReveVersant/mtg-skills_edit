@@ -3,16 +3,39 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import click
 
 from mtg_utils.card_classify import get_oracle_text, is_land
-from mtg_utils.hydrated_deck import HydratedDeck
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
+from mtg_utils.hydrated_deck import records_from_file
+
+
+def _face_stats(card: dict) -> str:
+    """One face's printed stats: power/toughness, else loyalty, else defense."""
+    if card.get("power") is not None and card.get("toughness") is not None:
+        return f"{card['power']}/{card['toughness']}"
+    if card.get("loyalty") is not None:
+        return f"Loyalty {card['loyalty']}"
+    if card.get("defense") is not None:
+        return f"Defense {card['defense']}"
+    return ""
+
+
+def card_stats(card: dict) -> str:
+    """A card's stats for the table: the top-level record's when it carries them (an
+    adventure's creature), else each face's joined by `` // `` (a transforming or
+    modal card carries its stats on the faces; a face without any shows ``—``)."""
+    if top := _face_stats(card):
+        return top
+    faces = [_face_stats(face) for face in card.get("card_faces") or []]
+    return " // ".join(f or "—" for f in faces) if any(faces) else ""
 
 
 def card_summary(
-    hydrated: list[dict | None],
+    hydrated: Sequence[dict | None],
     *,
     lands_only: bool = False,
     nonlands_only: bool = False,
@@ -33,7 +56,7 @@ def card_summary(
         return "No cards match the given filters."
 
     # Build table rows
-    headers = ["Name", "Cost", "CMC", "Type", "Oracle Text"]
+    headers = ["Name", "Cost", "CMC", "Type", "Stats", "Oracle Text"]
     rows: list[list[str]] = []
     for card in cards:
         oracle = get_oracle_text(card)
@@ -47,6 +70,7 @@ def card_summary(
                 card.get("mana_cost", "") or "",
                 str(card.get("cmc", 0.0)),
                 card.get("type_line", ""),
+                card_stats(card),
                 oracle,
             ]
         )
@@ -70,46 +94,44 @@ def card_summary(
 
 
 @click.command()
-@click.argument("hydrated_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option("--lands-only", is_flag=True, default=False, help="Show only lands.")
 @click.option(
     "--nonlands-only", is_flag=True, default=False, help="Show only non-lands."
 )
 @click.option("--type", "type_filter", default=None, help="Filter by type line.")
 @click.option(
-    "--deck",
-    "deck_path",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Parsed deck JSON (enables --sideboard).",
-)
-@click.option(
     "--sideboard",
     is_flag=True,
     default=False,
-    help="Show only sideboard cards (requires --deck).",
+    help="Show the sideboard instead of the mainboard (deck JSON only).",
 )
 def main(
-    hydrated_path: Path,
+    path: Path,
+    bulk_data: Path | None,
     *,
     lands_only: bool,
     nonlands_only: bool,
     type_filter: str | None,
-    deck_path: Path | None,
     sideboard: bool,
 ) -> None:
-    """Format hydrated card data as a compact readable table."""
-    if sideboard:
-        if deck_path is None:
-            raise click.UsageError("--sideboard requires --deck")
-        # The deck owns the join: from_paths reads both files (raising on a stub
-        # hydrated file), and entries() pairs each distinct sideboard entry with its
-        # alias-resolved record in one walk — the replacement for _filter_to_section.
-        # card_summary drops the None misses itself, so no filter is needed here.
-        hd = HydratedDeck.from_paths(deck_path, hydrated_path)
-        hydrated = [rec for _, rec in hd.entries(zones=("sideboard",))]
+    """Print a compact card table for PATH: a parsed deck JSON (mainboard, or
+    --sideboard), or a JSON list of card records (e.g. a scryfall-lookup --batch
+    cache of candidates)."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    hydrated: Sequence[dict | None]
+    if isinstance(payload, list) or "records" in payload:
+        # A records list (a scryfall-lookup --batch cache) or a hydrated sidecar.
+        if sideboard:
+            raise click.UsageError("--sideboard needs a deck JSON, not a record list")
+        hydrated = records_from_file(path)
     else:
-        hydrated = json.loads(hydrated_path.read_text(encoding="utf-8"))
+        # The deck owns the join; entries() pairs each entry with its alias-resolved
+        # record in one walk and card_summary drops the None misses itself.
+        hd = acquire_for_cli(path, bulk_data)
+        zones = ("sideboard",) if sideboard else ("commanders", "cards")
+        hydrated = [rec for _, rec in hd.entries(zones=zones)]
     output = card_summary(
         hydrated,
         lands_only=lands_only,

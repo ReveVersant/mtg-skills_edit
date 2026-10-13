@@ -5,8 +5,7 @@
   // the card object is still resolving (or unresolvable), it degrades to a plain
   // name pill — never a broken image.
   import { hoverPreview } from "../lib/hover.js";
-  import { applySnapshot } from "../lib/store.js";
-  import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
   import { displayName } from "../lib/cards.js";
 
   export let name;
@@ -21,11 +20,11 @@
   $: shown = displayName(name);
 
   let adding = false;
+  let addError = "";
   async function add() {
     if (adding) return;
     adding = true;
-    const r = await api.add(name, "cards", 1);
-    if (r.ok) applySnapshot(r.data);
+    addError = await tryAdd(name, "cards");
     adding = false;
   }
 </script>
@@ -39,7 +38,7 @@
   >
     {#if art}<img class="thumb" src={art} alt="" loading="lazy" />{/if}
     <span class="nm">{shown}</span>
-  </button>
+  </button>{#if addError}<span class="chip-err">{addError}</span>{/if}
 {:else if card}
   <span class="cardchip static" use:hoverPreview={card}>
     {#if art}<img class="thumb" src={art} alt="" loading="lazy" />{/if}
@@ -50,6 +49,12 @@
 {/if}
 
 <style>
+  .chip-err {
+    display: block;
+    color: var(--fail);
+    font-size: 0.78rem;
+  }
+
   .cardchip {
     display: inline-flex;
     align-items: center;

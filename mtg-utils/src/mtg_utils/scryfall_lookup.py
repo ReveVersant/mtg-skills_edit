@@ -1,4 +1,11 @@
-"""Scryfall card lookup against bulk data with API fallback."""
+"""Card lookup against the card pool, with Scryfall's per-card endpoint as the
+cache-miss fallback (ADR-0005 / ADR-0033).
+
+``lookup_single`` and ``lookup_cards`` serve the bulk's own adapter record — the ONE
+record shape every consumer reads (ADR-0046) — and only the single-card CLI mode prints
+a terminal-sized projection of it (``display_fields``). The Scryfall fetch is strictly
+the cache-miss path: a card newer than the last ``download-mtgjson``.
+"""
 
 import contextlib
 import hashlib
@@ -12,20 +19,27 @@ import click
 import requests
 
 from mtg_utils._http import USER_AGENT
-from mtg_utils._name_index import NameIndex, build_name_index, keep_cheaper
+from mtg_utils._name_index import NameIndex
 from mtg_utils._sidecar import atomic_write_json
-from mtg_utils.bulk_loader import load_bulk_cards
-from mtg_utils.card_classify import (
-    SKIP_LAYOUTS,
-    get_oracle_text,
-    has_copy_limit_exemption,
-)
-from mtg_utils.names import normalize_card_name
+from mtg_utils.card_classify import get_oracle_text
+from mtg_utils.card_pool import CardPool
+
+__all__ = [
+    "DISPLAY_FIELDS",
+    "build_digest",
+    "display_fields",
+    "fetch_card",
+    "lookup_cards",
+    "lookup_single",
+]
 
 SCRYFALL_NAMED_URL = "https://api.scryfall.com/cards/named"
 RATE_LIMIT_DELAY = 0.1
 
-CARD_FIELDS = [
+# The fields a terminal read of one card wants (``scryfall-lookup <name>`` and
+# ``card-search --json``): a DISPLAY projection, never the hydration shape — hydration
+# serves the full record, so a field can't go missing on one path and not the other.
+DISPLAY_FIELDS = (
     "id",
     "name",
     "oracle_id",
@@ -35,19 +49,10 @@ CARD_FIELDS = [
     "mana_cost",
     "cmc",
     "type_line",
-    # Creature size. The MTGJSON adapter maps these, but they were absent from
-    # this list, so every hydrated card was blind to P/T. Survivable in Commander,
-    # disqualifying in Limited — where body size is the primary evaluation axis.
     "power",
     "toughness",
     "loyalty",
     "defense",
-    # Required for the four fields above to mean anything on a double-faced card:
-    # the adapter only writes top-level P/T for _TOP_PT_LAYOUTS ({flip, adventure}),
-    # so transform / modal_dfc / meld carry power, toughness, mana_cost and colors
-    # ONLY here. Without it, MDFCs stay blind to P/T and playtest._card_pips's
-    # documented card_faces fallback — which exists so MDFC-heavy pools don't
-    # under-report color screw — is dead code on hydrated input.
     "card_faces",
     "keywords",
     "colors",
@@ -55,137 +60,27 @@ CARD_FIELDS = [
     "produced_mana",
     "prices",
     "legalities",
+    "arena_available",
     "rarity",
     "game_changer",
-    # Card-quality signal the tuner's fringe/upgrade logic reads (classify.is_fringe).
-    # MTGJSON populates it (adapter sets edhrec_rank); dropping it here made EVERY
-    # hydrated card look unranked → fringe, so the swap proposer cut premium staples.
     "edhrec_rank",
-]
-
-RARITY_ORDER = {
-    "common": 0,
-    "uncommon": 1,
-    "rare": 2,
-    "mythic": 3,
-    "special": 2,
-    "bonus": 2,
-}
-
-# Digital-only Arena draft sets whose rarities reflect limited design,
-# not Arena wildcard cost.  Reprints in these sets are excluded from the
-# Arena rarity index so the "real" printing's rarity wins.  E.g.,
-# Lightning Bolt is common in J21 (for draft) but uncommon on Arena
-# (STA/FCA — the actual wildcard cost).
-_DRAFT_RARITY_SETS = frozenset({"j21", "jmp", "ajmp"})
+)
 
 
-def _load_bulk_index(bulk_path: Path) -> NameIndex:
-    """Load bulk data into a folding name index, keeping the cheapest printing.
-
-    Keyed by canonical name, every DFC face, and Arena printed_name / flavor_name
-    (NFKD-folded for diacritic- and case-robust lookups) via the shared name-index core.
-    When printings share a key the cheapest USD one wins — a priced printing beats a
-    price-less one.
-    """
-    return build_name_index(
-        load_bulk_cards(bulk_path),
-        reduce=keep_cheaper,
-        prefilter=lambda card: card.get("layout") not in SKIP_LAYOUTS,
-    )
-
-
-def _keep_lowest_rarity(existing: dict, new: dict) -> dict:
-    """Arena acquisition-cost reducer: a card's wildcard cost is the LOWEST rarity among
-    its legal printings, so the lower ``RARITY_ORDER`` rank wins."""
-    existing_rank = RARITY_ORDER.get(existing.get("rarity", "rare"), 2)
-    new_rank = RARITY_ORDER.get(new.get("rarity", "rare"), 2)
-    return new if new_rank < existing_rank else existing
-
-
-def build_rarity_index(
-    bulk_path: Path,
-    legality_key: str,
-    *,
-    arena_only: bool = False,
-    ignore_key_bans: bool = False,
-    banned_cards: frozenset[str] | None = None,
-) -> NameIndex:
-    """Build a folding ``name -> {rarity, exempt_from_4cap}`` index.
-
-    For Arena formats, a card's wildcard cost equals its lowest rarity among
-    printings available in that format.  When *arena_only* is True, only
-    printings that exist on Arena (``"arena" in games``) are considered.
-
-    Some digital-only Arena sets (J21, JMP, AJMP) assign rarities for
-    draft/limited purposes that don't match the wildcard cost Arena
-    charges.  Reprints in these sets are excluded from rarity
-    consideration so that the "real" Arena printing's rarity wins.
-    Non-reprints (cards exclusive to these sets) are kept because they
-    have no alternative printing to defer to.
-
-    ``exempt_from_4cap`` is True for cards whose oracle text opts out of the
-    standard 4-copy limit ("A deck can have any number of cards named X"
-    or "A deck can have up to N cards named X"). Arena normally treats
-    ownership of 4 copies as infinite because no legal deck can need a
-    5th, but that substitution does not apply to exempt cards — a deck
-    can legitimately want 17 Hare Apparent.
-
-    *ignore_key_bans* / *banned_cards* mirror ``legality_audit.check_format_legality``
-    for formats that share another format's legality key but not its ban list
-    (Arena's Competitive Brawl reads ``brawl`` yet legalizes everything that key
-    marks ``banned``, enforcing its own list by name). Without them the index
-    silently drops owned, legal staples like Force of Will and ``price-check``
-    reports them as "illegal or not on Arena". ``not_legal`` is still excluded
-    under the override: it means the card is absent from the pool.
-    """
-    banned_names = {normalize_card_name(n) for n in (banned_cards or ())}
-    admitted = (
-        ("legal", "restricted", "banned")
-        if ignore_key_bans
-        else ("legal", "restricted")
-    )
-
-    def _legal(card: dict) -> bool:
-        if card.get("layout") in SKIP_LAYOUTS:
-            return False
-        if card.get("legalities", {}).get(legality_key) not in admitted:
-            return False
-        if banned_names and normalize_card_name(card.get("name", "")) in banned_names:
-            return False
-        if arena_only and "arena" not in (card.get("games") or []):
-            return False
-        # Reprints in digital-only draft sets carry limited-design rarities that don't
-        # reflect Arena's wildcard cost; defer to the real printing.
-        return not (
-            arena_only
-            and card.get("set", "") in _DRAFT_RARITY_SETS
-            and card.get("reprint", False)
-        )
-
-    def _rarity(card: dict) -> dict:
-        rarity = card.get("rarity", "rare")
-        return {
-            "rarity": "rare" if rarity in ("special", "bonus") else rarity,
-            "exempt_from_4cap": has_copy_limit_exemption(card),
-        }
-
-    return build_name_index(
-        load_bulk_cards(bulk_path),
-        reduce=_keep_lowest_rarity,
-        value=_rarity,
-        prefilter=_legal,
-    )
-
-
-def _extract_fields(card: dict) -> dict:
-    result = {field: card.get(field) for field in CARD_FIELDS}
+def display_fields(card: dict) -> dict:
+    """The terminal projection of a record: ``DISPLAY_FIELDS``, None where the card
+    has no such field (so a table renderer can index every column), with a multi-face
+    card's oracle text assembled from its faces."""
+    result = {field: card.get(field) for field in DISPLAY_FIELDS}
     if result["oracle_text"] is None:
         result["oracle_text"] = get_oracle_text(card) or None
     return result
 
 
-def _api_lookup(name: str) -> dict | None:
+def fetch_card(name: str) -> dict | None:
+    """Scryfall's per-card endpoint (fuzzy name): the cache-miss path for a card the
+    bulk doesn't carry yet. The raw record (Scryfall's shape, which the MTGJSON adapter
+    mirrors), or ``None`` on a 404."""
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
     try:
@@ -196,7 +91,7 @@ def _api_lookup(name: str) -> dict | None:
             return None
 
         resp.raise_for_status()
-        return _extract_fields(resp.json())
+        return resp.json()
     finally:
         # Close so a batch lookup (one call per name) doesn't leak pooled sockets.
         session.close()
@@ -207,15 +102,17 @@ def lookup_single(
     bulk_path: Path | None = None,
     bulk_index: NameIndex | None = None,
 ) -> dict | None:
+    """The record for *name*: from *bulk_index* (or the pool at *bulk_path*), else
+    :func:`fetch_card`. ``None`` when neither knows the card."""
     if bulk_index is None and bulk_path is not None:
-        bulk_index = _load_bulk_index(bulk_path)
+        bulk_index = CardPool.load(bulk_path).by_name
 
     if bulk_index is not None:
-        card = bulk_index.get(name.lower())
+        card = bulk_index.get(name)
         if card:
-            return _extract_fields(card)
+            return card
 
-    return _api_lookup(name)
+    return fetch_card(name)
 
 
 def _extract_names(data: list | dict) -> list[str]:
@@ -263,6 +160,10 @@ def _build_cache_key(content: str, bulk_path: Path | None) -> str:
     return hasher.hexdigest()[:16]
 
 
+# The keys only a parsed deck JSON carries (a cube JSON has ``cards`` alone).
+_DECK_ZONE_KEYS = frozenset({"commanders", "sideboard", "companion", "format"})
+
+
 def lookup_cards(
     names_path: Path,
     bulk_path: Path | None = None,
@@ -286,6 +187,16 @@ def lookup_cards(
 
     content = names_path.read_text(encoding="utf-8")
     raw = json.loads(content)
+    if isinstance(raw, dict) and _DECK_ZONE_KEYS & raw.keys():
+        # A parsed deck hydrates itself through its sidecar (ADR-0046). A cube JSON
+        # (``{cards, name, source, cube_format}``) is the cube bounded context's own
+        # shape and still hydrates here — ADR-0046 scoped cube-wizard out.
+        msg = (
+            "scryfall-lookup --batch takes a JSON list of card names (or a cube "
+            "JSON); a parsed deck hydrates itself — run `deck-hydrate <deck.json>` "
+            "instead."
+        )
+        raise click.ClickException(msg)
     names = _extract_names(raw)
 
     cache_key = _build_cache_key(content, bulk_path)
@@ -303,7 +214,7 @@ def lookup_cards(
         else:
             return results, cache_path, names
 
-    bulk_index = _load_bulk_index(bulk_path) if bulk_path else None
+    bulk_index = CardPool.load(bulk_path).by_name if bulk_path else None
 
     results: list[dict | None] = []
     for name in names:
@@ -421,7 +332,7 @@ def main(
     elif card_name:
         result = lookup_single(card_name, bulk_path=bulk_data)
         if result:
-            click.echo(json.dumps(result, indent=2))
+            click.echo(json.dumps(display_fields(result), indent=2))
         else:
             click.echo(f"Card not found: {card_name}", err=True)
             raise SystemExit(1)

@@ -3,7 +3,16 @@
 import json
 from unittest.mock import patch
 
-from mtg_utils.build_card_snapshot import _existing_names, _scan_module, main
+from mtg_utils._analysis.bridge_ledger import BRIDGES
+from mtg_utils.build_card_snapshot import (
+    LEDGER_SOURCE,
+    PRESET_SOURCE,
+    _existing_names,
+    _index_by_name,
+    _scan_module,
+    main,
+    scan_test_usage,
+)
 
 # NB: the module under scan is a STRING — the test_card(...) calls inside it are
 # data for the scanner, not calls this test file makes, so they must not feed
@@ -128,6 +137,16 @@ def test_scans_pytest_param_rows():
     assert _scan_module(src) == {"Peek", "Telepathy"}
 
 
+def test_scans_parametrize_rows_with_a_non_literal_cell():
+    # A predicate beside the name is not a literal; the name column still counts.
+    src = (
+        '@pytest.mark.parametrize(("name", "pred"), [("Xathrid Demon", has_x)])\n'
+        "def test_x(name, pred):\n"
+        "    assert pred(test_card_ir(name))\n"
+    )
+    assert _scan_module(src) == {"Xathrid Demon"}
+
+
 def test_ignores_parametrize_columns_not_feeding_a_helper():
     # `label` never reaches a helper call, so its values (which could collide
     # with real card names, e.g. "Mountain") are not harvested.
@@ -203,8 +222,8 @@ def test_main_carries_forward_a_name_only_the_snapshot_knows(tmp_path):
 
     with (
         patch(
-            "mtg_utils.build_card_snapshot._scan_names",
-            return_value={"Newly Scanned Card"},
+            "mtg_utils.build_card_snapshot._test_file_usage",
+            return_value={"Newly Scanned Card": set()},
         ),
         patch(
             "mtg_utils.build_card_snapshot.build_snapshot",
@@ -237,8 +256,19 @@ def test_main_prune_drops_names_the_scan_no_longer_supplies(tmp_path):
 
     with (
         patch(
-            "mtg_utils.build_card_snapshot._scan_names",
-            return_value={"Fresh Card"},
+            "mtg_utils.build_card_snapshot._test_file_usage",
+            return_value={"Fresh Card": set()},
+        ),
+        # The preset registry is a name source of its own; this test is about the
+        # scan's names, so give it nothing.
+        patch(
+            "mtg_utils.build_card_snapshot._preset_fixture_names",
+            return_value=set(),
+        ),
+        # So is the bridge ledger's pin list.
+        patch(
+            "mtg_utils.build_card_snapshot._bridge_pin_names",
+            return_value=set(),
         ),
         patch(
             "mtg_utils.build_card_snapshot.build_snapshot",
@@ -249,3 +279,87 @@ def test_main_prune_drops_names_the_scan_no_longer_supplies(tmp_path):
 
     assert rc == 0
     assert captured["names"] == {"Fresh Card"}
+
+
+def test_main_reads_every_bridge_ledger_pin(tmp_path):
+    """test_bridge_ledger parametrizes over the ledger itself, which the AST scan
+    cannot see — so the builder reads every pin from the registry."""
+    out_path = tmp_path / "card_snapshot.json"
+    captured: dict = {}
+
+    def fake_build_snapshot(names, out):
+        captured["names"] = set(names)
+        out.write_text(json.dumps({"cards": {}}))
+        return out, {
+            "cards": 0,
+            "requested": len(names),
+            "unresolved": [],
+            "no_phase_records": [],
+            "bytes": out.stat().st_size,
+        }
+
+    with (
+        patch("mtg_utils.build_card_snapshot._test_file_usage", return_value={}),
+        patch(
+            "mtg_utils.build_card_snapshot._preset_fixture_names",
+            return_value=set(),
+        ),
+        patch(
+            "mtg_utils.build_card_snapshot.build_snapshot",
+            side_effect=fake_build_snapshot,
+        ),
+    ):
+        assert main(["--out", str(out_path)]) == 0
+
+    assert captured["names"] == {pin for b in BRIDGES.values() for pin in b.pins}
+
+
+def test_scan_test_usage_names_every_source_of_a_card(tmp_path):
+    """The bump's "PINNED" bucket reads the same scan the snapshot is built
+    from, with provenance: the test modules, a preset fixture, a ledger pin."""
+    tests = tmp_path / "tests" / "mtg-utils"
+    tests.mkdir(parents=True)
+    (tests / "test_a.py").write_text(
+        'def test_x():\n    assert test_card("Test Relic")\n'
+    )
+    (tests / "conftest.py").write_text('CARD = test_card("Test Blade")\n')
+    with (
+        patch(
+            "mtg_utils.build_card_snapshot._preset_fixture_names",
+            return_value={"Test Relic"},
+        ),
+        patch(
+            "mtg_utils.build_card_snapshot._bridge_pin_names",
+            return_value={"Test Pin"},
+        ),
+    ):
+        usage = scan_test_usage(tmp_path)
+    assert usage == {
+        "Test Relic": ("tests/mtg-utils/test_a.py", PRESET_SOURCE),
+        "Test Blade": ("tests/mtg-utils/conftest.py",),
+        "Test Pin": (LEDGER_SOURCE,),
+    }
+
+
+# Machinery records: the index's name policy, not any real card's data.
+def _printing(name: str, oid: str, layout: str = "normal") -> dict:
+    return {"name": name, "oracle_id": oid, "layout": layout}
+
+
+def test_index_keys_a_back_face_to_its_gameplay_card():
+    """A back-face name resolves to the card it is a face of, not to an
+    art-series record that shares the name (the Krallenhorde Howler trap)."""
+    art = _printing("Back Face // Back Face", "oid-art", "art_series")
+    dfc = _printing("Front Face // Back Face", "oid-dfc", "transform")
+    index = _index_by_name([art, dfc], {"oid-dfc": [{}]})
+    assert index["back face"] is dfc
+    assert index["front face"] is dfc
+
+
+def test_index_prefers_a_standalone_name_then_a_front_face_over_a_back_face():
+    back = _printing("Other Card // Shared Name", "oid-back")
+    front = _printing("Shared Name // Its Back", "oid-front")
+    alone = _printing("Shared Name", "oid-alone")
+    groups = {"oid-back": [{}], "oid-front": [{}], "oid-alone": [{}]}
+    assert _index_by_name([back, front, alone], groups)["shared name"] is alone
+    assert _index_by_name([back, front], groups)["shared name"] is front

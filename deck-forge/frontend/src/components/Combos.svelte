@@ -1,6 +1,6 @@
 <script>
   import { api } from "../lib/api.js";
-  import { applySnapshot } from "../lib/store.js";
+  import { tryAdd } from "../lib/adds.js";
   import CardTile from "./CardTile.svelte";
   import OracleText from "./OracleText.svelte";
 
@@ -25,21 +25,23 @@
     if (r.data.error) error = r.data.error;
   }
 
+  // A refused add carries the hub's rule text; it must not replace the combo list
+  // (the panel's `error` is the lookup's), so it gets its own line.
+  let addError = "";
   async function add(name, zone = "cards") {
-    const r = await api.add(name, zone, 1);
-    if (r.ok) applySnapshot(r.data);
+    addError = await tryAdd(name, zone);
   }
 
   const missingOf = (c) => (c.card_views || []).filter((cv) => !cv.in_deck);
   const haveOf = (c) => (c.card_views || []).filter((cv) => cv.in_deck);
 
   async function addMissing(c) {
-    let snap = null;
+    const refused = [];
     for (const cv of missingOf(c)) {
-      const r = await api.add(cv.name, "cards", 1);
-      if (r.ok) snap = r.data;
+      const why = await tryAdd(cv.name, "cards");
+      if (why) refused.push(why);
     }
-    if (snap) applySnapshot(snap);
+    addError = refused.join(" · ");
   }
 </script>
 
@@ -52,6 +54,9 @@
   </div>
 
   <div class="body">
+    {#if addError}
+      <div class="notice adderr">{addError}</div>
+    {/if}
     {#if error}
       <div class="notice">{error}</div>
     {:else if loading}
@@ -132,6 +137,10 @@
 </div>
 
 <style>
+  .notice.adderr {
+    color: var(--fail);
+  }
+
   .combos {
     padding: 1rem;
     height: 100%;

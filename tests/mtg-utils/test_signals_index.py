@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pickle
 
-from mtg_utils._deck_forge import signals_index
-from mtg_utils._deck_forge.signals import Signal
+from mtg_utils._analysis import signals_index
+from mtg_utils._analysis.signals import Signal
 
 
 def _sig(key, scope="you", subject=""):
@@ -27,9 +27,7 @@ class TestBuildSignalsIndex:
             calls.append(rec["name"])
             return [_sig("ramp")]
 
-        monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals", fake_extract
-        )
+        monkeypatch.setattr("mtg_utils._analysis.signals.extract_signals", fake_extract)
         records = [
             {"oracle_id": "oid-1", "name": "Printing A"},
             {"oracle_id": "oid-1", "name": "Printing B"},  # same card, reprint
@@ -43,7 +41,7 @@ class TestBuildSignalsIndex:
 
     def test_skips_records_without_oracle_id(self, monkeypatch):
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [_sig("ramp")],
         )
         records = [{"name": "No Oracle Id"}, {"oracle_id": "", "name": "Empty"}]
@@ -51,7 +49,7 @@ class TestBuildSignalsIndex:
 
     def test_ident_format_is_key_pipe_scope_pipe_subject(self, monkeypatch):
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [
                 _sig("type_matters", "you", "Goblin"),
                 _sig("ramp", "you", ""),
@@ -63,7 +61,7 @@ class TestBuildSignalsIndex:
 
     def test_empty_signal_list_is_a_real_cached_answer(self, monkeypatch):
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [],
         )
         records = [{"oracle_id": "oid-1", "name": "Vanilla"}]
@@ -108,7 +106,8 @@ class TestSignalSourceFiles:
         assert "recovery.py" in names
         assert "text_idioms.py" in names
         assert "overlay_corrections.py" in names
-        assert "_ir_lookup.py" in names
+        assert "trees.py" in names  # _card_ir/trees.py — the tree owner (ADR-0047)
+        assert "signal_trees.py" in names
         assert "schema.py" in names  # mirror/schema.py — codegen'd substrate
 
     def test_excludes_signal_specs_which_does_not_feed_extraction(self):
@@ -116,7 +115,7 @@ class TestSignalSourceFiles:
         # AFTER extraction — it never feeds extract_signals's own output, so
         # it must not force a spurious rebuild on every edit. Checked by
         # PATH PARTS, not basename: signal_specs is now a package
-        # (`_deck_forge/signal_specs/__init__.py`, `core.py`, `data_1.py`, …),
+        # (`_analysis/signal_specs/__init__.py`, `core.py`, `data_1.py`, …),
         # so no file in the closure is literally named "signal_specs.py" —
         # a basename check is vacuously true regardless of whether the
         # package ever entered the closure. Verified this assertion isn't
@@ -181,7 +180,7 @@ class TestLoadSignalsIndex:
         assert not sidecar.exists()
 
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [_sig("ramp")],
         )
         records = [{"oracle_id": "oid-1", "name": "Card"}]
@@ -194,7 +193,7 @@ class TestLoadSignalsIndex:
         def boom(_rec, *_args, **_kwargs):
             raise AssertionError("recomputed despite a fresh, matching sidecar")
 
-        monkeypatch.setattr("mtg_utils._deck_forge.signals.extract_signals", boom)
+        monkeypatch.setattr("mtg_utils._analysis.signals.extract_signals", boom)
         cached = signals_index.load_signals_index(bulk, records=records)
         assert cached == index
 
@@ -207,9 +206,7 @@ class TestLoadSignalsIndex:
             calls.append(rec["oracle_id"])
             return []
 
-        monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals", fake_extract
-        )
+        monkeypatch.setattr("mtg_utils._analysis.signals.extract_signals", fake_extract)
         records = [{"oracle_id": "oid-1", "name": "Card"}]
         signals_index.load_signals_index(bulk, records=records)
         assert calls == ["oid-1"]
@@ -228,9 +225,7 @@ class TestLoadSignalsIndex:
             calls.append(rec["oracle_id"])
             return []
 
-        monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals", fake_extract
-        )
+        monkeypatch.setattr("mtg_utils._analysis.signals.extract_signals", fake_extract)
         records = [{"oracle_id": "oid-1", "name": "Card"}]
         signals_index.load_signals_index(bulk, records=records)
         assert calls == ["oid-1"]
@@ -245,7 +240,7 @@ class TestLoadSignalsIndex:
         bulk = tmp_path / "AllPrintings.json"
         bulk.write_text("{}", encoding="utf-8")
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [_sig("ramp")],
         )
         signals_index.load_signals_index(bulk, records=[{"oracle_id": "oid-1"}])
@@ -263,7 +258,7 @@ class TestLoadSignalsIndex:
         bulk = tmp_path / "bulk.json"
         bulk.write_text('[{"oracle_id": "oid-1", "name": "Card"}]', encoding="utf-8")
         monkeypatch.setattr(
-            "mtg_utils._deck_forge.signals.extract_signals",
+            "mtg_utils._analysis.signals.extract_signals",
             lambda _rec, *_args, **_kwargs: [_sig("ramp")],
         )
         index = signals_index.load_signals_index(bulk)
@@ -302,3 +297,35 @@ class TestByteEquivalenceAgainstRealSnapshot:
             assert set(index.get(oid, ())) == live, name
             checked += 1
         assert checked > 0
+
+
+def test_build_reports_progress_every_batch_and_at_the_end(monkeypatch):
+    """The meter's seam: ``(done, total)`` once at the start (so a reporter's clock
+    starts with the pass), every PROGRESS_EVERY records, and once at the end with
+    the final call at (total, total)."""
+    monkeypatch.setattr(signals_index, "PROGRESS_EVERY", 2)
+    records = [{"oracle_id": f"oid-{i}", "name": f"Card {i}"} for i in range(5)]
+    monkeypatch.setattr(
+        "mtg_utils._analysis.signals.extract_signals", lambda _rec: [], raising=False
+    )
+    seen: list[tuple[int, int]] = []
+    signals_index.build_signals_index(
+        records, progress=lambda d, t: seen.append((d, t))
+    )
+    assert seen == [(0, 5), (2, 5), (4, 5), (5, 5)]
+
+
+def test_the_installed_hook_is_the_default_reporter(monkeypatch, tmp_path):
+    """``load_signals_index`` with no explicit progress uses the process hook the
+    hub installs (else the stderr default)."""
+    seen: list[tuple[int, int]] = []
+    signals_index.set_progress_hook(lambda d, t: seen.append((d, t)))
+    try:
+        bulk = tmp_path / "bulk.json"
+        bulk.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(signals_index, "_read_sidecar", lambda *_a, **_k: None)
+        monkeypatch.setattr(signals_index, "_write_sidecar", lambda *_a, **_k: None)
+        signals_index.load_signals_index(bulk, [{"oracle_id": "x"}])
+    finally:
+        signals_index.set_progress_hook(None)
+    assert seen == [(0, 1), (1, 1)]

@@ -7,20 +7,21 @@ import pytest
 from click.testing import CliRunner
 
 from mtg_utils.build_deck import build_deck, main
+from mtg_utils.testkit import test_card
 
 
 class TestBuildDeck:
     def test_basic_cut_and_add(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Sol Ring", "quantity": 1},
                 {"name": "Bad Card", "quantity": 1},
             ],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
             {"name": "Good Card", "cmc": 2, "type_line": "Instant"},
         ]
@@ -34,16 +35,16 @@ class TestBuildDeck:
 
     def test_quantity_adjustment(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Mountain", "quantity": 2},
                 {"name": "Island", "quantity": 2},
             ],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Mountain", "cmc": 0, "type_line": "Basic Land — Mountain"},
-            {"name": "Island", "cmc": 0, "type_line": "Basic Land — Island"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Mountain"),
+            test_card("Island"),
         ]
         cuts = [{"name": "Mountain", "quantity": 1}]
         adds = [{"name": "Island", "quantity": 1}]
@@ -54,11 +55,11 @@ class TestBuildDeck:
 
     def test_removes_entry_when_quantity_zero(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Bad Card", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
         ]
         cuts = [{"name": "Bad Card", "quantity": 1}]
@@ -67,22 +68,22 @@ class TestBuildDeck:
 
     def test_does_not_modify_original(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Sol Ring", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
         ]
         build_deck(deck, hydrated, [], [{"name": "New Card", "quantity": 1}])
         assert len(deck["cards"]) == 1
 
     def test_merges_new_card_into_hydrated(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [],
         }
-        hydrated = [{"name": "Korvold", "cmc": 5, "type_line": "Creature"}]
+        hydrated = [{"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"}]
         new_card_data = {"name": "New Card", "cmc": 2, "type_line": "Instant"}
         adds = [{"name": "New Card", "quantity": 1}]
         hd, _um = build_deck(deck, hydrated, [], adds, extra_hydrated=[new_card_data])
@@ -94,32 +95,32 @@ class TestBuildDeck:
         so a cut card's record is dropped — where the old list(hydrated)+extra
         lingered it. Pins the new contract against a revert to the records= path."""
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Sol Ring", "quantity": 1},
                 {"name": "Bad Card", "quantity": 1},
             ],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
         ]
         hd, _ = build_deck(deck, hydrated, [{"name": "Bad Card", "quantity": 1}], [])
         record_names = [r["name"] for r in hd.records]
         assert "Bad Card" not in record_names  # cut -> dropped from the projection
         assert "Sol Ring" in record_names  # kept -> retained
-        assert "Korvold" in record_names  # commander -> retained
+        assert "Fictional Commander" in record_names  # commander -> retained
 
 
 class TestCLI:
     def test_cli_writes_output_files(self, tmp_path):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Bad Card", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
         ]
         cuts = [{"name": "Bad Card", "quantity": 1}]
@@ -154,6 +155,7 @@ class TestCLI:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--cuts",
                     str(cuts_path),
@@ -170,7 +172,9 @@ class TestCLI:
         assert "Good Card" in card_names
         assert "Bad Card" not in card_names
 
-        new_hydrated = json.loads((output_dir / "new-hydrated.json").read_text())
+        new_hydrated = json.loads((output_dir / "new-deck.hydrated.json").read_text())[
+            "records"
+        ]
         hydrated_names = [c["name"] for c in new_hydrated if c]
         assert "Good Card" in hydrated_names
 
@@ -178,15 +182,15 @@ class TestCLI:
 class TestFlexibleInput:
     def test_accepts_string_cuts(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Sol Ring", "quantity": 1},
                 {"name": "Bad Card", "quantity": 1},
             ],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
         ]
         cuts = ["Bad Card"]
@@ -196,11 +200,11 @@ class TestFlexibleInput:
 
     def test_accepts_string_adds(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
             {"name": "Good Card", "cmc": 2, "type_line": "Instant"},
         ]
         adds = ["Good Card"]
@@ -210,11 +214,11 @@ class TestFlexibleInput:
 
     def test_accepts_mixed_string_and_dict(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Bad Card", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
             {"name": "Bad Card", "cmc": 3, "type_line": "Creature"},
             {"name": "Good Card", "cmc": 2, "type_line": "Instant"},
         ]
@@ -227,10 +231,10 @@ class TestFlexibleInput:
 
     def test_rejects_invalid_entry(self):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [],
         }
-        hydrated = [{"name": "Korvold", "cmc": 5, "type_line": "Creature"}]
+        hydrated = [{"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"}]
         with pytest.raises(ValueError, match="Expected card name string"):
             build_deck(deck, hydrated, [42], [])
 
@@ -241,12 +245,12 @@ class TestDeckSizeWarning:
         deck = {
             "format": "brawl",
             "deck_size": 60,
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Sol Ring", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -259,6 +263,7 @@ class TestDeckSizeWarning:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--output-dir",
                     str(tmp_path / "out"),
@@ -271,17 +276,17 @@ class TestDeckSizeWarning:
         """A deck at its expected size should not warn."""
         deck = {
             "format": "commander",
-            "deck_size": 3,
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "deck_size": 100,
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Sol Ring", "quantity": 1},
-                {"name": "Mountain", "quantity": 1},
+                {"name": "Mountain", "quantity": 98},
             ],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
-            {"name": "Mountain", "cmc": 0, "type_line": "Basic Land — Mountain"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
+            test_card("Mountain"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -294,6 +299,7 @@ class TestDeckSizeWarning:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--output-dir",
                     str(tmp_path / "out"),
@@ -305,12 +311,12 @@ class TestDeckSizeWarning:
     def test_default_deck_size_is_100(self, tmp_path):
         """A deck without format/deck_size fields should warn against 100."""
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Sol Ring", "quantity": 1}],
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -323,6 +329,7 @@ class TestDeckSizeWarning:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--output-dir",
                     str(tmp_path / "out"),
@@ -350,14 +357,14 @@ class TestTotalCardsField:
         deck = {
             "format": "commander",
             "deck_size": 100,
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [{"name": "Sol Ring", "quantity": 1}],
             "total_cards": 2,
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
-            {"name": "Mountain", "cmc": 0, "type_line": "Basic Land — Mountain"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
+            test_card("Mountain"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -373,6 +380,7 @@ class TestTotalCardsField:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--adds",
                     str(adds_path),
@@ -396,7 +404,7 @@ class TestTotalCardsField:
         deck = {
             "format": "commander",
             "deck_size": 100,
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Fictional Commander", "quantity": 1}],
             "cards": [
                 {"name": "Sol Ring", "quantity": 1},
                 {"name": "Mountain", "quantity": 5},
@@ -404,9 +412,9 @@ class TestTotalCardsField:
             "total_cards": 7,
         }
         hydrated = [
-            {"name": "Korvold", "cmc": 5, "type_line": "Creature"},
-            {"name": "Sol Ring", "cmc": 1, "type_line": "Artifact"},
-            {"name": "Mountain", "cmc": 0, "type_line": "Basic Land — Mountain"},
+            {"name": "Fictional Commander", "cmc": 5, "type_line": "Creature"},
+            test_card("Sol Ring"),
+            test_card("Mountain"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -422,6 +430,7 @@ class TestTotalCardsField:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--cuts",
                     str(cuts_path),
@@ -468,6 +477,7 @@ class TestTotalCardsField:
                 main,
                 [
                     str(deck_path),
+                    "--bulk-data",
                     str(hydrated_path),
                     "--sideboard-adds",
                     str(sb_adds_path),
@@ -495,9 +505,9 @@ class TestSideboardCutsAdds:
             ],
         }
         hydrated = [
-            {"name": "Lightning Bolt", "cmc": 1, "type_line": "Instant"},
-            {"name": "Smash to Smithereens", "cmc": 2, "type_line": "Instant"},
-            {"name": "Roiling Vortex", "cmc": 2, "type_line": "Enchantment"},
+            test_card("Lightning Bolt"),
+            test_card("Smash to Smithereens"),
+            test_card("Roiling Vortex"),
         ]
         hd, unmatched = build_deck(
             deck,
@@ -519,7 +529,7 @@ class TestSideboardCutsAdds:
             "sideboard": [{"name": "Smash", "quantity": 2}],
         }
         hydrated = [
-            {"name": "Lightning Bolt", "cmc": 1, "type_line": "Instant"},
+            test_card("Lightning Bolt"),
             {"name": "Smash", "cmc": 2, "type_line": "Instant"},
             {"name": "Vortex", "cmc": 2, "type_line": "Enchantment"},
         ]

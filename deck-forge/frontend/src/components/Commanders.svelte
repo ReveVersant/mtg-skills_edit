@@ -5,8 +5,8 @@
   // shows its lanes + per-lane owned counts (transparent, like the rest of the engine).
   import { onMount } from "svelte";
   import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
   import {
-    applySnapshot,
     collectionOpen,
     agentAttached,
     deck,
@@ -15,13 +15,15 @@
   import { askForge } from "../lib/agent.js";
   import { hoverPreview } from "../lib/hover.js";
   import { displayName } from "../lib/cards.js";
+  import { busy } from "../lib/store.js";
   import Mana from "./Mana.svelte";
+  import PresetPicker from "./PresetPicker.svelte";
 
   const PIPS = ["W", "U", "B", "R", "G", "C"];
 
   let sort = "support";
   let colors = new Set();
-  let theme = "";
+  let themes = new Set(); // build-around presets a commander must all match (as Find)
   let presets = [];
   let results = [];
   // Best guess at the Collection slot the backend will read, before any response has
@@ -46,7 +48,7 @@
     const r = await api.discoverCommanders({
       sort,
       colors: colors.size ? [...colors].join("") : null,
-      theme: theme || null,
+      themes: [...themes],
       limit: 24,
     });
     loading = false;
@@ -67,7 +69,7 @@
   // mounted (SSE snapshots update the `deck` store out from under this component).
   $: sortSig = sort;
   $: colorSig = [...colors].sort().join("");
-  $: themeSig = theme;
+  $: themeSig = [...themes].sort().join(",");
   $: ctxSig = `${$deck.format}|${$deck.medium}`;
   let prevCtxSig;
   $: {
@@ -89,9 +91,11 @@
     colors = new Set(colors);
   }
 
+  // A refused set-as-commander (a second copy, an occupied singleton zone) carries
+  // the hub's rule text; the panel's `error` is discovery's, so this is its own line.
+  let addError = "";
   async function setCommander(name) {
-    const r = await api.add(name, "commanders", 1);
-    if (r.ok) applySnapshot(r.data);
+    addError = await tryAdd(name, "commanders");
   }
 
   // The headline number per result: signal rarity for novelty, support depth otherwise.
@@ -140,17 +144,31 @@
           >
         {/each}
       </div>
-      <select class="theme" bind:value={theme} title="Build-around theme">
-        <option value="">Any theme</option>
-        {#each presets as p (p.name)}<option value={p.name}>{p.name}</option
-          >{/each}
-      </select>
+      <div class="theme" title="Build-around themes">
+        <PresetPicker
+          {presets}
+          bind:selected={themes}
+          placeholder="Any theme"
+        />
+      </div>
     </div>
   </div>
 
   <div class="results">
+    {#if addError}
+      <div class="notice adderr">{addError}</div>
+    {/if}
     {#if loading}
-      <div class="notice">Reading your {slotLabel(activeSlot)}…</div>
+      <!-- A cold sweep (first launch, a refreshed database) reports through the
+           busy meter; name it here too so this panel never reads as hung. -->
+      <div class="notice">
+        {#if $busy}
+          {$busy.label}: {$busy.done.toLocaleString()} / {$busy.total.toLocaleString()}
+          — see the progress bar above.
+        {:else}
+          Reading your {slotLabel(activeSlot)}…
+        {/if}
+      </div>
     {:else if error}
       <div class="notice">{error}</div>
     {:else if slotSize === 0}
@@ -231,6 +249,10 @@
 </div>
 
 <style>
+  .notice.adderr {
+    color: var(--fail);
+  }
+
   .discover {
     padding: 1rem;
     height: 100%;
@@ -293,12 +315,7 @@
   }
   .theme {
     flex: 1;
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--hairline-soft);
-    border-radius: var(--radius);
-    color: var(--parchment);
-    padding: 0.35rem 0.5rem;
-    font-size: 0.82rem;
+    min-width: 0;
   }
   .results {
     margin-top: 0.8rem;

@@ -13,13 +13,11 @@ detection are reused from ``deck_stats.detect_bracket`` (Game Changers via Scryf
 
 from __future__ import annotations
 
-import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
-from mtg_utils._deck_forge._ir_lookup import ir_for
-from mtg_utils.card_classify import get_oracle_text
-from mtg_utils.card_ir import Card
+from mtg_utils.combo_search import is_game_winning
 from mtg_utils.deck_stats import detect_bracket
+from mtg_utils.theme_presets import get_preset
 
 # Game-Changers count ceiling per target bracket. Brackets 4 (Optimized) and 5 (cEDH)
 # are unconstrained (banned list only) and short-circuit before this is consulted.
@@ -29,21 +27,13 @@ _GC_CEILING: dict[int, int] = {1: 0, 2: 0, 3: 3}
 # banned-list-only (nothing to enforce).
 _UNCONSTRAINED_FROM = 4
 
-# Extra-turn grant ("Take an extra turn after this one"). At bracket 1 any is a FAIL;
-# at 2-3 they're allowed "in low quantities... not chained/looped" — a qualitative
-# rule, so more than this many is a heuristic WARN (project-chosen, not an official
-# number), never a hard FAIL.
-# Extra-turn detection prefers the IR (``cat=extra_turn`` — phase parses Time Warp and
-# Time Stretch's "two extra turns" identically, no count needed for B1's "any = FAIL").
-# The regex is the no-IR fallback: "takes an extra turn" OR "takes two/N extra turns".
-_EXTRA_TURN_RE = re.compile(r"takes? \w+ extra turns?", re.IGNORECASE)
+# Extra-turn grant (CR 500.7). At bracket 1 any is a FAIL; at 2-3 they're allowed
+# "in low quantities... not chained/looped" — a qualitative rule, so more than this
+# many is a heuristic WARN (project-chosen, not an official number), never a hard
+# FAIL. Read off the ``extra_turns`` signal key (the ``extra-turns`` preset): any
+# extra-turn grant, whoever takes it — Time Stretch's two turns read the same as Time
+# Warp's one, and B1's "any = FAIL" needs no count.
 _EXTRA_TURN_LOW_MAX = 1
-
-
-def _ir_has_extra_turn(ir: Card) -> bool:
-    return any(
-        e.category == "extra_turn" for ab in ir.all_abilities() for e in ab.effects
-    )
 
 
 # A two-card infinite combo whose pieces' combined mana value is at or below this reads
@@ -53,32 +43,26 @@ def _ir_has_extra_turn(ir: Card) -> bool:
 _COMBO_CHEAP_MV_MAX = 6.0
 
 
-def _has_extra_turn(card: dict) -> bool:
-    ir = ir_for(card)
-    if ir is not None and _ir_has_extra_turn(ir):
-        return True
-    return bool(_EXTRA_TURN_RE.search(get_oracle_text(card) or ""))
-
-
 def _extra_turn_cards(records: Sequence[dict | None]) -> list[str]:
-    return sorted({c["name"] for c in records if c and _has_extra_turn(c)})
+    extra_turns = get_preset("extra-turns")
+    return sorted({c["name"] for c in records if c and extra_turns.matches(c)})
 
 
-def _is_infinite(result: str | list | None) -> bool:
-    # combo_search emits `result` as a LIST of feature strings (the real Commander
-    # Spellbook shape); a few synthetic call sites still pass a bare string. Normalize
-    # both the same way combo_search itself joins the list (line 317) before matching.
-    if isinstance(result, list):
-        result = " ".join(str(r) for r in result)
-    t = (result or "").lower()
-    return (
-        "infinite" in t
-        or "win the game" in t
-        or "wins the game" in t
-        # Loss-side kills are equally game-ending (Each opponent loses the game).
-        or "lose the game" in t
-        or "loses the game" in t
-    )
+# Intentional two-card infinite combos are disallowed below bracket 3 (WotC's
+# Commander Brackets; the gate's two_card_combo axis below).
+TWO_CARD_COMBOS_FROM = 3
+
+
+def suggestable_near_misses(
+    combos: Mapping | None, target_bracket: int | None
+) -> list[dict]:
+    """combo-search's near-misses the tuner may complete. Below
+    :data:`TWO_CARD_COMBOS_FROM` a game-winning line is off the table: this gate
+    fails the combo it would build."""
+    near = list((combos or {}).get("near_misses") or [])
+    if target_bracket is not None and target_bracket < TWO_CARD_COMBOS_FROM:
+        near = [n for n in near if not is_game_winning(n)]
+    return near
 
 
 def _two_card_infinite_combos(combos: dict | None) -> list[list[str]]:
@@ -88,7 +72,7 @@ def _two_card_infinite_combos(combos: dict | None) -> list[list[str]]:
     out: list[list[str]] = []
     for combo in combos.get("combos") or []:
         cards = combo.get("cards") or []
-        if len(cards) == 2 and _is_infinite(combo.get("result")):
+        if len(cards) == 2 and is_game_winning(combo):
             out.append(list(cards))
     return out
 
@@ -105,29 +89,52 @@ def _combined_mv(names: Sequence[str], records: Sequence[dict | None]) -> float 
     return total
 
 
+def _passing(target_bracket: int, *, not_applicable: str | None = None) -> dict:
+    """A gate with nothing to measure — brackets 4-5, or a one-on-one game."""
+    out: dict = {
+        "target_bracket": target_bracket,
+        "pass": True,
+        "ceilings": {},
+        "violations": [],
+    }
+    if not_applicable:
+        out["not_applicable"] = not_applicable
+    return out
+
+
 def bracket_gate(
     records: Sequence[dict | None],
     target_bracket: int,
     *,
     combos: dict | None = None,
+    multiplayer: bool = True,
 ) -> dict:
     """Measure a deck against ``target_bracket``'s official allowances.
 
     ``combos`` is an optional ``combo-search`` result (``{"combos": [...]}``) feeding
     the two-card-combo axis; omit it to skip that axis (graceful degradation).
 
+    The brackets are WotC's system for multiplayer Commander (the "Commander
+    Brackets" document ADR-0030 verifies against; the CR has no bracket rule): mass
+    land denial, extra turns and two-card combos are permissions at a pod and
+    ordinary tempo one-on-one. ``multiplayer=False`` (``Format.game`` under the
+    build's medium — every Arena game, Competitive Brawl) returns a passing gate
+    marked ``not_applicable``.
+
     Returns ``{target_bracket, pass, ceilings, violations}`` where each violation
     names the breached ``axis``, a ``severity`` (FAIL for the deterministic axes,
     WARN for the qualitative ones), the offending ``cards``, and a ``detail`` line.
     Brackets 4-5 are banned-list-only, so they always pass with no violations.
     """
+    if not multiplayer:
+        return _passing(
+            target_bracket,
+            not_applicable=(
+                "Commander brackets are a multiplayer concept; this build is one-on-one"
+            ),
+        )
     if target_bracket >= _UNCONSTRAINED_FROM:
-        return {
-            "target_bracket": target_bracket,
-            "pass": True,
-            "ceilings": {},
-            "violations": [],
-        }
+        return _passing(target_bracket)
 
     detected = detect_bracket(records, 0.0)
     violations: list[dict] = []
@@ -182,7 +189,7 @@ def bracket_gate(
         )
 
     for combo_cards in _two_card_infinite_combos(combos):
-        if target_bracket in (1, 2):
+        if target_bracket < TWO_CARD_COMBOS_FROM:
             violations.append(
                 {
                     "axis": "two_card_combo",
@@ -211,5 +218,8 @@ def bracket_gate(
         # WARNs are advisory; only a FAIL fails the gate.
         "pass": not any(v["severity"] == "FAIL" for v in violations),
         "ceilings": {"game_changers": gc_ceiling, "mass_land_denial": 0},
+        # What the deck holds against each counted ceiling — the swap proposer's
+        # headroom is ``ceilings - counts`` (it must never add past the ceiling).
+        "counts": {"game_changers": len(gc_cards)},
         "violations": violations,
     }

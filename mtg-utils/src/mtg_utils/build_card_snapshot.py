@@ -6,7 +6,7 @@ no cargo), and is NEVER run in CI (CI consumes the committed snapshot offline). 
 collects the card names the tests reference via the ``mtg_utils.testkit`` helpers,
 resolves each to its GAMEPLAY printing, and emits, per card, a minimal Scryfall
 record plus its RAW phase face records (ADR-0039 task #80 step 5) — exactly the
-records ``mtg_utils._deck_forge._ir_lookup.trees_for`` strict-loads in production, so
+records ``mtg_utils._card_ir.trees.trees_for`` strict-loads in production, so
 ``testkit`` builds the SAME ``ConceptTree`` / compat ``Card`` on demand with **no**
 phase cache / network in CI. This replaces the pre-step-5 shape (a single baked
 ``project_card`` IR slice per card): the crosswalk world derives its IR from the
@@ -21,10 +21,13 @@ expanded rather than a lossy slice silently shipped.
 
 Modes:
   * default — AST-scan the test tree for ``test_card`` / ``test_card_ir`` /
-    ``test_signals`` usage: direct string-literal calls, parametrize columns
-    that feed such a call through a bare variable, and ``_REAL_CASES`` name
-    tables (usage-derived; the snapshot only holds cards a test actually asks
-    for).
+    ``test_signals`` / ``test_phase_records`` usage: direct string-literal calls,
+    parametrize columns that feed such a call through a bare variable, and
+    ``_REAL_CASES`` name tables (usage-derived; the snapshot only holds cards a
+    test actually asks for), plus every theme preset's ``should_match`` /
+    ``should_not_match`` read from the registry itself (a preset fixture is
+    proven against the snapshot's real record, never hand-typed text) and every
+    ledgered bridge's pin.
   * ``--names "A,B"`` / ``--names-file PATH`` — an explicit name list (additive to the
     scan unless ``--no-scan``).
 
@@ -41,10 +44,10 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from mtg_utils._analysis.signals import extract_signals
 from mtg_utils._card_ir.build import _group_by_oracle_id
 from mtg_utils._card_ir.load import CROSSWALK_SIDECAR_VERSION
-from mtg_utils._deck_forge._ir_lookup import build_trees, seed_trees
-from mtg_utils._deck_forge.signals import extract_signals
+from mtg_utils._card_ir.trees import build_trees, seed_trees
 from mtg_utils._phase import PHASE_TAG, ensure_card_data
 from mtg_utils.bulk_loader import default_bulk_path, load_bulk_cards
 from mtg_utils.names import normalize_card_name
@@ -64,10 +67,13 @@ _SCRY_FIELDS = (
     "cmc",
     "power",
     "toughness",
+    "loyalty",
+    "defense",
     "produced_mana",
     "color_identity",
     "colors",
     "legalities",
+    "arena_available",
     "layout",
     "card_faces",
     "all_parts",
@@ -79,11 +85,13 @@ _FACE_FIELDS = (
     "mana_cost",
     "power",
     "toughness",
+    "loyalty",
+    "defense",
     "keywords",
     "colors",
 )
 
-# The snapshot-feeding core: the three testkit entry points. Per-suite wrappers
+# The snapshot-feeding core: the four testkit entry points. Per-suite wrappers
 # that forward a card name into them (``_ks_real("Atraxa, …")``, ``_keys(…)`` —
 # the name literal sits on the wrapper, not on ``test_signals``) are DERIVED per
 # module by ``_local_wrappers``, never hand-listed: a hardcoded wrapper list
@@ -92,7 +100,16 @@ _FACE_FIELDS = (
 # The scan is AST-based (see ``_scan_module``), so apostrophes in names,
 # comments mentioning ``test_card("…")``, and parametrize tables all behave
 # correctly — a regex scan mis-handled all three.
-_CORE_HELPERS = frozenset({"test_card", "test_card_ir", "test_signals"})
+_CORE_HELPERS = frozenset(
+    {
+        "test_card",
+        "test_card_ir",
+        "test_signals",
+        "test_phase_records",
+        "test_printing",
+        "mtgjson_printing",
+    }
+)
 
 
 def _call_name(call: ast.Call) -> str | None:
@@ -173,10 +190,19 @@ def _parametrize_argnames(node: ast.expr) -> list[str]:
     return []
 
 
+def _literal_or_none(node: ast.expr) -> object:
+    try:
+        return ast.literal_eval(node)
+    except ValueError:
+        return None
+
+
 def _parametrize_rows(node: ast.expr) -> list[tuple]:
-    """The literal rows of a ``parametrize`` argvalues list, each normalized to a
-    tuple (scalars become 1-tuples; ``pytest.param(...)`` rows contribute their
-    positional args; non-literal rows are skipped)."""
+    """The rows of a ``parametrize`` argvalues list, each normalized to a tuple
+    (scalars become 1-tuples; ``pytest.param(...)`` rows contribute their
+    positional args). A cell that isn't a literal — a predicate passed beside the
+    card name, ``("Xathrid Demon", has_selfloss_engine)`` — reads as ``None``, so
+    the row's literal name column is still harvested."""
     if not isinstance(node, (ast.Tuple, ast.List)):
         return []
     rows: list[tuple] = []
@@ -188,11 +214,10 @@ def _parametrize_rows(node: ast.expr) -> list[tuple]:
             and elt.func.attr == "param"
         ):
             target = ast.Tuple(elts=list(elt.args), ctx=ast.Load())
-        try:
-            value = ast.literal_eval(target)
-        except ValueError:
-            continue
-        rows.append(value if isinstance(value, tuple) else (value,))
+        if isinstance(target, ast.Tuple):
+            rows.append(tuple(_literal_or_none(e) for e in target.elts))
+        else:
+            rows.append((_literal_or_none(target),))
     return rows
 
 
@@ -290,28 +315,87 @@ def _minimal(card: dict) -> dict:
     return out
 
 
-def _scan_names(test_dirs: list[Path]) -> set[str]:
-    """Usage-derived names: direct ``test_card(...)`` literals, parametrize
-    columns feeding a helper call, and every value in a ``_REAL_CASES`` key→name
-    table. So adding a parametrize row (and re-running) grows the snapshot with
-    no external name list."""
-    names: set[str] = set()
-    for d in test_dirs:
+# The test trees the usage scan reads, relative to the repo root.
+# Every skill's tests: ADR-0056 applies to all of them, so a real card any test
+# names must be captured, not only deck-forge's and mtg-utils'.
+TEST_DIRS = ("tests",)
+# Source labels for the two name sources the AST scan cannot see.
+PRESET_SOURCE = "theme_presets (fixture)"
+LEDGER_SOURCE = "bridge_ledger (pin)"
+
+
+def usage_scan_dirs(repo_root: Path) -> list[Path]:
+    """The :data:`TEST_DIRS` under ``repo_root`` (named so pytest never collects
+    it: a ``test_``-prefixed function imported into a test module would be)."""
+    return [repo_root / d for d in TEST_DIRS]
+
+
+def _test_file_usage(dirs: list[Path]) -> dict[str, set[Path]]:
+    """Usage-derived names, each with the test modules that ask for it: direct
+    ``test_card(...)`` literals, parametrize columns feeding a helper call, and
+    every value in a ``_REAL_CASES`` key→name table. So adding a parametrize row
+    (and re-running) grows the snapshot with no external name list.
+    ``conftest.py`` modules are scanned too: a shared fixture that builds real
+    cards by name feeds the snapshot like a test does."""
+    usage: dict[str, set[Path]] = {}
+    for d in dirs:
         if not d.exists():
             continue
-        for py in d.rglob("test_*.py"):
-            names.update(_scan_module(py.read_text(encoding="utf-8")))
-    return names
+        for py in (*d.rglob("test_*.py"), *d.rglob("conftest.py")):
+            for name in _scan_module(py.read_text(encoding="utf-8")):
+                usage.setdefault(name, set()).add(py)
+    return usage
+
+
+def scan_test_usage(repo_root: Path) -> dict[str, tuple[str, ...]]:
+    """Every card name the snapshot is derived from → where it comes from: the
+    test modules that name it (repo-relative paths), :data:`PRESET_SOURCE` for a
+    theme-preset fixture, :data:`LEDGER_SOURCE` for a bridge-ledger pin.
+    ``main`` snapshots exactly these names and ``bump-phase-pin`` reads their
+    provenance — so "a test names this card" means one thing to both."""
+    usage: dict[str, set[str]] = {
+        name: {str(p.relative_to(repo_root)) for p in paths}
+        for name, paths in _test_file_usage(usage_scan_dirs(repo_root)).items()
+    }
+    for name in _preset_fixture_names():
+        usage.setdefault(name, set()).add(PRESET_SOURCE)
+    for name in _bridge_pin_names():
+        usage.setdefault(name, set()).add(LEDGER_SOURCE)
+    return {name: tuple(sorted(srcs)) for name, srcs in usage.items()}
+
+
+def _preset_fixture_names() -> set[str]:
+    """Every ``should_match`` / ``should_not_match`` name in the theme-preset
+    registry: a preset's fixtures are proven against the snapshot's REAL records
+    (keywords + oracle text as the bulk carries them, never hand-typed —
+    ``tests/mtg-utils/test_theme_presets.py``), so the registry is a name source
+    of its own — the AST scan cannot see a comprehension over imported data."""
+    from mtg_utils.theme_presets import PRESETS
+
+    return {
+        card
+        for preset in PRESETS.values()
+        for card in (*preset.should_match, *preset.should_not_match)
+    }
+
+
+def _bridge_pin_names() -> set[str]:
+    """Every ledgered bridge's convergence pin (ADR-0048): ``test_bridge_ledger``
+    parametrizes over the ledger itself, so — like the preset registry — the
+    ledger is a name source the AST scan cannot see."""
+    from mtg_utils._analysis.bridge_ledger import BRIDGES
+
+    return {pin for bridge in BRIDGES.values() for pin in bridge.pins}
 
 
 def _existing_names(out_path: Path) -> set[str]:
     """Card names already committed in *out_path*, or empty if it doesn't
     exist / doesn't parse. The AST scan is necessarily incomplete — a table
-    built from a dynamic comprehension over imported registry data (e.g.
-    ``[card for name in PRESETS for card in PRESETS[name].should_match]``)
-    has no string literal for the scanner to find at all. Regenerating must
-    never silently drop a name the scan can't see; ``--prune`` opts into
-    that instead of it happening by accident."""
+    built from a dynamic comprehension over imported registry data has no
+    string literal for the scanner to find at all (the preset registry is
+    read directly, :func:`_preset_fixture_names`; any other such table is
+    not). Regenerating must never silently drop a name the scan can't see;
+    ``--prune`` opts into that instead of it happening by accident."""
     if not out_path.exists():
         return set()
     try:
@@ -326,18 +410,33 @@ def _existing_names(out_path: Path) -> set[str]:
 
 def _index_by_name(bulk: list[dict], groups: dict[str, list[dict]]) -> dict[str, dict]:
     """normalized name → the GAMEPLAY printing (oracle_id has >=1 phase face
-    record; DFC front faces keyed too; art_series / reversible dups are skipped
-    because their oracle_id is absent from phase's card-data.json)."""
-    by_name: dict[str, list[dict]] = defaultdict(list)
+    record; a multi-face card is keyed by every face name too; art_series /
+    reversible dups are skipped because their oracle_id is absent from phase's
+    card-data.json).
+
+    A back face is keyed so a test of that face's own phase record can name it
+    (``test_phase_records("Howlpack Alpha")`` → Mayor of Avabruck, whose two
+    records the test picks the face from) — the crosswalk suites address faces
+    that way. Without the key, a back-face name fell through to whatever other
+    record shared it: Krallenhorde Howler resolved to its art-series card."""
+    by_name: dict[str, list[tuple[int, dict]]] = defaultdict(list)
     for c in bulk:
         nm = c.get("name")
         if not nm:
             continue
-        by_name[normalize_card_name(nm)].append(c)
+        by_name[normalize_card_name(nm)].append((0, c))
         if " // " in nm:
-            by_name[normalize_card_name(nm.split(" // ")[0])].append(c)
+            front, *rest = nm.split(" // ")
+            by_name[normalize_card_name(front)].append((1, c))
+            for face in rest:
+                by_name[normalize_card_name(face)].append((2, c))
     resolved: dict[str, dict] = {}
-    for key, printings in by_name.items():
+    for key, ranked in by_name.items():
+        # A standalone card whose name IS the key wins over a split card keyed
+        # here only by its front face ("Bind" vs "Bind // Liberate") — the same
+        # policy CardPool.by_name applies — and a front face wins over a back
+        # face. Stable sort: order otherwise kept.
+        printings = [c for _rank, c in sorted(ranked, key=lambda rc: rc[0])]
         pick = next((c for c in printings if c.get("oracle_id") in groups), None)
         if pick is None:
             # No printing has phase coverage — real for NON-PLAYABLE folded
@@ -449,7 +548,12 @@ def main(argv: list[str] | None = None) -> int:
         "--names-file", default=None, help="File with one card name per line."
     )
     parser.add_argument(
-        "--no-scan", action="store_true", help="Skip the test-tree usage scan."
+        "--no-scan",
+        action="store_true",
+        help=(
+            "Skip the test-tree usage scan and the preset-registry / bridge-"
+            "ledger name reads."
+        ),
     )
     parser.add_argument(
         "--out", default=None, help="Output path (default: the fixture)."
@@ -474,9 +578,7 @@ def main(argv: list[str] | None = None) -> int:
 
     names: set[str] = set()
     if not args.no_scan:
-        names |= _scan_names(
-            [repo_root / "tests" / "deck-forge", repo_root / "tests" / "mtg-utils"]
-        )
+        names |= set(scan_test_usage(repo_root))
     if args.names:
         names |= {n.strip() for n in args.names.split(",") if n.strip()}
     if args.names_file:

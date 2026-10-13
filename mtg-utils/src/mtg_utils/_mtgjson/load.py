@@ -12,11 +12,12 @@ Scryfall represents them.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from mtg_utils._mtgjson.adapter import (
+    COMPETITIVE_BRAWL_KEY,
     aggregate_legalities,
-    gate_arena_formats,
     token_part,
     translate_card,
 )
@@ -28,6 +29,10 @@ ALLPRICES_NAME = "AllPricesToday.json"
 # what the sidecar freshness check stats, and what download fetches — so the
 # three can't drift (e.g. freshness silently not watching a daily price refresh).
 MTGJSON_FILES = (ALLPRINTINGS_NAME, ALLPRICES_NAME)
+STALE_COMPETITIVE_BRAWL_WARNING = (
+    "Warning: your MTGJSON bulk predates the competitivebrawl key, so every card "
+    "reads not legal in Competitive Brawl; re-run download-mtgjson."
+)
 
 
 def is_mtgjson_path(path: Path) -> bool:
@@ -94,7 +99,8 @@ def flatten(data: dict, *, price_index: dict | None = None) -> list[dict]:
     card_by_uuid: dict[str, dict] = {}
     # Oracle-level legalities: gather every printing's legalities per oracle_id so an
     # oversized/promo printing can't make a legal card read not_legal (see adapter).
-    # Also track per-oracle Arena availability to gate the Arena-only formats.
+    # Also track per-oracle Arena availability: it rides on each record as
+    # ``arena_available``; ``formats.Format.legality`` gates Arena-pool formats on it.
     raw_leg: dict[str, list[dict | None]] = {}
     arena: dict[str, bool] = {}
     for s in data.values():
@@ -111,10 +117,7 @@ def flatten(data: dict, *, price_index: dict | None = None) -> list[dict]:
                     "arena" in (c.get("availability") or [])
                 )
     legalities_index = {
-        oid: gate_arena_formats(
-            aggregate_legalities(legs), arena_available=arena.get(oid, False)
-        )
-        for oid, legs in raw_leg.items()
+        oid: aggregate_legalities(legs) for oid, legs in raw_leg.items()
     }
 
     # Oracle-level token graph: a representative token record per token oracle_id, and
@@ -165,6 +168,7 @@ def flatten(data: dict, *, price_index: dict | None = None) -> list[dict]:
                     token_parts=token_parts_by_oid.get(moid) if moid else None,
                     card_by_uuid=card_by_uuid,
                     legalities_index=legalities_index,
+                    arena_index=arena,
                     set_meta=set_meta,
                 )
             )
@@ -172,6 +176,14 @@ def flatten(data: dict, *, price_index: dict | None = None) -> list[dict]:
             out.append(
                 translate_card(group, price_index=price_index, set_meta=set_meta)
             )
+    # A file that predates MTGJSON's Competitive Brawl key carries it on no card, so
+    # every record reads not_legal there: say so once, while the index is built.
+    if not any(
+        COMPETITIVE_BRAWL_KEY in (leg or {})
+        for legs in raw_leg.values()
+        for leg in legs
+    ):
+        print(STALE_COMPETITIVE_BRAWL_WARNING, file=sys.stderr, flush=True)
     return out
 
 

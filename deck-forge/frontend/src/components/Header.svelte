@@ -1,20 +1,17 @@
 <script>
-  import { deck, buildId, buildName, applySnapshot } from "../lib/store.js";
+  import {
+    deck,
+    buildId,
+    buildName,
+    formatOptions,
+    applySnapshot,
+  } from "../lib/store.js";
   import { api } from "../lib/api.js";
   import BuildMenu from "./BuildMenu.svelte";
   import FinalizeButton from "./FinalizeButton.svelte";
 
   let editing = false;
   let draft = "";
-
-  // The Commander-family formats deck-forge builds (paper Commander + the Arena
-  // Brawl queues). Mirrors format_config.COMMANDER_FORMATS on the backend.
-  const FORMATS = [
-    ["commander", "Commander"],
-    ["brawl", "Brawl"],
-    ["historic_brawl", "Historic Brawl"],
-    ["competitive_brawl", "Competitive Brawl"],
-  ];
 
   async function changeFormat(e) {
     const r = await api.setFormat(e.target.value);
@@ -31,11 +28,36 @@
     if (r.ok) applySnapshot(r.data);
   }
 
-  // Medium toggle only for the formats that exist in BOTH media (commander is
-  // paper-only; Competitive Brawl is Arena-only); the 60/100 size picker only for
-  // paper Historic Brawl (both legal for paper "Brawl").
-  $: showMedium = $deck.format === "brawl" || $deck.format === "historic_brawl";
-  $: showSize = $deck.format === "historic_brawl" && $deck.medium === "paper";
+  // The pickers derive from the served format table: the medium toggle only where
+  // the format has more than one medium, the size picker only where the current
+  // medium may choose (paper Historic Brawl: 60 or 100).
+  $: current = $formatOptions.find((f) => f.id === $deck.format);
+  $: media = current?.media ?? [];
+  $: showMedium = media.length > 1;
+  $: sizeChoices = current?.size_choices?.[$deck.medium] ?? [];
+  $: showSize = sizeChoices.length > 1;
+  // A size-minimum family (constructed, limited) has no choice list: its size is a
+  // TARGET at or above the served floor (an 80-card Yorion deck). Typed, then
+  // applied on change; the hub refuses anything below 1 and the floor stays the
+  // audit's (CR 100.2a / 100.2b).
+  $: sizeFloor = current?.deck_size ?? 60;
+  $: showTarget = current?.size_is_minimum === true;
+  async function changeTarget(e) {
+    const n = Math.max(
+      sizeFloor,
+      Math.floor(Number(e.target.value) || sizeFloor),
+    );
+    e.target.value = n;
+    if (n === $deck.deck_size) return;
+    const r = await api.setDeckSize(n);
+    if (r.ok) applySnapshot(r.data);
+    else e.target.value = $deck.deck_size; // the deck kept its size; so does the box
+  }
+  // The picker groups by the served family (its label is served too — the Format
+  // is the one authority, ADR-0045); the order is the table's.
+  $: families = [
+    ...new Map($formatOptions.map((f) => [f.family, f.family_label])),
+  ];
 
   function startEdit() {
     draft = $buildName;
@@ -78,8 +100,14 @@
   <div class="meta">
     <BuildMenu />
     <select class="chip format" title="Deck format" on:change={changeFormat}>
-      {#each FORMATS as [val, label] (val)}
-        <option value={val} selected={val === $deck.format}>{label}</option>
+      {#each families as [fam, label] (fam)}
+        <optgroup {label}>
+          {#each $formatOptions.filter((f) => f.family === fam) as f (f.id)}
+            <option value={f.id} selected={f.id === $deck.format}
+              >{f.label}</option
+            >
+          {/each}
+        </optgroup>
       {/each}
     </select>
     {#if showMedium}
@@ -88,21 +116,33 @@
         title="Paper or digital (Arena) — sets the collection & cost mode"
         on:change={changeMedium}
       >
-        <option value="digital" selected={$deck.medium === "digital"}
-          >Arena</option
-        >
-        <option value="paper" selected={$deck.medium === "paper"}>Paper</option>
+        {#each media as m (m)}
+          <option value={m} selected={m === $deck.medium}
+            >{current?.medium_labels?.[m] ?? m}</option
+          >
+        {/each}
       </select>
     {/if}
     {#if showSize}
-      <select
-        class="chip format"
-        title="Paper Historic Brawl may be 60 or 100 cards"
-        on:change={changeDeckSize}
-      >
-        <option value="100" selected={$deck.deck_size === 100}>100</option>
-        <option value="60" selected={$deck.deck_size === 60}>60</option>
+      <select class="chip format" title="Deck size" on:change={changeDeckSize}>
+        {#each sizeChoices as n (n)}
+          <option value={n} selected={n === $deck.deck_size}>{n}</option>
+        {/each}
       </select>
+    {:else if showTarget}
+      <label
+        class="chip format target"
+        title="Deck size target — at least {sizeFloor}; set 80 for a Yorion deck. The land math scales to it; the {sizeFloor}-card floor is the rule."
+      >
+        <input
+          type="number"
+          min={sizeFloor}
+          step="1"
+          value={$deck.deck_size}
+          on:change={changeTarget}
+        />
+        <span>cards</span>
+      </label>
     {/if}
     <FinalizeButton />
   </div>
@@ -212,5 +252,28 @@
   select.format option {
     background: var(--panel);
     color: var(--parchment);
+  }
+  .target {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    cursor: text;
+  }
+  .target input {
+    width: 3.2rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px dashed var(--hairline);
+    color: var(--brass-bright);
+    font-family: var(--body);
+    font-size: 0.78rem;
+    text-align: right;
+  }
+  .target input:focus {
+    outline: none;
+    border-bottom-color: var(--brass);
+  }
+  .target span {
+    color: var(--parchment-dim);
   }
 </style>

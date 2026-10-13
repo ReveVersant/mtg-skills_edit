@@ -37,6 +37,7 @@ from mtg_utils._card_ir.crosswalk import (
     AbilityUnit,
     ConceptNode,
     ConceptTree,
+    additional_phase_kind,
     change_zone_dirs,
     effect_filter,
     explicit_recipient_scope,
@@ -214,7 +215,7 @@ _DOUBLE_PT_TAG: dict[str, str] = {
     "DoublePT": "pump_target",  # 100% x16 n=27
     "DoublePTAll": "pump",  # 100% x10 n=7
 }
-# AdditionalPhase.phase → old extra-phase category (project.py _EXTRA_PHASE).
+# additional_phase_kind → old extra-phase category (project.py _EXTRA_PHASE).
 _EXTRA_PHASE_FIELD: dict[str, str] = {
     "begincombat": "extra_combat",  # 100% x735 n=41
     "upkeep": "extra_upkeep",  # 100% x5270 n=3
@@ -486,7 +487,7 @@ def _pump_pt(
     "-X/-X", scaled by life paid at cast time) has no fixed magnitude the
     adapter can project without guessing, but its SIGN is real and load-
     bearing — CR 613.4c: a mass "-X/-X" can still kill regardless of X's
-    eventual value (``budgets._ir_board_wipe``'s gate only checks
+    eventual value (``roles._ir_board_wipe``'s gate only checks
     ``factor < 0``). Kept as ``Quantity(op="variable", factor=+-1)``, the
     SAME shape project.py's ``_pump_toughness``/``_signed_pt_mod`` gives a
     dynamic pump toughness (SIDECAR v74's own contract). A ``Quantity``-
@@ -569,7 +570,7 @@ def _effect_category(cnode: ConceptNode, cov: CompatCoverage) -> str:
       pump_target split needed. The previous ``tag_of(target) in ("Typed",
       "Or", "And")`` heuristic collapsed EVERY one of these single-target
       shapes into the mass ``pump`` category, which tripped
-      ``budgets._ir_board_wipe``'s mass-shrink gate on a plain single-
+      ``roles._ir_board_wipe``'s mass-shrink gate on a plain single-
       target ``-N/-N`` removal spell (Tragic Slip's base clause) — a false
       positive a live spot-check confirmed (``_ir_board_wipe`` returned
       True for Tragic Slip pre-fix, False post-fix, matching Giant Growth's
@@ -577,7 +578,7 @@ def _effect_category(cnode: ConceptNode, cov: CompatCoverage) -> str:
     * ``tap_untap`` routes on ``SetTapState.state``: Untap = ``untap``
       (measured 99% x44.1); Tap stays a miss (old ``tap`` presence 49% —
       the old projection categorized only some tap forms, via markers).
-    * ``extra_phase`` routes on ``AdditionalPhase.phase`` (the old
+    * ``extra_phase`` routes on ``additional_phase_kind`` (the old
       projection's _EXTRA_PHASE routing, measured per phase).
     * ``give_player_counter`` routes on ``counter_kind`` (CR 122.1 — kinds
       are non-interchangeable; mirrors the old _PLAYER_COUNTER_CATEGORY),
@@ -630,8 +631,7 @@ def _effect_category(cnode: ConceptNode, cov: CompatCoverage) -> str:
         cov.unported["concept:tap_untap"] += 1
         return "other"
     if cnode.concept == "extra_phase":
-        ph = getattr(cnode.node, "phase", None)
-        cat = _EXTRA_PHASE_FIELD.get(ph.lower() if isinstance(ph, str) else "")
+        cat = _EXTRA_PHASE_FIELD.get(additional_phase_kind(cnode.node))
         if cat is not None:
             cov.ported[cat] += 1
             return cat
@@ -892,14 +892,12 @@ def _ability(unit: AbilityUnit, cov: CompatCoverage) -> Ability:
 def compat_card_base(tree: ConceptTree, cov: CompatCoverage | None = None) -> Card:
     """The compat ``Card`` BEFORE the Stage-3b (c) dropped-clause synthesis stage.
 
-    Runs the (b) overlay-correction stage then reads the corrected overlay into
-    old-IR abilities. Split out from :func:`compat_card` so the (c) convergence
-    check can build the pre-synthesis card and observe which arms still fire (find
-    a gap) at the pin.
+    Reads the CORRECTED overlay (``mtg_utils._card_ir.trees.face_tree`` already ran
+    the (b) overlay-correction stage — ADR-0047: the one owner applies it, this
+    reader never re-applies) into old-IR abilities. Split out from
+    :func:`compat_card` so the (c) convergence check can build the pre-synthesis
+    card and observe which arms still fire (find a gap) at the pin.
     """
-    from mtg_utils._card_ir.overlay_corrections import apply_overlay_corrections
-
-    tree = apply_overlay_corrections(tree)
     cov = cov if cov is not None else CompatCoverage()
     abilities = tuple(_ability(u, cov) for u in tree.units)
     return Card(
@@ -916,9 +914,9 @@ def compat_card(tree: ConceptTree, cov: CompatCoverage | None = None) -> Card:
     node into ported / explicitly-unported buckets; pass ``None`` to discard
     the accounting.
 
-    Runs the ADR-0035 Stage-3b (b) overlay-correction stage FIRST — decorating a
-    handful of concept-node fields the pure substrate under-derives — then reads
-    the corrected overlay (:func:`compat_card_base`), then runs the Stage-3b (c)
+    ``tree`` is a CORRECTED tree (the owner ran the ADR-0035 Stage-3b (b)
+    overlay-correction stage; ADR-0047). Reads the corrected overlay
+    (:func:`compat_card_base`), then runs the Stage-3b (c)
     dropped-clause synthesis stage on the built Card
     (:func:`apply_dropped_clause_synthesis`), adding old-IR structure for clauses
     phase dropped entirely. The (c) stage is a strict per-card SUPERSET: a
@@ -977,24 +975,17 @@ def compat_card_from_records(
     that drifts from ``schema`` is skipped and tallied in the returned drift
     count rather than aborting the build. Returns ``(None, drift)`` when
     EVERY face drifts (nothing to build)."""
-    from mtg_utils._card_ir.crosswalk import build_concept_tree
-    from mtg_utils._card_ir.mirror import MirrorDriftError, strict_load_card
+    from mtg_utils._card_ir.trees import face_tree
 
     faces: list[Face] = []
     drift = 0
     name = ""
     for rec in records:
         name = name or (rec.get("name") or "")
-        nm = rec.get("name") or ""
-        try:
-            root = strict_load_card(rec, schema, name=nm)
-        except MirrorDriftError:
+        tree = face_tree(rec, schema, oracle_id=oid)  # the one owner (ADR-0047)
+        if tree is None:
             drift += 1
             continue
-        if root is None:
-            drift += 1
-            continue
-        tree = build_concept_tree(root, name=nm, oracle_id=oid)
         faces.extend(compat_card(tree, cov).faces)
     if not faces:
         return None, drift

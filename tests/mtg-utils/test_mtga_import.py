@@ -36,8 +36,11 @@ import pytest
 from click.testing import CliRunner
 
 from mtg_utils import mtga_import
+from mtg_utils.arena_card_db import player_log_path as _platform_log_path
+from mtg_utils.card_pool import CardPool
 from mtg_utils.mark_owned import mark_owned
 from mtg_utils.mtga_import import (
+    _build_arena_id_index,
     _build_collection_json,
     _build_wildcards_json,
     _check_bulk_freshness,
@@ -45,12 +48,13 @@ from mtg_utils.mtga_import import (
     _collection_from_decks,
     _default_log_path,
     _extract_wildcards,
-    _inject_free_basics,
     _load_untapped_csv,
     _parse_timestamp_prefix,
     _resolve_collection,
     _scan_log,
+    arena_id_index,
     main,
+    read_arena_wildcards,
 )
 
 # A minimal "good" log body — one StartHook with a realistic
@@ -105,6 +109,10 @@ def _fake_bulk_cards(
 
     ``entries`` is a list of ``(arena_id, name, layout)`` tuples. If
     ``arena_id`` is None, the card has no arena_id (paper-only).
+
+    Index machinery only (ADR-0056): each record carries a name plus the
+    per-printing facts the importer reads (``arena_id``, ``layout``), and no
+    card facts — the importer never reads oracle text, types or legalities.
     """
     if entries is None:
         entries = [
@@ -117,8 +125,6 @@ def _fake_bulk_cards(
             "arena_id": arena_id,
             "name": name,
             "layout": layout or "normal",
-            "legalities": {"historic_brawl": "legal"},
-            "games": ["arena", "paper"],
         }
         for arena_id, name, layout in entries
     ]
@@ -489,8 +495,8 @@ class TestArenaIdIndexPrintings:
         assert by_name["Sol Ring"]["printings"] == [
             {"set": "khm", "collector_number": "263", "quantity": 2, "foil_quantity": 0}
         ]
-        # Injected basics carry no printing detail (they're synthesized).
-        assert "printings" not in by_name["Island"]
+        # Basics aren't synthesized: the ownership rule covers them (ADR-0058).
+        assert "Island" not in by_name
 
     def _run(self, tmp_path, output_dir, *extra):
         log_path = tmp_path / "Player.log"
@@ -565,19 +571,11 @@ class TestArenaIdIndexPrintings:
 
 
 def _build_arena_id_index_from_list(cards: list[dict]) -> dict[int, list[str]]:
-    """Helper that mimics _build_arena_id_index without touching disk."""
-    index: dict[int, list[str]] = {}
-    for card in cards:
-        arena_id = card.get("arena_id")
-        if not isinstance(arena_id, int):
-            continue
-        name = card.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        bucket = index.setdefault(arena_id, [])
-        if name not in bucket:
-            bucket.append(name)
-    return index
+    """The production :func:`arena_id_index` over an in-memory pool, as names."""
+    return {
+        arena_id: [entry["name"] for entry in entries]
+        for arena_id, entries in arena_id_index(CardPool.from_cards(cards)).items()
+    }
 
 
 class TestResolveCollection:
@@ -729,39 +727,6 @@ class TestResolveCollection:
         assert cards == [{"name": "Sol Ring", "quantity": 2}]
 
 
-class TestBasicInject:
-    def test_all_six_basics_injected_when_absent(self):
-        cards = _inject_free_basics([])
-        names = {c["name"] for c in cards}
-        assert names == {"Island", "Mountain", "Plains", "Forest", "Swamp", "Wastes"}
-        assert all(c["quantity"] == 99 for c in cards)
-
-    def test_existing_basics_bumped_to_at_least_99(self):
-        cards = _inject_free_basics(
-            [
-                {"name": "Island", "quantity": 4},
-                {"name": "Mountain", "quantity": 150},
-            ],
-        )
-        by_name = {c["name"]: c["quantity"] for c in cards}
-        assert by_name["Island"] == 99  # bumped up
-        assert by_name["Mountain"] == 150  # preserved because higher
-
-    def test_snow_basics_are_not_injected(self):
-        """Snow basics are collected normally on Arena — the importer
-        must not synthesize entries for them."""
-        cards = _inject_free_basics([])
-        names = {c["name"] for c in cards}
-        assert "Snow-Covered Island" not in names
-        assert "Snow-Covered Mountain" not in names
-
-    def test_non_basic_cards_are_preserved(self):
-        cards = _inject_free_basics([{"name": "Sol Ring", "quantity": 1}])
-        by_name = {c["name"]: c["quantity"] for c in cards}
-        assert by_name["Sol Ring"] == 1
-        assert by_name["Island"] == 99
-
-
 class TestWildcardsExtraction:
     """The real MTGA log field names are ``WildCardMythics`` etc.,
     NOT ``wcMythic``. See the module docstring of mtga_import for why
@@ -804,6 +769,50 @@ class TestWildcardsExtraction:
         logs; it's an old manasight-parser assumption."""
         wc = _extract_wildcards({"wcMythic": 99, "wcRare": 99})
         assert wc == {"mythic": 0, "rare": 0, "uncommon": 0, "common": 0}
+
+
+class TestReadArenaWildcards:
+    """``read_arena_wildcards`` — deck-forge's budget seed: the latest login's
+    counts from Player.log (Player-prev.log as the fallback), ``None`` and never an
+    error when nothing is readable."""
+
+    def test_reads_the_latest_inventory_and_its_login_time(self, tmp_path):
+        log = tmp_path / "Player.log"
+        log.write_text(_GOOD_LOG)
+        assert read_arena_wildcards(log) == {
+            "wildcards": {"mythic": 3, "rare": 12, "uncommon": 47, "common": 132},
+            "captured_local": "2026-04-10T14:32:17",
+        }
+
+    def test_falls_back_to_the_previous_log(self, tmp_path):
+        (tmp_path / "Player.log").write_text("no login yet\n")
+        (tmp_path / "Player-prev.log").write_text(_GOOD_LOG)
+        found = read_arena_wildcards(tmp_path / "Player.log")
+        assert found is not None
+        assert found["wildcards"]["rare"] == 12
+
+    def test_no_log_or_no_inventory_is_none(self, tmp_path):
+        assert read_arena_wildcards(tmp_path / "Player.log") is None
+        (tmp_path / "Player.log").write_text("<== StartHook(x) {broken\n")
+        assert read_arena_wildcards(tmp_path / "Player.log") is None
+
+    def test_an_unreadable_log_is_none(self, tmp_path, monkeypatch):
+        log = tmp_path / "Player.log"
+        log.write_text(_GOOD_LOG)
+
+        def denied(_path):
+            raise PermissionError("locked")
+
+        monkeypatch.setattr("mtg_utils.mtga_import._read_log_text", denied)
+        assert read_arena_wildcards(log) is None
+
+    def test_defaults_to_the_platform_log(self, tmp_path, monkeypatch):
+        log = tmp_path / "Player.log"
+        log.write_text(_GOOD_LOG)
+        monkeypatch.setattr("mtg_utils.mtga_import.player_log_path", lambda: log)
+        assert read_arena_wildcards()["wildcards"]["mythic"] == 3
+        monkeypatch.setattr("mtg_utils.mtga_import.player_log_path", lambda: None)
+        assert read_arena_wildcards() is None
 
 
 class TestFreshnessWarnings:
@@ -898,10 +907,7 @@ class TestEndToEndMarkOwned:
             {"100": 4, "200": 2},
             {100: ["Sheoldred, the Apocalypse"], 200: ["Sol Ring"]},
         )
-        collection = _build_collection_json(
-            _inject_free_basics(cards),
-            format="historic_brawl",
-        )
+        collection = _build_collection_json(cards, format="historic_brawl")
         deck = {
             "commanders": [{"name": "Sheoldred, the Apocalypse", "quantity": 1}],
             "cards": [
@@ -914,11 +920,18 @@ class TestEndToEndMarkOwned:
         owned_names = {e["name"] for e in marked["owned_cards"]}
         assert "Sheoldred, the Apocalypse" in owned_names
         assert "Sol Ring" in owned_names
-        assert "Island" in owned_names  # basics injected with qty 99
+        # Basics aren't recorded: the ownership rule covers them (ADR-0058).
+        assert "Island" not in owned_names
         assert "Unowned Card" not in owned_names
 
 
 class TestPathDetection:
+    @pytest.fixture(autouse=True)
+    def _real_path_lookup(self, monkeypatch):
+        """Restore the platform lookup tests/conftest.py stubs out — these tests
+        fake the platform and home directory, so no real log is read."""
+        monkeypatch.setattr(mtga_import, "player_log_path", _platform_log_path)
+
     def test_macos_path(self, monkeypatch):
         monkeypatch.setattr(mtga_import.sys, "platform", "darwin")
         monkeypatch.setattr(
@@ -1153,13 +1166,12 @@ class TestCLI:
         assert wildcards_path.exists()
 
         collection = json.loads(collection_path.read_text())
-        # Three resolved cards + 6 injected basics.
+        # The three resolved cards; basics aren't synthesized (ADR-0058).
         names = {c["name"] for c in collection["cards"]}
         assert "Sheoldred, the Apocalypse" in names
         assert "Sol Ring" in names
         assert "Lightning Bolt" in names
-        for basic in ("Island", "Mountain", "Plains", "Forest", "Swamp", "Wastes"):
-            assert basic in names
+        assert "Island" not in names
 
         # Quantities should reflect the max-across-zones reduction:
         # cardId 100 → Sheoldred at qty 4, cardId 200 → Sol Ring at qty 2,
@@ -1247,9 +1259,8 @@ class TestCLI:
         assert by_name["Untapped Only Card"] == 2
         # Not-owned row should not appear in collection output.
         assert "Not Owned" not in by_name
-        # Basics should still be injected.
-        for basic in ("Island", "Mountain", "Plains", "Forest", "Swamp", "Wastes"):
-            assert basic in by_name
+        # Basics aren't synthesized (the ownership rule covers them, ADR-0058).
+        assert "Island" not in by_name
 
     def test_collection_source_untapped_csv_requires_csv_path(self, tmp_path):
         """Selecting untapped-csv without passing --untapped-csv
@@ -1455,3 +1466,23 @@ class TestCLI:
         collection = json.loads((output_dir / "collection.json").read_text())
         names = {c["name"] for c in collection["cards"]}
         assert "Sheoldred, the Apocalypse" in names
+
+
+def test_arena_ids_resolve_against_the_mtgjson_bulk(tmp_path):
+    """The card data of record is MTGJSON (ADR-0033): a Player.log id must resolve
+    through a real ``AllPrintings`` file, not only a Scryfall-shaped one. It
+    resolved nothing while the adapter dropped ``mtgArenaId``."""
+    from mtg_utils.testkit import mtgjson_printing, mtgjson_sets
+
+    bulk_path = tmp_path / "AllPrintings.json"
+    bulk_path.write_text(
+        json.dumps(
+            mtgjson_sets(
+                mtgjson_printing(
+                    "Lightning Bolt", "J21", "uncommon", ["arena"], arena_id=72104
+                ),
+            )
+        )
+    )
+    index = _build_arena_id_index(bulk_path)
+    assert [entry["name"] for entry in index[72104]] == ["Lightning Bolt"]

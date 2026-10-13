@@ -16,13 +16,14 @@ from __future__ import annotations
 
 # The full legality-format universe. MTGJSON OMITS not-legal formats, so the adapter
 # fills every absent key with "not_legal" — matching Scryfall, whose records carry
-# every format. These 20 are MTGJSON's emitted set; they cover every format any
-# consumer reads via ``format_config`` (Scryfall's extra ``oldschool`` / ``tlr`` are
+# every format. These 21 are MTGJSON's emitted set; they cover every format any
+# consumer reads via ``formats`` (Scryfall's extra ``oldschool`` / ``tlr`` are
 # read by nothing). Values are lowercased (MTGJSON Capitalizes them).
 _LEGALITY_FORMATS: tuple[str, ...] = (
     "alchemy",
     "brawl",
     "commander",
+    "competitivebrawl",
     "duel",
     "future",
     "gladiator",
@@ -41,6 +42,11 @@ _LEGALITY_FORMATS: tuple[str, ...] = (
     "timeless",
     "vintage",
 )
+
+# Arena's Competitive Brawl key: MTGJSON emits it from 5.3.0+20261010
+# (mtgjson/mtgjson#1742). A file older than that carries it on no card, so every
+# record reads not_legal there; ``load.flatten`` warns when it sees one.
+COMPETITIVE_BRAWL_KEY = "competitivebrawl"
 
 # Scryfall CDN sizes the codebase reads (see ``_deck_forge/images.py``). All are .jpg.
 _IMAGE_SIZES: tuple[str, ...] = ("small", "normal", "art_crop")
@@ -88,24 +94,6 @@ def aggregate_legalities(per_printing: list[dict | None]) -> dict:
             if _LEG_RANK.get(s, 0) > _LEG_RANK.get(acc.get(fmt, "not_legal"), 0):
                 acc[fmt] = s
     return {fmt: acc.get(fmt, "not_legal") for fmt in _LEGALITY_FORMATS}
-
-
-# Arena-digital-only formats: a card can't be legal in one without an Arena printing.
-# MTGJSON occasionally marks a paper-only card legal here (Lord of Atlantis, pw24);
-# Scryfall — which tracks Arena availability precisely — does not. Gate on availability.
-_ARENA_ONLY_FORMATS = frozenset(
-    {"alchemy", "brawl", "historic", "timeless", "standardbrawl"}
-)
-
-
-def gate_arena_formats(legalities: dict, *, arena_available: bool) -> dict:
-    """Force Arena-only formats to ``not_legal`` for a card with no Arena printing."""
-    if arena_available:
-        return legalities
-    return {
-        fmt: ("not_legal" if fmt in _ARENA_ONLY_FORMATS else status)
-        for fmt, status in legalities.items()
-    }
 
 
 # Un-set supplemental game pieces: sticker SHEETS (type "Stickers") and
@@ -173,6 +161,15 @@ def prices(uuid: str | None, price_index: dict) -> dict:
         "tix": _latest(ch.get("normal")),
     }
     return {k: v for k, v in out.items() if v is not None}
+
+
+def _arena_id(raw: str | int | None) -> int | None:
+    """MTGJSON's ``mtgArenaId`` (a string) as Scryfall's ``arena_id`` (an int), or
+    None for a printing Arena doesn't have."""
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _part(component: str, rec: dict, *, prefer_face: bool = False) -> dict:
@@ -259,9 +256,18 @@ def translate_card(
     token_parts: list | None = None,
     card_by_uuid: dict | None = None,
     legalities_index: dict | None = None,
+    arena_index: dict | None = None,
     set_meta: dict | None = None,
 ) -> dict:
     """Translate one physical card (1 entry, or 2+ face-entries) to a Scryfall dict.
+
+    ``arena_index`` is the oracle-level "any printing exists on Arena" map (built in
+    ``load.flatten``); it becomes the record's ``arena_available``, which
+    ``formats.Format.legality`` gates the Arena-pool formats on. MTGJSON occasionally
+    marks a paper-only card legal in an Arena-defined format (Lord of Atlantis, pw24);
+    Scryfall — which tracks Arena availability precisely — does not. Legalities are
+    emitted as aggregated, never rewritten here. Without the index (a lone printing,
+    a token) the printing's own availability stands in.
 
     ``token_parts`` is the precomputed oracle-level ``token`` all_parts list for this
     card (built in ``load.flatten`` so a token-less promo printing still carries the
@@ -292,6 +298,7 @@ def translate_card(
     rec: dict = {
         "oracle_id": oracle_id,
         "id": ids.get("scryfallId"),
+        "arena_id": _arena_id(ids.get("mtgArenaId")),
         "name": name,
         "type_line": " // ".join(f.get("type", "") or "" for f in faces),
         # Scryfall cmc is always a float (0.0 for lands/tokens); MTGJSON omits manaValue
@@ -305,7 +312,20 @@ def translate_card(
         "collector_number": front.get("number"),
         "layout": layout,
         "games": [g for g in (front.get("availability") or []) if g in _GAMES],
+        "reprint": bool(front.get("isReprint")),
+        "arena_available": (
+            bool(arena_index.get(oracle_id))
+            if arena_index is not None and oracle_id in arena_index
+            else "arena" in (front.get("availability") or [])
+        ),
         "finishes": front.get("finishes") or [],
+        # Printing style — what makes a printing a special one (a full-art or
+        # showcase basic; ``formats.is_special_basic_request``).
+        "full_art": bool(front.get("isFullArt")),
+        "border_color": front.get("borderColor"),
+        "frame_effects": front.get("frameEffects") or [],
+        "promo": bool(front.get("isPromo")),
+        "promo_types": front.get("promoTypes") or [],
         "game_changer": bool(front.get("isGameChanger")),
         # Pre-split arrays — new, used to harden the _subtypes precision gate.
         "types": front.get("types") or [],

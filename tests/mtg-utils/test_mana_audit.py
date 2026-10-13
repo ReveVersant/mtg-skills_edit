@@ -14,14 +14,15 @@ from mtg_utils.mana_audit import (
     constructed_land_target,
     karsten_adjustment,
     land_band,
-    land_band_status,
-    land_count_status,
+    land_band_readout,
+    limited_land_target,
     main,
     mana_audit,
     pip_demand,
     render_text_report,
 )
 from mtg_utils.parse_deck import parse_deck
+from mtg_utils.testkit import test_card
 
 
 def _hd(deck, hydrated):
@@ -31,16 +32,13 @@ def _hd(deck, hydrated):
 class TestPipDemandFaces:
     def test_counts_mdfc_face_pips(self):
         # Modal DFCs carry no top-level mana_cost; pips live on card_faces and must
-        # not be silently dropped.
-        mdfc = {
-            "name": "Malakir Rebirth // Malakir Mire",
-            "mana_cost": None,
-            "card_faces": [{"mana_cost": "{2}{B}"}, {"mana_cost": ""}],
-        }
+        # not be silently dropped. Blackbloom Rogue is {2}{B}; its land back is free.
+        mdfc = test_card("Blackbloom Rogue // Blackbloom Bog")
+        assert mdfc.get("mana_cost") is None
         assert pip_demand([mdfc]) == {"B": 1}
 
     def test_normal_card_still_uses_top_level_cost(self):
-        card = {"name": "Lightning Helix", "mana_cost": "{R}{W}"}
+        card = test_card("Lightning Helix")
         assert pip_demand([card]) == {"R": 1, "W": 1}
 
 
@@ -105,20 +103,31 @@ class TestKarstenAdjustment:
         assert karsten_adjustment(ramp_count=100) == 36
 
 
-class TestLandCountStatus:
+def _constructed(land_count, *, floor, top):
+    return land_band_readout(
+        land_count=land_count, floor=floor, top=top, warn_below_top=True
+    )["status"]
+
+
+class TestConstructedReadoutStatus:
+    """The 60-card gate: FAIL below the floor, WARN between floor and the target,
+    PASS at or above it, FLOOD above top + 2."""
+
     def test_pass_at_recommended(self):
-        assert land_count_status(land_count=38, recommended=38, burgess=36) == "PASS"
+        assert _constructed(38, floor=36, top=38) == "PASS"
 
     def test_warn_below_recommended(self):
-        assert land_count_status(land_count=37, recommended=38, burgess=36) == "WARN"
+        assert _constructed(37, floor=36, top=38) == "WARN"
 
-    def test_fail_below_burgess(self):
-        assert land_count_status(land_count=35, recommended=38, burgess=36) == "FAIL"
+    def test_fail_below_floor(self):
+        assert _constructed(35, floor=36, top=38) == "FAIL"
 
-    def test_warn_at_burgess_below_recommended(self):
-        # Mono-color low CMC: Burgess says 35, Karsten says 38.
-        # At 35 lands we meet Burgess → WARN (not FAIL).
-        assert land_count_status(land_count=35, recommended=38, burgess=35) == "WARN"
+    def test_warn_at_floor_below_recommended(self):
+        assert _constructed(35, floor=35, top=38) == "WARN"
+
+    def test_flood_above_top_plus_two(self):
+        assert _constructed(40, floor=36, top=38) == "PASS"
+        assert _constructed(41, floor=36, top=38) == "FLOOD"
 
 
 class TestLandBand:
@@ -145,27 +154,41 @@ class TestLandBand:
         assert (floor, top) == (23, 25)
 
 
-class TestLandBandStatus:
+def _commander(land_count, *, floor=38, top=41):
+    return land_band_readout(
+        land_count=land_count, floor=floor, top=top, warn_below_top=False
+    )
+
+
+class TestCommanderReadout:
+    """ADR-0041: FAIL only below the floor; the top is a reference, never a WARN
+    line; above top + 2 the advisory FLOOD status (never a gate)."""
+
     def test_fail_below_floor(self):
-        assert land_band_status(land_count=37, floor=38) == "FAIL"
+        assert _commander(37)["status"] == "FAIL"
 
     def test_pass_at_floor(self):
-        assert land_band_status(land_count=38, floor=38) == "PASS"
+        assert _commander(38)["status"] == "PASS"
 
     def test_pass_within_band(self):
-        assert land_band_status(land_count=40, floor=38) == "PASS"
+        assert _commander(40)["status"] == "PASS"
 
-    def test_pass_above_band_top_too(self):
-        # The band top is a reference, never a second failure/warning line.
-        assert land_band_status(land_count=50, floor=38) == "PASS"
+    def test_pass_above_band_top_up_to_the_flood_line(self):
+        assert _commander(43)["status"] == "PASS"
+
+    def test_flood_above_the_flood_line(self):
+        assert _commander(44) == {
+            "floor": 38,
+            "top": 41,
+            "flood": 43,
+            "count": 44,
+            "status": "FLOOD",
+        }
 
 
 class TestPipDemand:
     def test_counts_colored_pips(self):
-        cards = [
-            {"mana_cost": "{U}{U}"},  # Counterspell
-            {"mana_cost": "{2}{B}{B}"},  # No Mercy
-        ]
+        cards = [test_card("Counterspell"), test_card("No Mercy")]
         result = pip_demand(cards)
         assert result == {"B": 2, "U": 2}
 
@@ -234,12 +257,9 @@ class TestManaAudit:
         # Check all required keys are present
         expected_keys = [
             "land_count",
-            "recommended_land_count",
-            "land_count_floor",
             "burgess_formula",
             "karsten_adjustment",
             "land_band",
-            "land_count_status",
             "ramp_count",
             "avg_cmc",
             "pip_demand",
@@ -260,11 +280,10 @@ class TestManaAudit:
         assert "result" in result["burgess_formula"]
         assert "ramp_count" in result["karsten_adjustment"]
         assert "result" in result["karsten_adjustment"]
-        assert "floor" in result["land_band"]
-        assert "top" in result["land_band"]
+        assert set(result["land_band"]) == {"floor", "top", "flood", "count", "status"}
 
         # Validate status values
-        assert result["land_count_status"] in ("PASS", "WARN", "FAIL")
+        assert result["land_band"]["status"] in ("PASS", "WARN", "FAIL", "FLOOD")
         assert result["color_balance_status"] in ("PASS", "WARN", "FAIL")
         assert result["overall_status"] in ("PASS", "WARN", "FAIL")
 
@@ -297,9 +316,10 @@ class TestManaAudit:
 def _benchmark_deck(*, land_count, ramp_count=12):
     """ADR-0041 benchmark shape: 5-color, CMC-5 commander, N ramp pieces,
     land_count copies of one land (a real deck would vary basics/nonbasics;
-    land count is all this audit cares about)."""
+    land count is all this audit cares about). The commander is fictional
+    machinery: the benchmark needs a 5-color, CMC-5 commander with no text."""
     commander = {
-        "name": "Bennie Bracks, Zoologist",
+        "name": "Benchmark Commander",
         "cmc": 5.0,
         "type_line": "Legendary Creature — Human Advisor",
         "mana_cost": "{W}{U}{B}{R}{G}",
@@ -316,15 +336,7 @@ def _benchmark_deck(*, land_count, ramp_count=12):
         }
         for i in range(ramp_count)
     ]
-    land = {
-        "name": "Command Tower",
-        "cmc": 0.0,
-        "type_line": "Land",
-        "oracle_text": (
-            "({T}: Add one mana of any color in your commander's color identity.)"
-        ),
-        "keywords": [],
-    }
+    land = test_card("Command Tower")
     deck = {
         "format": "commander",
         "commanders": [{"name": commander["name"], "quantity": 1}],
@@ -341,18 +353,27 @@ class TestManaAuditBenchmarkLandBand:
 
     def test_pass_at_40_lands(self):
         result = mana_audit(_benchmark_deck(land_count=40))
-        assert result["land_count_floor"] == 38
-        assert result["recommended_land_count"] == 41
-        assert result["land_band"] == {"floor": 38, "top": 41}
-        assert result["land_count_status"] == "PASS"
+        assert result["land_band"] == {
+            "floor": 38,
+            "top": 41,
+            "flood": 43,
+            "count": 40,
+            "status": "PASS",
+        }
 
     def test_pass_at_the_floor(self):
         result = mana_audit(_benchmark_deck(land_count=38))
-        assert result["land_count_status"] == "PASS"
+        assert result["land_band"]["status"] == "PASS"
 
     def test_fail_just_below_the_floor(self):
         result = mana_audit(_benchmark_deck(land_count=37))
-        assert result["land_count_status"] == "FAIL"
+        assert result["land_band"]["status"] == "FAIL"
+        assert result["overall_status"] == "FAIL"
+
+    def test_flood_is_advisory_never_the_overall_gate(self):
+        result = mana_audit(_benchmark_deck(land_count=44))
+        assert result["land_band"]["status"] == "FLOOD"
+        assert result["overall_status"] != "FAIL"
 
 
 class TestCLI:
@@ -371,7 +392,13 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            [str(deck_path), str(hydrated_path), "--output", str(output_path)],
+            [
+                str(deck_path),
+                "--bulk-data",
+                str(hydrated_path),
+                "--output",
+                str(output_path),
+            ],
         )
         assert result.exit_code == 0, result.output
         assert "mana-audit:" in result.output
@@ -398,10 +425,10 @@ class TestCLI:
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--compare",
                 str(deck_path),
-                str(hydrated_path),
                 "--output",
                 str(output_path),
             ],
@@ -436,15 +463,11 @@ class TestScaledFormulas:
     def test_karsten_unscaled_at_100(self):
         assert karsten_adjustment(ramp_count=0) == 42
 
-    def test_land_count_status_scaled_floor(self):
-        # For 60-card Brawl with Burgess floor 22: below is FAIL, at is WARN
-        assert land_count_status(land_count=21, recommended=23, burgess=22) == "FAIL"
-        assert land_count_status(land_count=22, recommended=23, burgess=22) == "WARN"
-        assert land_count_status(land_count=23, recommended=23, burgess=22) == "PASS"
-
-    def test_land_count_status_default_100(self):
-        # 35 lands with Burgess=36 → FAIL (below Burgess)
-        assert land_count_status(land_count=35, recommended=38, burgess=36) == "FAIL"
+    def test_constructed_readout_scaled_floor(self):
+        # For a 60-card deck with floor 22 / target 23: below is FAIL, at is WARN
+        assert _constructed(21, floor=22, top=23) == "FAIL"
+        assert _constructed(22, floor=22, top=23) == "WARN"
+        assert _constructed(23, floor=22, top=23) == "PASS"
 
 
 class TestManaAuditWithFormat:
@@ -453,25 +476,12 @@ class TestManaAuditWithFormat:
         deck = {
             "format": "brawl",
             "deck_size": 60,
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Korvold, Fae-Cursed King", "quantity": 1}],
             "cards": [{"name": "Mountain", "quantity": 22}],
         }
         hydrated = [
-            {
-                "name": "Korvold",
-                "cmc": 5,
-                "type_line": "Legendary Creature",
-                "mana_cost": "{2}{B}{R}{G}",
-                "keywords": [],
-                "color_identity": ["B", "R", "G"],
-            },
-            {
-                "name": "Mountain",
-                "cmc": 0,
-                "type_line": "Basic Land — Mountain",
-                "oracle_text": "({T}: Add {R}.)",
-                "keywords": [],
-            },
+            test_card("Korvold, Fae-Cursed King"),
+            test_card("Mountain"),
         ]
         result = mana_audit(_hd(deck, hydrated))
         assert result["land_count"] == 22
@@ -482,25 +492,12 @@ class TestManaAuditWithFormat:
 class TestCompareLabels:
     def test_uses_primary_comparison_keys(self, tmp_path):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Korvold, Fae-Cursed King", "quantity": 1}],
             "cards": [{"name": "Mountain", "quantity": 37}],
         }
         hydrated = [
-            {
-                "name": "Korvold",
-                "cmc": 5,
-                "type_line": "Legendary Creature",
-                "mana_cost": "{2}{B}{R}{G}",
-                "keywords": [],
-                "color_identity": ["B", "R", "G"],
-            },
-            {
-                "name": "Mountain",
-                "cmc": 0,
-                "type_line": "Basic Land — Mountain",
-                "oracle_text": "({T}: Add {R}.)",
-                "keywords": [],
-            },
+            test_card("Korvold, Fae-Cursed King"),
+            test_card("Mountain"),
         ]
         deck_path = tmp_path / "deck.json"
         deck_path.write_text(json.dumps(deck))
@@ -515,9 +512,11 @@ class TestCompareLabels:
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--compare",
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--output",
                 str(output_path),
@@ -532,25 +531,12 @@ class TestCompareLabels:
 
     def test_includes_source_filenames(self, tmp_path):
         deck = {
-            "commanders": [{"name": "Korvold", "quantity": 1}],
+            "commanders": [{"name": "Korvold, Fae-Cursed King", "quantity": 1}],
             "cards": [{"name": "Mountain", "quantity": 37}],
         }
         hydrated = [
-            {
-                "name": "Korvold",
-                "cmc": 5,
-                "type_line": "Legendary Creature",
-                "mana_cost": "{2}{B}{R}{G}",
-                "keywords": [],
-                "color_identity": ["B", "R", "G"],
-            },
-            {
-                "name": "Mountain",
-                "cmc": 0,
-                "type_line": "Basic Land — Mountain",
-                "oracle_text": "({T}: Add {R}.)",
-                "keywords": [],
-            },
+            test_card("Korvold, Fae-Cursed King"),
+            test_card("Mountain"),
         ]
         deck_path = tmp_path / "primary.json"
         deck_path.write_text(json.dumps(deck))
@@ -567,10 +553,10 @@ class TestCompareLabels:
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--compare",
                 str(compare_path),
-                str(hydrated_path),
                 "--output",
                 str(output_path),
             ],
@@ -609,6 +595,33 @@ class TestConstructedLandTarget:
         assert r80 > r60
 
 
+class TestLimitedLandTarget:
+    """The 40-card norm is 17, a tight 16-18 band — not the constructed formula
+    scaled down (which reads the 17-land default as over-landed)."""
+
+    def test_baseline_17(self):
+        assert limited_land_target(ramp_count=0, avg_cmc=3.0) == 17
+
+    def test_low_curve_cuts_one(self):
+        assert limited_land_target(ramp_count=0, avg_cmc=2.4) == 16
+
+    def test_real_ramp_cuts_one(self):
+        assert limited_land_target(ramp_count=3, avg_cmc=3.0) == 16
+
+    def test_high_curve_adds_one(self):
+        assert limited_land_target(ramp_count=0, avg_cmc=3.6) == 18
+
+    def test_never_outside_the_band(self):
+        assert limited_land_target(ramp_count=9, avg_cmc=1.0) == 16
+        assert limited_land_target(ramp_count=0, avg_cmc=6.0) == 18
+
+    def test_scales_to_the_deck_size(self):
+        assert limited_land_target(ramp_count=0, avg_cmc=3.0, deck_size=60) == 26
+
+    def test_no_curve_yet_is_the_baseline(self):
+        assert limited_land_target(ramp_count=0, avg_cmc=0.0) == 17
+
+
 class TestConstructedManaAudit:
     def test_constructed_uses_constructed_target(self):
         deck = {
@@ -621,22 +634,8 @@ class TestConstructedManaAudit:
             ],
         }
         hydrated = [
-            {
-                "name": "Lightning Bolt",
-                "cmc": 1.0,
-                "mana_cost": "{R}",
-                "type_line": "Instant",
-                "keywords": [],
-                "oracle_text": "Lightning Bolt deals 3 damage to any target.",
-            },
-            {
-                "name": "Mountain",
-                "cmc": 0.0,
-                "mana_cost": "",
-                "type_line": "Basic Land — Mountain",
-                "keywords": [],
-                "oracle_text": "({T}: Add {R}.)",
-            },
+            test_card("Lightning Bolt"),
+            test_card("Mountain"),
         ]
         result = mana_audit(_hd(deck, hydrated))
         assert "constructed_land_target" in result
@@ -653,22 +652,8 @@ class TestConstructedManaAudit:
             "sideboard": [{"name": "Island", "quantity": 5}],
         }
         hydrated = [
-            {
-                "name": "Mountain",
-                "cmc": 0.0,
-                "mana_cost": "",
-                "type_line": "Basic Land — Mountain",
-                "keywords": [],
-                "oracle_text": "({T}: Add {R}.)",
-            },
-            {
-                "name": "Island",
-                "cmc": 0.0,
-                "mana_cost": "",
-                "type_line": "Basic Land — Island",
-                "keywords": [],
-                "oracle_text": "({T}: Add {U}.)",
-            },
+            test_card("Mountain"),
+            test_card("Island"),
         ]
         result = mana_audit(_hd(deck, hydrated))
         assert result["land_count"] == 22  # sideboard Island not counted
@@ -735,14 +720,15 @@ class TestEffectiveCommanderCost:
         )
 
 
-def _limited_deck(land_count: int):
-    """A 40-card constructed-shaped deck (Arena limited): 23 3-cmc
-    creatures plus ``land_count`` Plains. Avg cmc 3.0 keeps the
-    constructed target at its baseline (24 scaled to 16)."""
+def _limited_deck(land_count: int, fmt: str = "timeless", cmc: float = 3.0):
+    """A 40-card deck: 23 ``cmc``-cost creatures plus ``land_count`` Plains. Labelled
+    ``timeless`` it is a constructed-shaped deck (avg cmc 3.0 keeps the constructed
+    target at its baseline, 24 scaled to 16); labelled ``sealed`` it is a limited
+    deck under the 17-of-40 norm."""
     spells = [
         {
             "name": f"Bear {i}",
-            "cmc": 3.0,
+            "cmc": cmc,
             "type_line": "Creature — Bear",
             "mana_cost": "{2}{W}",
             "oracle_text": "",
@@ -750,21 +736,56 @@ def _limited_deck(land_count: int):
         }
         for i in range(23)
     ]
-    plains = {
-        "name": "Plains",
-        "cmc": 0.0,
-        "type_line": "Basic Land — Plains",
-        "oracle_text": "({T}: Add {W}.)",
-        "keywords": [],
-    }
+    plains = test_card("Plains")
     deck = {
-        "format": "timeless",
+        "format": fmt,
         "deck_size": 40,
         "commanders": [],
         "cards": [{"name": s["name"], "quantity": 1} for s in spells]
         + [{"name": "Plains", "quantity": land_count}],
     }
     return _hd(deck, [plains, *spells])
+
+
+class TestLimitedManaAudit:
+    """A limited deck reads the 17-of-40 band (16-18), not the constructed formula
+    scaled down."""
+
+    def test_17_lands_is_the_norm(self):
+        result = mana_audit(_limited_deck(17, fmt="sealed"))
+        assert "limited_land_target" in result
+        assert "constructed_land_target" not in result
+        assert result["land_band"]["top"] == 17
+        assert result["land_band"]["floor"] == 16
+        assert result["land_band"]["flood"] == 19
+        assert result["land_band"]["status"] == "PASS"
+
+    def test_band_edges(self):
+        assert mana_audit(_limited_deck(16, fmt="draft"))["land_band"]["status"] == (
+            "WARN"
+        )
+        assert mana_audit(_limited_deck(15, fmt="sealed"))["land_band"]["status"] == (
+            "FAIL"
+        )
+        assert mana_audit(_limited_deck(20, fmt="sealed"))["land_band"]["status"] == (
+            "FLOOD"
+        )
+
+    def test_render_shows_the_limited_target(self):
+        text = render_text_report(mana_audit(_limited_deck(17, fmt="sealed")))
+        assert "target: 17" in text
+
+    def test_floor_never_drops_below_the_band_minimum(self):
+        """A low curve pulls the target to 16, the band's own minimum; the FAIL
+        floor stays there rather than sliding to 15."""
+        result = mana_audit(_limited_deck(16, fmt="sealed", cmc=2.0))
+        assert result["land_band"]["top"] == 16
+        assert result["land_band"]["floor"] == 16
+        assert result["land_band"]["status"] == "PASS"
+        assert (
+            mana_audit(_limited_deck(15, fmt="sealed", cmc=2.0))["land_band"]["status"]
+            == "FAIL"
+        )
 
 
 class TestConstructedFloorScalesWithDeckSize:
@@ -774,11 +795,11 @@ class TestConstructedFloorScalesWithDeckSize:
 
     def test_40_card_deck_at_target_passes(self):
         result = mana_audit(_limited_deck(land_count=17))
-        assert result["recommended_land_count"] == 16
-        assert result["land_count_floor"] == 14
-        assert result["land_count_status"] == "PASS"
+        assert result["land_band"]["top"] == 16
+        assert result["land_band"]["floor"] == 14
+        assert result["land_band"]["status"] == "PASS"
 
     def test_40_card_deck_below_scaled_floor_fails(self):
         result = mana_audit(_limited_deck(land_count=13))
-        assert result["land_count_floor"] == 14
-        assert result["land_count_status"] == "FAIL"
+        assert result["land_band"]["floor"] == 14
+        assert result["land_band"]["status"] == "FAIL"

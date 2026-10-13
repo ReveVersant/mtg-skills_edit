@@ -2,9 +2,8 @@
 
 Runs three independent checks against a parsed deck + hydrated card data:
 
-1. **Format legality**: every card's ``legalities[<format>]`` must be ``legal``
-   or ``restricted`` (the codebase convention — see ``find_commanders``,
-   ``card_search``, ``scryfall_lookup``).
+1. **Format legality**: every card's ``Format.legality`` status must be ``legal``
+   or ``restricted`` (the one legality read — ``mtg_utils.formats``, ADR-0045).
 2. **Color identity**: every card's ``color_identity`` must be a subset of
    the commander(s)' combined color identity. Brawl/Historic Brawl grant a
    colorless-commander exemption allowing any number of basic lands of one
@@ -20,7 +19,6 @@ inspect ``overall_status`` to decide what to do with the result.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -31,11 +29,13 @@ from mtg_utils.card_classify import (
     build_card_lookup,
     has_any_number_exemption,
     is_basic_land,
+    is_basic_land_name,
     named_card_cap,
 )
 from mtg_utils.companion import companion_violations, is_companion
-from mtg_utils.format_config import get_format_config
-from mtg_utils.hydrated_deck import HydratedDeck
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
+from mtg_utils.formats import LEGAL_STATUSES, Format
+from mtg_utils.hydrated_deck import HydratedDeck, sidecar_path
 from mtg_utils.rules_lookup import load_rules, resolve_rules_path
 
 # Map legality-audit violation reasons to the Comprehensive Rules rules
@@ -56,8 +56,11 @@ _REASON_TO_CR_RULES: dict[str, tuple[str, ...]] = {
     "colorless_deck_must_pick_one_basic_type": ("903.5d",),
     # 100.4a: sideboard max 15 cards.
     "sideboard_too_large": ("100.4a",),
-    # 100.2a (60-card minimum) and 903.5a (100-card Commander minimum).
-    "below_minimum": ("100.2a", "903.5a"),
+    # 100.2a (60-card minimum), 100.2b (40-card limited minimum) and 903.5a
+    # (100-card Commander minimum).
+    "below_minimum": ("100.2a", "100.2b", "903.5a"),
+    # 100.2b: a limited deck is built from the opened product plus basic lands.
+    "not_in_pool": ("100.2b",),
     # Vintage restricted list (effectively a custom copy limit).
     "restricted": ("100.2a",),
     # Generic banned/not-legal in a format.
@@ -81,8 +84,6 @@ _REASON_TO_CR_RULES: dict[str, tuple[str, ...]] = {
 # without needing the colorless-Brawl exemption.
 _COLORED_BASIC_SUBTYPES = frozenset({"Plains", "Island", "Swamp", "Mountain", "Forest"})
 
-_LEGAL_STATUSES = frozenset({"legal", "restricted"})
-
 
 def _basic_subtype(card: dict) -> str | None:
     """Return the basic land subtype (e.g. 'Plains') from a type_line, or None."""
@@ -99,39 +100,25 @@ def _basic_subtype(card: dict) -> str | None:
 
 def check_format_legality(
     hydrated_cards: list[dict],
-    legality_key: str,
+    fmt: Format,
     *,
     deck_card_names: set[str] | None = None,
-    ignore_key_bans: bool = False,
-    banned_cards: frozenset[str] | None = None,
 ) -> list[dict]:
-    """Return a list of cards whose legality is not ``legal`` or ``restricted``.
+    """Return a list of cards whose ``fmt.legality`` is not ``legal`` or ``restricted``
+    (the status is the violation's ``legality``; the legality key and the Arena-pool
+    gate are the Format's business).
 
     When *deck_card_names* is provided, only cards whose name appears in the
     set are checked. This allows callers to pass a combined main+sideboard
     name set while still feeding the full hydrated list.
-
-    *ignore_key_bans* and *banned_cards* support formats that share another
-    format's legality key but not its ban list — Arena's Competitive Brawl
-    reads the ``brawl`` key for card availability while legalizing everything
-    that key marks ``banned``, and enforces its own ten-card list by name. A
-    ``not_legal`` status is still a violation under that arrangement: it means
-    the card is absent from the pool, not merely banned.
     """
-    banned_cards = banned_cards or frozenset()
     violations: list[dict] = []
     for card in hydrated_cards:
         name = card.get("name", "?")
         if deck_card_names is not None and name not in deck_card_names:
             continue
-        if name in banned_cards:
-            violations.append({"name": name, "legality": "banned"})
-            continue
-        legalities = card.get("legalities") or {}
-        status = legalities.get(legality_key, "not_legal")
-        if status in _LEGAL_STATUSES:
-            continue
-        if ignore_key_bans and status == "banned":
+        status = fmt.legality(card)
+        if status in LEGAL_STATUSES:
             continue
         violations.append({"name": name, "legality": status})
     return violations
@@ -151,7 +138,7 @@ def _commander_color_identity(
 
 def check_commander_zone(
     deck_json: dict,
-    config: dict,
+    fmt: Format,
     hydrated_by_name: Mapping[str, dict] | None = None,
 ) -> list[dict]:
     """Verify the commander zone is populated AND fully hydratable for
@@ -183,7 +170,7 @@ def check_commander_zone(
     flagged here — the distinction is "name resolves" vs "name doesn't
     resolve", not "identity is empty".
     """
-    if not config.get("has_commander", True):
+    if not fmt.has_commander:
         return []
     commanders = deck_json.get("commanders") or []
     if not commanders:
@@ -207,7 +194,7 @@ def check_commander_zone(
 def check_color_identity(
     deck_json: dict,
     hydrated_cards: list[dict],
-    config: dict,
+    fmt: Format,
 ) -> list[dict]:
     """Return a list of cards outside the commander's color identity.
 
@@ -215,7 +202,7 @@ def check_color_identity(
     restriction). Honors the Brawl/Historic Brawl colorless-commander
     exemption (one basic land subtype of the pilot's choice).
     """
-    if not config.get("has_commander", True):
+    if not fmt.has_commander:
         return []
     hydrated_by_name = build_card_lookup(hydrated_cards)
     commander_ci = _commander_color_identity(deck_json, hydrated_by_name)
@@ -231,7 +218,7 @@ def check_color_identity(
     # Compute colorless-Brawl exemption (if applicable).
     exempt_basic_subtype: str | None = None
     mixed_basic_violation_subtypes: list[str] = []
-    if not commander_ci and config.get("colorless_any_basic"):
+    if not commander_ci and fmt.colorless_any_basic:
         basic_subtypes: set[str] = set()
         for card in hydrated_cards:
             if card.get("name") not in deck_card_names:
@@ -288,14 +275,28 @@ def check_color_identity(
     return violations
 
 
+def card_copy_limit(card: dict, fmt: Format) -> int | None:
+    """How many copies of ``card`` a deck may run in ``fmt`` — the ONE owner of the
+    exemption ladder every copy-limit read follows (the audit below and the hub's
+    add rule alike): a basic land or an "any number" card is unlimited (``None``);
+    a named cap ("up to seven") is its own limit; a restricted card is one; else the
+    Format's ``max_copies`` (CR 100.2a constructed, CR 903.5b Commander)."""
+    if is_basic_land(card) or has_any_number_exemption(card):
+        return None
+    cap = named_card_cap(card)
+    if cap is not None:
+        return cap
+    return 1 if fmt.legality(card) == "restricted" else fmt.max_copies
+
+
 def check_copy_limits(
     deck_json: dict,
     hydrated_by_name: Mapping[str, dict],
-    config: dict,
+    fmt: Format,
 ) -> list[dict]:
     """Return a list of copy-limit violations.
 
-    The per-card limit comes from ``config["max_copies"]`` (1 for singleton
+    The per-card limit comes from ``fmt.max_copies`` (1 for singleton
     formats, 4 for constructed). Exemptions:
 
     - Basic lands (unlimited copies always legal)
@@ -303,14 +304,13 @@ def check_copy_limits(
     - Cards with "A deck can have up to <N> cards named X" oracle text, as
       long as ``quantity <= N``
 
-    For Vintage, cards with ``legalities.vintage == "restricted"`` are capped
+    Cards whose ``Format.legality`` is ``restricted`` (Vintage) are capped
     at 1 copy regardless of the format default.
 
     Counts are computed across mainboard + sideboard combined, matching MTG
     rules (the copy limit spans both zones).
     """
-    max_copies = config.get("max_copies", 1)
-    legality_key = config.get("legality_key", "")
+    max_copies = fmt.max_copies or 0  # None (no limit) never reads as restricted
 
     # Aggregate quantities across mainboard and sideboard
     combined_quantities: dict[str, int] = {}
@@ -325,52 +325,25 @@ def check_copy_limits(
         card = hydrated_by_name.get(name)
         if card is None:
             continue
-
-        if is_basic_land(card):
+        limit = card_copy_limit(card, fmt)
+        if limit is None or quantity <= limit:
             continue
-
-        if has_any_number_exemption(card):
-            continue
-
-        cap = named_card_cap(card)
-        if cap is not None:
-            if quantity <= cap:
-                continue
-            violations.append(
-                {
-                    "name": name,
-                    "quantity": quantity,
-                    "limit": cap,
-                    "reason": "exceeds_named_card_cap",
-                }
-            )
-            continue
-
-        # Vintage restricted: capped at 1 regardless of format max_copies
-        effective_limit = max_copies
-        if legality_key == "vintage":
-            legalities = card.get("legalities") or {}
-            if legalities.get("vintage") == "restricted":
-                effective_limit = 1
-
-        if quantity > effective_limit:
-            is_restricted = effective_limit == 1 and max_copies > 1
-            reason = "restricted" if is_restricted else "copy_limit"
-            violations.append(
-                {
-                    "name": name,
-                    "quantity": quantity,
-                    "limit": effective_limit,
-                    "reason": reason,
-                }
-            )
+        if named_card_cap(card) is not None:
+            reason = "exceeds_named_card_cap"
+        elif limit == 1 and max_copies > 1:
+            reason = "restricted"  # Vintage: capped at 1 regardless of max_copies
+        else:
+            reason = "copy_limit"
+        violations.append(
+            {"name": name, "quantity": quantity, "limit": limit, "reason": reason}
+        )
     return violations
 
 
 def check_companion(
     deck_json: dict,
     hydrated_by_name: Mapping[str, dict],
-    config: dict,
+    fmt: Format,
 ) -> list[dict]:
     """Validate the deck's ``companion`` zone (empty list → no violations).
 
@@ -383,9 +356,10 @@ def check_companion(
     - ``companion_condition``: the deckbuilding condition fails against the
       STARTING deck — commanders + mainboard, excluding sideboard and the
       companion itself (CR 702.139b) — via ``companion_violations``. The
-      ``deck_minimum`` fed to Yorion's check derives from ``format_config``:
+      ``deck_minimum`` fed to Yorion's check derives from the ``Format``:
       exact-size singleton formats (Commander family, CR 903.5a: minimum =
-      maximum) pass None; 60-card constructed passes its 60-card minimum.
+      maximum) pass None; 60-card constructed passes its 60-card minimum
+      (``min_deck_size`` — the CR floor, whatever size the build targets).
     """
     entries = deck_json.get("companion") or []
     if not entries:
@@ -401,7 +375,7 @@ def check_companion(
                 "reason": "companion_multiple",
             }
         )
-    deck_minimum = None if config.get("is_singleton") else config.get("deck_size", 60)
+    deck_minimum = None if fmt.is_singleton else fmt.min_deck_size
     starting_deck: list[dict] = []
     for section in ("commanders", "cards"):
         for entry in deck_json.get(section) or []:
@@ -437,15 +411,15 @@ def check_companion(
     return violations
 
 
-def check_sideboard_size(deck_json: dict, config: dict) -> list[dict]:
+def check_sideboard_size(deck_json: dict, fmt: Format) -> list[dict]:
     """Return a violation if the sideboard exceeds the format's limit.
 
     The ``companion`` zone is deliberately not counted: a companion is neither
     part of the deck nor of the sideboard (CR 702.139a-b).
     """
-    max_sb = config.get("sideboard_size", 0)
-    if max_sb == 0:
-        return []
+    max_sb = fmt.sideboard_size
+    if max_sb is None or max_sb == 0:
+        return []  # no sideboard (Commander) / no cap (limited: the unused pool)
     sb_total = sum(int(e.get("quantity", 1)) for e in deck_json.get("sideboard") or [])
     if sb_total > max_sb:
         return [
@@ -458,13 +432,53 @@ def check_sideboard_size(deck_json: dict, config: dict) -> list[dict]:
     return []
 
 
-def check_deck_minimum(deck_json: dict, config: dict) -> list[dict]:
+def check_pool_containment(
+    deck_json: dict,
+    hydrated_by_name: Mapping[str, dict],
+    fmt: Format,
+) -> list[dict]:
+    """A pool-bounded deck (sealed / draft) is drawn from its opened pool: every copy
+    in the main deck and sideboard must be in the ``pool`` zone at that quantity
+    (CR 100.2b), basic lands excepted (the product's basics are unlimited — read
+    off the record, or the name when no record joined). Empty for any other
+    format. Tautological on a freshly parsed list (its pool IS its cards and
+    sideboard); it earns its keep once a build adds or a hand edit diverges."""
+    if not fmt.pool_bounded:
+        return []
+    pool: dict[str, int] = {}
+    for entry in deck_json.get("pool") or []:
+        pool[entry["name"]] = pool.get(entry["name"], 0) + int(entry.get("quantity", 1))
+    used: dict[str, int] = {}
+    for section in ("cards", "sideboard"):
+        for entry in deck_json.get(section) or []:
+            used[entry["name"]] = used.get(entry["name"], 0) + int(
+                entry.get("quantity", 1)
+            )
+    violations: list[dict] = []
+    for name, quantity in used.items():
+        card = hydrated_by_name.get(name)
+        if is_basic_land(card) if card is not None else is_basic_land_name(name):
+            continue
+        in_pool = pool.get(name, 0)
+        if quantity > in_pool:
+            violations.append(
+                {
+                    "name": name,
+                    "quantity": quantity,
+                    "in_pool": in_pool,
+                    "reason": "not_in_pool",
+                }
+            )
+    return violations
+
+
+def check_deck_minimum(deck_json: dict, fmt: Format) -> list[dict]:
     """Return a violation if the mainboard is below the format minimum.
 
     Counts commanders + mainboard only — the ``companion`` zone is outside the
     deck (CR 702.139a-b), so it never pads the total toward the minimum.
     """
-    min_size = config.get("deck_size", 60)
+    min_size = fmt.min_deck_size
     total_cards = int(deck_json.get("total_cards", 0)) or sum(
         int(e.get("quantity", 1))
         for e in (deck_json.get("cards") or []) + (deck_json.get("commanders") or [])
@@ -483,8 +497,7 @@ def check_deck_minimum(deck_json: dict, config: dict) -> list[dict]:
 def legality_audit(hd: HydratedDeck) -> dict:
     """Run all legality checks and return a structured result."""
     deck_json = hd.deck
-    config = get_format_config(deck_json)
-    legality_key = config["legality_key"]
+    fmt = hd.format
 
     # Collect all card names across main + sideboard for format legality.
     # Include both deck-side names (which may be Arena display names) and
@@ -506,26 +519,21 @@ def legality_audit(hd: HydratedDeck) -> dict:
                 all_deck_names.add(card.get("name", ""))
 
     format_violations = check_format_legality(
-        hd.records,
-        legality_key,
-        deck_card_names=all_deck_names,
-        ignore_key_bans=config.get("ignores_legality_key_bans", False),
-        banned_cards=config.get("banned_cards"),
+        hd.records, fmt, deck_card_names=all_deck_names
     )
-    commander_zone_violations = check_commander_zone(
-        deck_json, config, hydrated_by_name
-    )
+    commander_zone_violations = check_commander_zone(deck_json, fmt, hydrated_by_name)
     # Suppress color-identity cascade when the commander zone is unset:
     # the would-be commander identity is empty, so every non-colorless
     # card would be flagged spuriously, drowning the real error.
     if commander_zone_violations:
         ci_violations: list[dict] = []
     else:
-        ci_violations = check_color_identity(deck_json, hd.records, config)
-    copy_violations = check_copy_limits(deck_json, hydrated_by_name, config)
-    sb_violations = check_sideboard_size(deck_json, config)
-    deck_min_violations = check_deck_minimum(deck_json, config)
-    companion_zone_violations = check_companion(deck_json, hydrated_by_name, config)
+        ci_violations = check_color_identity(deck_json, hd.records, fmt)
+    copy_violations = check_copy_limits(deck_json, hydrated_by_name, fmt)
+    sb_violations = check_sideboard_size(deck_json, fmt)
+    deck_min_violations = check_deck_minimum(deck_json, fmt)
+    companion_zone_violations = check_companion(deck_json, hydrated_by_name, fmt)
+    pool_violations = check_pool_containment(deck_json, hydrated_by_name, fmt)
 
     counts = {
         "format_legality": len(format_violations),
@@ -535,6 +543,7 @@ def legality_audit(hd: HydratedDeck) -> dict:
         "sideboard_size": len(sb_violations),
         "deck_minimum": len(deck_min_violations),
         "companion": len(companion_zone_violations),
+        "pool_containment": len(pool_violations),
     }
     total_violations = sum(counts.values())
     overall_status = "PASS" if total_violations == 0 else "FAIL"
@@ -545,7 +554,7 @@ def legality_audit(hd: HydratedDeck) -> dict:
     )
 
     return {
-        "format": deck_json.get("format", "commander"),
+        "format": fmt.name,
         "overall_status": overall_status,
         "total_cards": total_cards,
         "counts": counts,
@@ -557,6 +566,7 @@ def legality_audit(hd: HydratedDeck) -> dict:
             "sideboard_size": sb_violations,
             "deck_minimum": deck_min_violations,
             "companion": companion_zone_violations,
+            "pool_containment": pool_violations,
         },
     }
 
@@ -596,6 +606,8 @@ def _format_violation_line(
             names.append(f"{v['sideboard_count']}/{v['limit']}")
         elif reason == "deck_minimum":
             names.append(f"{v['total_cards']}/{v['minimum']}")
+        elif reason == "pool_containment":
+            names.append(f"{v['name']} ({v['quantity']}x, {v['in_pool']} in pool)")
         elif reason == "companion":
             v_reason = v.get("reason")
             if v_reason == "companion_multiple":
@@ -624,6 +636,7 @@ _REPORT_CHECKS = (
     "sideboard_size",
     "deck_minimum",
     "companion",
+    "pool_containment",
 )
 
 
@@ -643,7 +656,12 @@ def render_text_report(result: dict) -> str:
         v = violations.get(check) or []
         # Skip checks that aren't relevant (e.g., sideboard for commander,
         # companion for decks with no companion zone)
-        if not v and check in ("sideboard_size", "deck_minimum", "companion"):
+        if not v and check in (
+            "sideboard_size",
+            "deck_minimum",
+            "companion",
+            "pool_containment",
+        ):
             continue
         lines.append(_format_violation_line(check, v))
     # Surface a CR-citations lookup failure in stdout, not just the JSON
@@ -710,7 +728,7 @@ def _attach_rule_citations(
 
 @click.command()
 @click.argument("deck_path", type=click.Path(exists=True, path_type=Path))
-@click.argument("hydrated_path", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option(
     "--output",
     "output_path",
@@ -739,25 +757,22 @@ def _attach_rule_citations(
 )
 def main(
     deck_path: Path,
-    hydrated_path: Path,
+    bulk_data: Path | None,
     output_path: Path | None,
     rules_file: Path | None,
     *,
     cite_rules: bool,
 ) -> None:
-    """Audit a deck for format legality, color identity, and singleton rule."""
-    deck_content = deck_path.read_text(encoding="utf-8")
-    hydrated_content = hydrated_path.read_text(encoding="utf-8")
-    deck = json.loads(deck_content)
-    hydrated = json.loads(hydrated_content)
-
-    result = legality_audit(HydratedDeck.from_parsed(deck, records=hydrated))
+    """Audit DECK_PATH for format legality, color identity, and singleton rule."""
+    result = legality_audit(acquire_for_cli(deck_path, bulk_data))
 
     if cite_rules:
         _attach_rule_citations(result, rules_file, input_path=deck_path)
 
     if output_path is None:
-        output_path = _default_output_path(deck_content, hydrated_content)
+        output_path = _default_output_path(
+            deck_path.read_text(encoding="utf-8"), sidecar_path(deck_path)
+        )
     else:
         output_path = output_path.resolve()
     atomic_write_json(output_path, result)

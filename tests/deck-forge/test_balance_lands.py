@@ -6,28 +6,15 @@ from fastapi.testclient import TestClient
 
 from mtg_utils._deck_forge.app import build_app
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
-
-
-def _basic(name, color, subtype):
-    return {
-        "name": name,
-        "type_line": f"Basic Land — {subtype}",
-        "cmc": 0.0,
-        "mana_cost": "",
-        "color_identity": [],
-        "produced_mana": [color],
-        "oracle_text": f"({{T}}: Add {{{color}}}.)",
-        "keywords": [],
-    }
-
+from mtg_utils.testkit import test_card
 
 BASICS = {
-    "Plains": _basic("Plains", "W", "Plains"),
-    "Island": _basic("Island", "U", "Island"),
-    "Swamp": _basic("Swamp", "B", "Swamp"),
-    "Mountain": _basic("Mountain", "R", "Mountain"),
-    "Forest": _basic("Forest", "G", "Forest"),
-    "Wastes": _basic("Wastes", "C", "Wastes"),
+    "Plains": test_card("Plains"),
+    "Island": test_card("Island"),
+    "Swamp": test_card("Swamp"),
+    "Mountain": test_card("Mountain"),
+    "Forest": test_card("Forest"),
+    "Wastes": test_card("Wastes"),
 }
 CMD = {
     "name": "WU Captain",
@@ -65,10 +52,10 @@ def test_balance_targets_the_floor_not_recommended():
     assert client.get("/api/snapshot").json()["mana"]["land_count"] == 0
     mana = client.post("/api/deck/balance-lands").json()["mana"]
     # fills to the FAIL floor (= Burgess), not all the way to the recommended count.
-    assert mana["land_count"] == mana["land_count_floor"]
-    assert mana["land_count_floor"] == mana["burgess_formula"]["result"]
-    assert mana["land_count"] <= mana["recommended_land_count"]
-    assert mana["land_count_status"] != "FAIL"
+    assert mana["land_count"] == mana["land_band"]["floor"]
+    assert mana["land_band"]["floor"] == mana["burgess_formula"]["result"]
+    assert mana["land_count"] <= mana["land_band"]["top"]
+    assert mana["land_band"]["status"] != "FAIL"
 
 
 def test_balance_distributes_by_color_demand():
@@ -90,7 +77,7 @@ def test_rebalance_swaps_basics_at_count_net_zero():
         by_name=idx, search_fn=lambda **_: [], session=session, bulk_available=True
     )
     client = TestClient(build_app(state))
-    floor = client.get("/api/snapshot").json()["mana"]["land_count_floor"]
+    floor = client.get("/api/snapshot").json()["mana"]["land_band"]["floor"]
     session.add("Plains", floor)  # at the floor, but mono-white basics
     assert client.get("/api/snapshot").json()["mana"]["land_count"] == floor
 

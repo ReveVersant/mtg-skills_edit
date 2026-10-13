@@ -1428,20 +1428,24 @@ def run(
 
 # --- CLI -------------------------------------------------------------------
 
-# Default under the user's cache home, not world-readable /tmp (avoids a
-# predictable shared-temp path and symlink races). Override with
-# MTG_SKILLS_CACHE_DIR, consistent with the rest of the package.
-_DEFAULT_CACHE = Path(
-    os.environ.get("MTG_SKILLS_CACHE_DIR") or (Path.home() / ".cache" / "mtg-skills")
-)
+
+def default_http_cache() -> Path:
+    """Where the crawler keeps its HTTP responses by default: ``$MTG_SKILLS_CACHE_DIR``,
+    else ``~/.cache/mtg-skills`` — read when the command runs, so a test's env applies.
+
+    Fork change: the fallback is the user cache home, not world-readable ``/tmp``
+    (avoids a predictable shared-temp path and symlink races)."""
+    return Path(
+        os.environ.get("MTG_SKILLS_CACHE_DIR") or (Path.home() / ".cache" / "mtg-skills")
+    )
 
 
 @click.command()
 @click.option(
     "--cache-dir",
     type=click.Path(path_type=Path),
-    default=_DEFAULT_CACHE,
-    show_default=True,
+    default=None,
+    show_default="$MTG_SKILLS_CACHE_DIR, else /tmp",
     help=(
         "Root cache directory. HTTP responses are stored under "
         "<cache-dir>/ascii-art-fetcher/ with a 7-day TTL."
@@ -1506,7 +1510,7 @@ _DEFAULT_CACHE = Path(
     help="Print every subtype slug that had no in-budget match.",
 )
 def main(
-    cache_dir: Path,
+    cache_dir: Path | None,
     out_dir: Path | None,
     limit: int | None,
     from_deck: Path | None,
@@ -1527,6 +1531,8 @@ def main(
     if by_name and from_deck is None:
         click.echo("ERROR: --by-name requires --from-deck", err=True)
         sys.exit(EXIT_FETCH_FAILED)
+    if cache_dir is None:
+        cache_dir = default_http_cache()
     if out_dir is None:
         out_dir = attributed_art_dir()
     try:

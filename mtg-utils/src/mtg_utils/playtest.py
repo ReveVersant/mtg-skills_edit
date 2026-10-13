@@ -30,6 +30,7 @@ from mtg_utils.card_classify import (
     is_land,
     land_fetch_profile,
 )
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
 
 GOLDFISH_VERSION = "goldfish v1"
 
@@ -599,14 +600,10 @@ def _run_goldfish(
 
 
 @click.command()
-@click.argument("deck_path", type=click.Path(exists=True, dir_okay=False))
-@click.option(
-    "--hydrated",
-    "hydrated_path",
-    type=click.Path(exists=True, dir_okay=False),
-    required=True,
-    help="Hydrated card data (scryfall-lookup --batch output)",
+@click.argument(
+    "deck_path", type=click.Path(exists=True, dir_okay=False, path_type=Path)
 )
+@bulk_data_option
 @click.option(
     "--games", default=1000, show_default=True, help="Number of games to simulate"
 )
@@ -622,28 +619,20 @@ def _run_goldfish(
     help="Write full JSON envelope to this path (markdown report printed to stdout)",
 )
 def goldfish_main(
-    deck_path: str,
-    hydrated_path: str,
+    deck_path: Path,
+    bulk_data: Path | None,
     games: int,
     turns: int,
     seed: int,
     output_path: str | None,
 ) -> None:
     """Solo deck simulator (mulligan, curve, color-screw, combo timing)."""
-    deck = json.loads(Path(deck_path).read_text())
-    hydrated_raw = json.loads(Path(hydrated_path).read_text())
-    lookup = build_card_lookup(hydrated_raw)
-
-    deck_hydrated: list[dict] = []
-    missing_set: set[str] = set()
-    for entry in (deck.get("commanders") or []) + (deck.get("cards") or []):
-        card = lookup.get(entry["name"])
-        if card is None:
-            missing_set.add(entry["name"])
-            continue
-        for _ in range(int(entry.get("quantity", 1))):
-            deck_hydrated.append(card)
-    missing = sorted(missing_set)
+    hd = acquire_for_cli(deck_path, bulk_data)
+    deck = hd.deck
+    deck_hydrated = hd.expanded(zones=("commanders", "cards"))
+    missing = sorted(
+        n for n in hd.missing if any(e["name"] == n for e in hd.commanders + hd.cards)
+    )
 
     start = time.perf_counter()
     results = _run_goldfish(
@@ -682,6 +671,19 @@ def goldfish_main(
     click.echo(render_goldfish_markdown(out))
 
 
+#: A phase batch's default time budget: about 5 s per game was observed, so 10 s per
+#: game leaves headroom, with a floor for short runs.
+PHASE_SECONDS_PER_GAME = 10
+PHASE_MIN_TIMEOUT_S = 600
+
+
+def phase_timeout(timeout_s: int | None, games: int) -> int:
+    """``--timeout-s`` when given, else a budget proportional to ``games``."""
+    if timeout_s is not None:
+        return timeout_s
+    return max(PHASE_MIN_TIMEOUT_S, PHASE_SECONDS_PER_GAME * games)
+
+
 @click.command()
 @click.argument("deck_a", type=click.Path(exists=True, dir_okay=False))
 @click.argument("deck_b", type=click.Path(exists=True, dir_okay=False))
@@ -695,7 +697,15 @@ def goldfish_main(
     show_default=True,
     type=click.Choice(["Easy", "Medium", "Hard"]),
 )
-@click.option("--timeout-s", default=600, show_default=True, type=int)
+@click.option(
+    "--timeout-s",
+    type=int,
+    default=None,
+    help=(
+        "Time budget for the run, in seconds (default: 10 s per game, at least 600). "
+        "Games that finish inside it are kept if it runs out."
+    ),
+)
 @click.option(
     "--force",
     is_flag=True,
@@ -709,7 +719,7 @@ def match_main(
     games: int,
     seed: int,
     difficulty: str,
-    timeout_s: int,
+    timeout_s: int | None,
     force: bool,  # noqa: FBT001
     output_path: str | None,
 ) -> None:
@@ -746,6 +756,7 @@ def match_main(
         )
         raise SystemExit(2)
 
+    timeout_s = phase_timeout(timeout_s, games)
     phase_a = _phase.to_phase_deck(deck_a_obj, label="A")
     phase_b = _phase.to_phase_deck(deck_b_obj, label="B")
 
@@ -780,10 +791,16 @@ def match_main(
             f"Phase coverage {cov['supported_pct']:.1%} — "
             f"{len(cov['missing'])} cards substituted: {sample}{more}",
         )
-    if result.get("status") == "timeout":
+    if result.get("timed_out"):
+        done, asked = result["games_completed"], result["games_requested"]
         warnings.append(
-            f"Phase match timed out after {timeout_s}s with no games completed - "
-            f"the 0-0 result is 'did not finish', not a real tie.",
+            f"Phase match timed out after {timeout_s}s: {done} of {asked} games "
+            "completed"
+            + (
+                " - the results cover those games only."
+                if done
+                else " - no result (0-0 is 'did not finish', not a tie)."
+            ),
         )
 
     out = envelope(
@@ -829,7 +846,15 @@ def match_main(
     show_default=True,
     type=click.Choice(["Easy", "Medium", "Hard"]),
 )
-@click.option("--timeout-s", default=600, show_default=True, type=int)
+@click.option(
+    "--timeout-s",
+    type=int,
+    default=None,
+    help=(
+        "Time budget per pair, in seconds (default: 10 s per game, at least 600). "
+        "Games that finish inside it are kept if it runs out."
+    ),
+)
 @click.option("--output", "output_path", type=click.Path(dir_okay=False), default=None)
 def gauntlet_main(
     cube_path: str,
@@ -838,10 +863,11 @@ def gauntlet_main(
     games_per_pair: int,
     seed: int,
     difficulty: str,
-    timeout_s: int,
+    timeout_s: int | None,
     output_path: str | None,
 ) -> None:
     """Cube archetype-gauntlet round-robin (phase-rs)."""
+    timeout_s = phase_timeout(timeout_s, games_per_pair)
     import importlib.resources
     import tempfile as _tempfile
 
@@ -955,11 +981,13 @@ def gauntlet_main(
                     raise click.ClickException(
                         f"{exc}\nEngine stderr:\n{exc.stderr}",
                     ) from exc
-                if result.get("status") == "timeout":
-                    # A timed-out pair has games=0, which renders as "—" — the same
-                    # glyph as an unplayed diagonal. Record it so it's reported, not
-                    # silently read as "no games / not run".
-                    timed_out_pairs.append(f"{a_name} vs {b_name}")
+                if result.get("timed_out"):
+                    # Its rate covers only the games that finished (the matrix marks
+                    # it), or none at all: report it, don't let it read as complete.
+                    timed_out_pairs.append(
+                        f"{a_name} vs {b_name} "
+                        f"({result['games_completed']}/{result['games_requested']})"
+                    )
                 pairs.append(
                     {
                         "a": a_name,
@@ -967,7 +995,9 @@ def gauntlet_main(
                         "wins_a": result["wins_p0"],
                         "wins_b": result["wins_p1"],
                         "draws": result["draws"],
-                        "games": result["games"],
+                        "games": result["games_completed"],
+                        "games_requested": result["games_requested"],
+                        "timed_out": result["timed_out"],
                     }
                 )
     elapsed = time.perf_counter() - start
@@ -991,8 +1021,9 @@ def gauntlet_main(
         )
         + (
             [
-                f"{len(timed_out_pairs)} pair(s) timed out after {timeout_s}s "
-                f"(shown as 0-0, not a real result): {', '.join(timed_out_pairs[:5])}"
+                f"{len(timed_out_pairs)} pair(s) timed out after {timeout_s}s; "
+                "each rate covers only the games that finished (games done/asked): "
+                f"{', '.join(timed_out_pairs[:5])}"
                 + ("…" if len(timed_out_pairs) > 5 else "")
             ]
             if timed_out_pairs

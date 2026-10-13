@@ -1,9 +1,8 @@
 """Commander Spellbook combo search for Commander decks."""
 
-import json
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import click
@@ -12,7 +11,8 @@ import requests
 from mtg_utils._http import USER_AGENT
 from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
 from mtg_utils.card_classify import get_oracle_text
-from mtg_utils.format_config import FORMAT_CONFIGS, get_format_config
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
+from mtg_utils.formats import FORMATS
 from mtg_utils.hydrated_deck import HydratedDeck
 
 SPELLBOOK_URL = "https://backend.commanderspellbook.com/find-my-combos"
@@ -102,10 +102,16 @@ def _unmet_templates(
     ]
 
 
-def _is_format_legal(variant: dict, legality_key: str = "commander") -> bool:
-    """Check if a combo is legal in the given format."""
+def _is_format_legal(variant: dict, legality_key: str | None = "commander") -> bool:
+    """Check if a combo is legal in the given format. A pool-bounded format (no
+    legality key) has no ban list: any combo the pool holds is playable. Spellbook
+    camel-cases the keys MTGJSON spells in lower case (``competitiveBrawl``,
+    ``standardBrawl``), so the match ignores case."""
+    if legality_key is None:
+        return True
+    key = legality_key.lower()
     legalities = variant.get("legalities", {})
-    return legalities.get(legality_key, False)
+    return any(v for k, v in legalities.items() if k.lower() == key)
 
 
 def _resolve_name(
@@ -140,8 +146,7 @@ def combo_search(hd: HydratedDeck, *, max_near_misses: int = 5) -> dict:
     and near-miss detection falls back to the cards-only count (legacy behavior).
     """
     deck = hd.deck
-    config = get_format_config(deck)
-    legality_key = config["legality_key"]
+    legality_key = hd.format.legality_key
 
     card_lookup = hd.by_name if hd.has_records else None
 
@@ -152,9 +157,16 @@ def combo_search(hd: HydratedDeck, *, max_near_misses: int = 5) -> dict:
     cards = [
         _resolve_name(entry["name"], card_lookup) for entry in deck.get("cards", [])
     ]
-    sideboard = [
-        _resolve_name(entry["name"], card_lookup) for entry in deck.get("sideboard", [])
-    ]
+    # A pool-bounded deck's sideboard is its unused pool — not cards it runs, so not
+    # part of what the combo engine reads.
+    sideboard = (
+        []
+        if hd.format.pool_bounded
+        else [
+            _resolve_name(entry["name"], card_lookup)
+            for entry in deck.get("sideboard", [])
+        ]
+    )
     all_card_names = set(commanders + cards + sideboard)
 
     body = {
@@ -274,11 +286,9 @@ def search_combos(
     # Determine legality key for format filtering
     legality_key: str | None = None
     if format:
-        from mtg_utils.format_config import FORMAT_CONFIGS
-
-        cfg = FORMAT_CONFIGS.get(format)
-        if cfg:
-            legality_key = cfg["legality_key"]
+        fmt = FORMATS.get(format)
+        if fmt:
+            legality_key = fmt.legality_key
 
     # Load bulk data for arena/paper filtering if needed
     games_index: dict[str, list[str]] | None = None
@@ -324,14 +334,36 @@ def search_combos(
     return combos
 
 
-def _is_game_winning(combo: dict) -> bool:
+def combos_or_none[T](combos_fn: Callable[[T], dict] | None, deck: T) -> dict | None:
+    """``combos_fn(deck)``, or ``None`` when it fails: Commander Spellbook is a network
+    service, and a deterministic check must never depend on it being up."""
+    if combos_fn is None:
+        return None
+    try:
+        return combos_fn(deck)
+    except Exception:  # noqa: BLE001 — any combos failure degrades, never breaks
+        return None
+
+
+def is_game_winning(combo: Mapping) -> bool:
     """Heuristic: combos whose result is infinite or game-ending (win OR make an
-    opponent lose the game)."""
-    result_text = " ".join(str(r) for r in combo.get("result", [])).lower()
-    return (
-        "infinite" in result_text
-        or "win the game" in result_text
-        or "lose the game" in result_text
+    opponent lose the game). The one test behind the report's GAME_WINNING tag, the
+    bracket gate's two-card-combo axis and the tuner's near-miss severity.
+
+    ``result`` is Commander Spellbook's list of feature strings; a bare string (a few
+    synthetic call sites) reads the same way."""
+    result = combo.get("result") or []
+    if isinstance(result, str):
+        result = [result]
+    text = " ".join(str(r) for r in result).lower()
+    return "infinite" in text or any(
+        phrase in text
+        for phrase in (
+            "win the game",
+            "wins the game",
+            "lose the game",
+            "loses the game",
+        )
     )
 
 
@@ -340,7 +372,7 @@ def render_combo_search_report(data: dict) -> str:
     combos = data.get("combos", [])
     near_misses = data.get("near_misses", [])
 
-    game_winning_count = sum(1 for c in combos if _is_game_winning(c))
+    game_winning_count = sum(1 for c in combos if is_game_winning(c))
     value_count = len(combos) - game_winning_count
 
     lines: list[str] = []
@@ -356,7 +388,7 @@ def render_combo_search_report(data: dict) -> str:
         lines.append("")
         lines.append("Existing combos:")
         for c in combos:
-            kind = "GAME_WINNING" if _is_game_winning(c) else "VALUE"
+            kind = "GAME_WINNING" if is_game_winning(c) else "VALUE"
             cards = " + ".join(c.get("cards", []))
             result = ", ".join(str(r) for r in c.get("result", []))
             bracket = c.get("bracket_tag", "")
@@ -424,13 +456,7 @@ def _default_discover_output_path(*args: object) -> Path:
     show_default=True,
     help="Maximum number of near-miss combos to return.",
 )
-@click.option(
-    "--hydrated",
-    "hydrated_path",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Hydrated card data for resolving Arena display names to canonical names.",
-)
+@bulk_data_option
 @click.option(
     "--output",
     "output_path",
@@ -441,16 +467,16 @@ def _default_discover_output_path(*args: object) -> Path:
 def main(
     deck_json: Path,
     max_near_misses: int,
-    hydrated_path: Path | None,
+    bulk_data: Path | None,
     output_path: Path | None,
 ) -> None:
-    """Search Commander Spellbook for combos in a deck."""
+    """Search Commander Spellbook for combos in DECK_JSON.
+
+    Card data is optional here (Spellbook needs only names); with it, near-miss
+    detection can check template requirements against the deck's records.
+    """
     deck_content = deck_json.read_text(encoding="utf-8")
-    deck = json.loads(deck_content)
-    hydrated = None
-    if hydrated_path is not None:
-        hydrated = json.loads(hydrated_path.read_text(encoding="utf-8"))
-    hd = HydratedDeck.from_parsed(deck, records=hydrated)
+    hd = acquire_for_cli(deck_json, bulk_data, require_records=False)
     result = combo_search(hd, max_near_misses=max_near_misses)
 
     if output_path is None:
@@ -491,7 +517,7 @@ def main(
 @click.option(
     "--format",
     "combo_format",
-    type=click.Choice(sorted(FORMAT_CONFIGS.keys())),
+    type=click.Choice(sorted(FORMATS)),
     default=None,
 )
 @click.option("--arena-only", is_flag=True)

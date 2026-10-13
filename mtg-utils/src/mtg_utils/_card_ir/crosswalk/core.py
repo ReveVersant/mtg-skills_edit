@@ -10,7 +10,7 @@ the verbatim typed node** (the lossless hatch — categorically different from a
 verbatim-*text* ``raw`` that forces re-regex; the structured node is preserved).
 
 It is **additive / shadow-only** (ADR-0035 Stage 2): nothing in production reads
-this. The live regex+IR detection path (``_deck_forge.signals``) is untouched; the
+this. The live regex+IR detection path (``_analysis.signals``) is untouched; the
 crosswalk runs alongside it for the shadow ``Signal``-diff.
 
 The overlay preserves the **three join granularities** the lanes depend on, so a
@@ -32,17 +32,26 @@ flat-overlay regression fails loud:
 
 Stays self-contained within ``_card_ir`` (Layer-2 framework only — no
 ``_deck_forge`` import); the ``Signal``-lane derivation that *uses* this overlay
-lives at Layer 3 in ``_deck_forge.lanes``.
+lives at Layer 3 in ``_analysis.lanes``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import cached_property
 
+from mtg_utils._card_ir.crosswalk.cost_text import (
+    ALT_COST_KEYWORDS,
+    FACE_DOWN_KEYWORDS,
+    AltCost,
+    face_down_rows,
+    keyword_alt_costs,
+    mana_value_of_cost,
+)
 from mtg_utils._card_ir.crosswalk.reads import (
-    _EFFECT_CHILD_FIELDS,
     _PAYLIFE_COST_TAGS,
+    CURVE_COST_KEYWORDS,
     _effect_scope,
     _effect_subject,
     _filter_type_words,
@@ -51,9 +60,16 @@ from mtg_utils._card_ir.crosswalk.reads import (
     _present,
     _scope_from_player_node,
     _trigger_event,
+    effect_children,
     filter_core_types,
     iter_nested_granted_bodies,
+    iter_static_defs,
     iter_typed_nodes,
+    keyword_cost,
+    keyword_curve_cost,
+    mana_value_paying_life,
+    residue_is,
+    static_mode_tag,
     tag_of,
 )
 from mtg_utils._card_ir.mirror.runtime import (
@@ -347,6 +363,19 @@ class ConceptNode:
     # decorated straight from the typed substrate). Per-rule corpus fire
     # counts over this field are the bridge-remaining metric.
     recovered_by: str = ""
+    # The recovered clause's reading (``recovery.read_clause``: type words and
+    # ``CLAUSE_MARKS``) for a row whose ``scope`` / ``subject`` keep the node's
+    # own meaning (``TokenRule.into_clause`` — a token's ``subject`` is the
+    # token's types). Written only by the recovery stage.
+    clause: tuple[str, ...] = ()
+
+    @property
+    def reading(self) -> tuple[str, ...]:
+        """A recovered clause's reading — its type words and ``CLAUSE_MARKS`` —
+        whichever field its recovery row wrote it to (``clause`` for an
+        ``into_clause`` row, ``subject`` otherwise). The one read a lane makes of
+        a recovered node's marks."""
+        return self.clause or self.subject
 
 
 @dataclass(frozen=True)
@@ -390,6 +419,16 @@ class AbilityUnit:
     def has_effect(self, concept: str) -> bool:
         """Whether THIS unit has a role=effect concept-node named ``concept``."""
         return any(c.concept == concept for c in self.effects)
+
+    def iter_typed(self) -> Iterator[TypedMirrorNode]:
+        """Every typed mirror node under THIS unit — the per-unit deep walk, for
+        a gate that must read a node against its own unit (its root, origin)."""
+        yield from iter_typed_nodes(self.node)
+
+    def static_defs(self) -> Iterator[TypedMirrorNode]:
+        """Every static-ability def under THIS unit (the unit node itself when it
+        is one, plus the defs nested in a granted/emblem static list)."""
+        yield from iter_static_defs(self.node)
 
 
 @dataclass(frozen=True)
@@ -438,6 +477,30 @@ class ConceptTree:
     # the field is a whole-card deck-construction property, not tied to any
     # one ability.
     many_copies: bool = False
+    # The bound of an ``UpTo`` copy limit ("A deck can have up to seven cards
+    # named Seven Dwarves" — ``UpTo{data: 7}``), None otherwise. With
+    # ``many_copies`` it splits the relaxation three ways: unlimited
+    # (``many_copies`` and no cap — Relentless Rats), capped (Seven Dwarves 7,
+    # Nazgûl 9), or none. ``UpTo:1`` (Vazal's Megalegendary) carries cap 1 with
+    # ``many_copies`` False. ``card_classify.named_card_cap`` /
+    # ``has_any_number_exemption`` read it for ``legality_audit.card_copy_limit``.
+    deck_copy_cap: int | None = None
+    # The card's printed partner abilities (CR 702.124a), one per ``Partner``
+    # keyword on ``root.keywords``: ``(variant, data)`` — ``("Generic", "")``,
+    # ``("With", "Rory Williams")``, ``("FriendsForever", "")``,
+    # ``("CharacterSelect", "")``, ``("ChooseABackground", "")``,
+    # ``("DoctorsCompanion", "")``, and ``("Group", "Survivors")`` for a
+    # partner—[text] group phase collapses to Generic (corrected at build, see
+    # ``PARTNER_GROUPS_PHASE_COLLAPSES``). A card may print two (Amy Pond: Doctor's
+    # companion AND partner with Rory Williams — CR 702.124g). Root-level like
+    # ``card_enchant_core_types``: no ability unit carries it.
+    card_partner_kinds: tuple[tuple[str, str], ...] = ()
+    # Phase's ``root.is_commander``: whether the card can be your commander in the
+    # Commander variant -- a legendary creature, Vehicle or Spacecraft (CR 903.3),
+    # or a card whose own text says it can (Teferi, Temporal Archmage; Grist, the
+    # Hunger Tide, per its ruling). ``card_classify.is_commander`` reads it for the
+    # text half.
+    can_be_commander: bool = False
     # ADR-0039 grammar sprint (task #82, deepening-start-minimal): a modal
     # SPELL's card-root ``modal.mode_descriptions`` (CR 700.2 "choose one"),
     # positionally paired with ``root.abilities`` — the REAL per-mode English
@@ -464,6 +527,25 @@ class ConceptTree:
     # Aura with a non-Enchant-typed keyword predicate this narrow read
     # doesn't resolve.
     card_enchant_core_types: tuple[str, ...] = ()
+    # The mana values of the card's own unconditional alternative casting costs
+    # (``reads.CURVE_COST_KEYWORDS`` — warp, evoke, dash, blitz, prototype,
+    # impending), read off ``root.keywords`` like ``card_enchant_core_types``: the
+    # cost a deck can plan its curve on when it's below the printed mana value.
+    card_curve_costs: tuple[int, ...] = ()
+    # Every other way the card's printed keywords let you pay for it
+    # (``cost_text.keyword_alt_costs``: suspend, evoke, flashback, buyback, morph,
+    # ninjutsu …), in keyword order, with the printed cost and what the rules
+    # make of the payment (alternative / additional / special action / ability);
+    # plus the keywords phase drops, recovered by ``_dropped_keyword_costs``.
+    card_alt_costs: tuple[AltCost, ...] = ()
+    # The card's printed keyword abilities as phase names them (``Flashback``,
+    # ``Rebound``, ``JumpStart``, ``Embalm`` …), in ``root.keywords`` order — the
+    # keywords phase leaves to its rules engine rather than expanding into ability
+    # units (flashback's cast permission, rebound's exile), which a read can only
+    # see by name, plus the ones ``_dropped_keyword_costs`` recovers from a residue
+    # (Escape Velocity's escape, in its lowercase kind). Fold with
+    # ``reads.normalised_keyword_name`` to compare.
+    card_keywords: tuple[str, ...] = ()
 
     def is_type(self, core: str) -> bool:
         """Whether the card itself has core type ``core`` (Creature / Land / …).
@@ -488,6 +570,157 @@ class ConceptTree:
     def has_effect(self, concept: str) -> bool:
         """Whether ANY unit has a role=effect concept named ``concept``."""
         return any(u.has_effect(concept) for u in self.units)
+
+    # ── The gap-predicate vocabulary (ADR-0047) ────────────────────────────────
+    # Every "does the substrate already carry X?" question a recovery row, a
+    # synthesis arm, a ledgered bridge or a lane asks is one of these reads. A gate
+    # composes them; it never re-walks the tree in its own idiom.
+
+    def iter_units(self, *origins: str) -> Iterator[AbilityUnit]:
+        """The card's ability units, optionally only those whose ``origin`` is
+        one of ``origins`` — the unit-context read. A gate that must judge a node
+        against its own unit (a trigger's mode and condition, a static's mode
+        fields, an effect's owning wrapper) takes the unit from here and reads it
+        through the unit's own presence reads (:meth:`AbilityUnit.iter_typed`,
+        :meth:`AbilityUnit.static_defs`, ``effects``), never a raw walk."""
+        for unit in self.units:
+            if not origins or unit.origin in origins:
+                yield unit
+
+    def iter_typed(self) -> Iterator[TypedMirrorNode]:
+        """Every typed mirror node under every unit — the whole-card deep walk."""
+        for unit in self.units:
+            yield from unit.iter_typed()
+
+    def has_typed(self, *tags: str) -> bool:
+        """Whether ANY typed node anywhere in the card carries one of ``tags``."""
+        return any(tag_of(n) in tags for n in self.iter_typed())
+
+    def has_concept(
+        self,
+        concept: str,
+        *,
+        role: str | None = None,
+        scope: str | None = None,
+        subject: str | None = None,
+    ) -> bool:
+        """Whether ANY concept-node is named ``concept`` (optionally in ``role``,
+        with ``scope``, naming ``subject``) — the overlay-level presence read."""
+        for c in self.iter_concepts():
+            if c.concept != concept:
+                continue
+            if role is not None and c.role != role:
+                continue
+            if scope is not None and c.scope != scope:
+                continue
+            if subject is not None and subject not in c.subject:
+                continue
+            return True
+        return False
+
+    def has_static_mode(self, *tags: str) -> bool:
+        """Whether ANY static-origin unit's mode discriminator is one of ``tags``."""
+        return any(
+            u.origin == "static" and static_mode_tag(u.node) in tags for u in self.units
+        )
+
+    def has_trigger(self, *events: str) -> bool:
+        """Whether ANY trigger unit fires on one of the derived ``events``."""
+        return any(u.trigger_event in events for u in self.units)
+
+    @cached_property
+    def unimplemented(self) -> tuple[TypedMirrorNode, ...]:
+        """Every ``Unimplemented`` residue node on the card, walked once and kept:
+        the ledger's ~150 gap reads and the parked-residue lane reads all filter
+        this instead of re-walking the tree."""
+        return tuple(n for n in self.iter_typed() if tag_of(n) == "Unimplemented")
+
+    def residues(self, name: str | None = None) -> Iterator[str]:
+        """The descriptions of phase's ``Unimplemented`` residue nodes — every
+        typed node phase parked rather than parsed — optionally only those whose
+        phase ``name`` is ``name`` (``"static_structure"``, ``"effect_structure"``,
+        ``"Unsupported unless clause"``, …). The read every gap-gated text bridge
+        keys on: a residue present means the clause survives only as text."""
+        for n in self.unimplemented:
+            if name is not None and not residue_is(n, name):
+                continue
+            yield getattr(n, "description", "") or ""
+
+    def has_residue(self, name: str | None = None) -> bool:
+        """Whether phase left ANY ``Unimplemented`` residue (of ``name``)."""
+        return next(self.residues(name), None) is not None
+
+    def effect_residues(self, name: str | None = None) -> Iterator[str]:
+        """The descriptions of the ``Unimplemented`` residues sitting in an
+        ability's EFFECT position (a unit's ``effects`` chain), optionally only
+        those whose phase ``name`` is ``name``. The narrower sibling of
+        :meth:`residues` for a clause phase parks as a resolved effect: a
+        cost, trigger-condition or static residue elsewhere on the card never
+        counts."""
+        for unit in self.units:
+            for c in unit.effects:
+                if tag_of(c.node) != "Unimplemented":
+                    continue
+                if name is not None and not residue_is(c.node, name):
+                    continue
+                yield getattr(c.node, "description", "") or ""
+
+    def hollow_statics(self) -> Iterator[str]:
+        """The descriptions of phase's HOLLOW static defs — a static ability def
+        phase built (``affected: SelfRef``) but left with an EMPTY
+        ``modifications`` list, so the clause survives only in the def's own
+        ``description`` (Siege Behemoth, Illusionist's Gambit; Camel since
+        v0.94.0). The static-side sibling of :meth:`residues`: no
+        ``Unimplemented`` node marks this gap, so a gap-gated text bridge keys
+        on the hollow def instead. (An emblem's unparsed static is
+        :meth:`hollow_emblem_statics`.)"""
+        for unit in self.units:
+            for sdef in unit.static_defs():
+                if tag_of(getattr(sdef, "affected", None)) != "SelfRef":
+                    continue
+                if getattr(sdef, "modifications", None):
+                    continue
+                yield getattr(sdef, "description", "") or ""
+
+    def hollow_emblem_statics(self) -> Iterator[str]:
+        """The descriptions of an emblem's UNPARSED statics: phase's placeholder
+        ``EmblemStatic`` mode with no ``affected`` and no modifications, the
+        clause only in its ``description`` (Ajani Steadfast's "If a source would
+        deal damage to you or a planeswalker you control, prevent all but 1 of
+        that damage"; CR 114.4: abilities of emblems function in the command
+        zone). Kept apart from :meth:`hollow_statics`, whose bridges were
+        censused without these."""
+        for unit in self.units:
+            for sdef in unit.static_defs():
+                if getattr(sdef, "mode", None) != "EmblemStatic":
+                    continue
+                if getattr(sdef, "modifications", None):
+                    continue
+                yield getattr(sdef, "description", "") or ""
+
+    def unknown_trigger_modes(self) -> Iterator[str]:
+        """The phrases of phase's ``Unknown`` trigger modes — a trigger whose
+        event phase couldn't classify, the event surviving only as the mode's
+        own text (Hero of Bretagard's "Whenever one or more cards are put into
+        exile from your hand or …"). The trigger-side sibling of
+        :meth:`residues`."""
+        for unit in self.units:
+            mode = (
+                getattr(unit.node, "mode", None) if unit.origin == "trigger" else None
+            )
+            if (
+                isinstance(mode, MirrorVariant)
+                and mode.key == "Unknown"
+                and isinstance(mode.inner, str)
+            ):
+                yield mode.inner
+
+    @property
+    def is_text_only(self) -> bool:
+        """Whether the card carries NO phase-parsed unit at all — a text-only face
+        tree (ADR-0038 W2c) or a tree whose only units are synthesized — so every
+        typed read is empty and only the oracle text is left to read."""
+        return all(u.origin == "synth" for u in self.units)
 
 
 def iter_nested_token_effects(node: object) -> Iterator[ConceptNode]:
@@ -522,7 +755,7 @@ def iter_nested_granted_effect_concepts(node: object) -> Iterator[ConceptNode]:
     ability/trigger body under ``node`` (see :func:`iter_nested_granted_bodies`)
     — walks each yielded body through the SAME effect/sub_ability/execute/
     mode_abilities chain a top-level unit's own effects walk uses
-    (:func:`_walk_effect_chain`), so a granted ABILITY's
+    (:func:`walk_effect_chain`), so a granted ABILITY's
     ``definition.effect`` (Arc Spitter's Equip-granted damage ability,
     Lavamancer's Skill / Pathway Arrows / Shuriken's Aura/Equipment-granted
     damage abilities) and a granted TRIGGER's ``execute.effect`` (Tyrant's
@@ -537,7 +770,16 @@ def iter_nested_granted_effect_concepts(node: object) -> Iterator[ConceptNode]:
     concept of their own (CR 113.3 / 605 / 611).
     """
     for _kind, body in iter_nested_granted_bodies(node):
-        yield from _walk_effect_chain(body)
+        recovered = body.__dict__.get(GRANTED_RECOVERY_ATTR)
+        yield from recovered if recovered is not None else walk_effect_chain(body)
+
+
+#: Where the recovery stage (an overlay stage built on this module) leaves a
+#: granted body's effect concepts with its residues re-decorated (Shackles of
+#: Treachery's granted "destroy target Equipment attached to it"), for
+#: :func:`iter_nested_granted_effect_concepts` to serve. A memo attribute beside
+#: the node's fields, like :func:`iter_mod_sites`'s, never a field of the mirror.
+GRANTED_RECOVERY_ATTR = "_xw_granted_recovered"
 
 
 # ── Batch-9 typed accessors (death / library-top / grant cluster) ────────────
@@ -556,7 +798,7 @@ _SELF_RETURN_TARGETS: frozenset[str] = frozenset({"SelfRef", "TriggeringSource"}
 # back-reference after one of these names the produced card, not the dying
 # self (CR 702.93a/702.79a's "return it" is the dying object itself).
 _CARD_PRODUCER_TAGS: frozenset[str] = frozenset(
-    {"RevealTop", "Dig", "TurnFaceUp", "Search"}
+    {"RevealTop", "Dig", "TurnFaceUp", "Search", "Seek"}
 )
 
 # ADR-0038 W3 batch 2: the dies-return trigger's OWN watcher — a bare
@@ -577,7 +819,7 @@ def is_dies_return_trigger(trig: object) -> bool:
     (:data:`_DIES_RETURN_WATCHER_TAGS`), whose ``execute`` chain carries a
     ``ChangeZone`` back to the Battlefield targeting the same object
     (:data:`_SELF_RETURN_TARGETS` — directly, or one level down inside a
-    ``CreateDelayedTrigger`` wrapper, which :func:`_walk_effect_chain`
+    ``CreateDelayedTrigger`` wrapper, which :func:`walk_effect_chain`
     already descends into). Works on a card's own trigger unit (Young Wolf
     — undying parses to exactly this) AND on the granted trigger inside a
     ``GrantTrigger`` modification (Feign Death), so the dies_recursion lane
@@ -626,12 +868,22 @@ def is_dies_return_trigger(trig: object) -> bool:
     #     loose back-ref to the face-down IMPRINTED card being turned up
     #     (Clone Shell, Summoner's Egg — the returned object never died).
     #     A ``Dig``/exile producer marks the same imprint indirection.
+    #   * a delayed trigger that WATCHES an object ("When it dies or is
+    #     exiled, return it" — earthbend's animated land, Earth Village
+    #     Ruffians) binds its ``TriggeringSource`` to that watched object.
     delayed_ids: set[int] = set()
-    for cn in _walk_effect_chain(execute):
+    watching_ids: set[int] = set()
+    for cn in walk_effect_chain(execute):
         if tag_of(cn.node) == "CreateDelayedTrigger":
-            delayed_ids.update(id(x.node) for x in _walk_effect_chain(cn.node))
+            inner = {id(x.node) for x in walk_effect_chain(cn.node)}
+            delayed_ids.update(inner)
+            watched = getattr(getattr(cn.node, "condition", None), "filter", None)
+            if watched is not None and tag_of(watched) != "SelfRef":
+                watching_ids.update(inner)
     producer_seen = False
-    for cn in _walk_effect_chain(execute):
+    # The else branch is walked after the main branch's subtree, so any
+    # producer there still gates it (Bogardan Phoenix's return) — conservative.
+    for cn in walk_effect_chain(execute):
         node = cn.node
         tag = tag_of(node)
         if tag in _CARD_PRODUCER_TAGS:
@@ -653,6 +905,8 @@ def is_dies_return_trigger(trig: object) -> bool:
             continue
         if producer_seen and target == "TriggeringSource" and not in_delayed:
             continue  # imprint return — the face-down card, not the self
+        if target == "TriggeringSource" and id(node) in watching_ids:
+            continue  # the delayed trigger's watched object, not the self
         if player_chosen and getattr(node, "enters_under", None) != "You":
             continue  # hot-potato — the return goes to the CHOSEN player
         return True
@@ -682,14 +936,20 @@ def _decorate_effect(node: object, role: str) -> ConceptNode | None:
     )
 
 
-def _walk_effect_chain(ability_like: TypedMirrorNode) -> Iterator[ConceptNode]:
+def walk_effect_chain(ability_like: TypedMirrorNode) -> Iterator[ConceptNode]:
     """Yield role=effect concepts reachable from one ability unit, depth-first.
 
     Decorates every tagged effect node reached through an effect-bearing field
-    (``effect`` / ``sub_ability`` / ``execute`` / ``mode_abilities``) so a deeply
-    nested terminal effect (a replacement's ``execute.effect`` win, a modal arm's
-    loss) is still one of the unit's effects — the whole-unit aggregation the
-    co-occurrence and whole-card lanes read. Cycle-safe (id-set + depth cap).
+    (``effect`` / ``sub_ability`` / ``execute`` / ``else_ability`` and the branch
+    lists :data:`_EFFECT_LIST_FIELDS` — modes, ``ChooseOneOf`` branches, vote
+    outcomes, die-roll rows) so a deeply nested terminal effect (a replacement's
+    ``execute.effect`` win, a modal arm's loss, an "otherwise" branch, a d20 row)
+    is still one of the unit's effects — the whole-unit aggregation the
+    co-occurrence and whole-card lanes read. A branch is one POSSIBLE outcome, so
+    a lane that must tell who picks it reads the owner wrapper
+    (:func:`effect_owner_player_scope`, ``reads.effect_player_reach``).
+    Depth-first: a node's else branch is walked after its main-branch subtree.
+    Cycle-safe (id-set + depth cap).
     """
     yield from _walk_effects(ability_like, 0, set())
 
@@ -705,65 +965,8 @@ def _walk_effects(node: object, depth: int, seen: set[int]) -> Iterator[ConceptN
         cn = _decorate_effect(node, "effect")
         if cn is not None:
             yield cn
-    for fname in _EFFECT_CHILD_FIELDS:
-        child = getattr(node, fname, MISSING)
-        if isinstance(child, TypedMirrorNode):
-            yield from _walk_effects(child, depth + 1, seen)
-    modes = getattr(node, "mode_abilities", MISSING)
-    if _present(modes) and isinstance(modes, list):
-        for m in modes:
-            if isinstance(m, TypedMirrorNode):
-                yield from _walk_effects(m, depth + 1, seen)
-
-
-def _player_scope_tag(ps: object) -> str | None:
-    """The actor tag of a ``player_scope`` value (tagged node / variant / string)."""
-    if isinstance(ps, TypedMirrorNode):
-        return tag_of(ps)
-    if isinstance(ps, MirrorVariant):
-        return ps.key
-    return ps if isinstance(ps, str) else None
-
-
-def _find_owner_scope(
-    node: object, target: object, depth: int, seen: set[int]
-) -> str | None:
-    if depth > 40 or not isinstance(node, TypedMirrorNode) or id(node) in seen:
-        return None
-    seen.add(id(node))
-    if getattr(node, "effect", MISSING) is target:
-        return _player_scope_tag(getattr(node, "player_scope", MISSING))
-    for fname in (*_EFFECT_CHILD_FIELDS, "mode_abilities"):
-        child = getattr(node, fname, MISSING)
-        if isinstance(child, TypedMirrorNode):
-            r = _find_owner_scope(child, target, depth + 1, seen)
-            if r is not None:
-                return r
-        elif _present(child) and isinstance(child, list):
-            for m in child:
-                r = _find_owner_scope(m, target, depth + 1, seen)
-                if r is not None:
-                    return r
-    return None
-
-
-def effect_owner_player_scope(root: object, effect_node: object) -> str | None:
-    """The ``player_scope`` actor tag on the ability wrapper that DIRECTLY owns
-    ``effect_node`` (the wrapper whose ``.effect`` IS it), or ``None`` when that
-    wrapper carries none.
-
-    phase hangs ``player_scope`` ("each player / an opponent <does X>") on the
-    wrapper whose ``effect`` is the resolving action — a trigger ``execute``, a
-    sequential ``sub_ability``, a modal ``mode_abilities`` arm — NOT on the inner
-    effect node the overlay decorates. Reading the scope of the wrapper that owns
-    THIS effect (not a sibling's) tells a give-away / edict ("each player gains
-    control", "each opponent sacrifices an enchantment") from a you-effect that
-    merely shares a unit with an unrelated each-player action — Nihiloor's
-    per-opponent tap loop (a ``repeat_for`` on the OUTER trigger, not the
-    gain-control's wrapper), Garland's monarch vote. Typed-attr reads only;
-    depth-capped, cycle-safe. ``None`` == owned by the ability's controller.
-    """
-    return _find_owner_scope(root, effect_node, 0, set())
+    for child in effect_children(node):
+        yield from _walk_effects(child, depth + 1, seen)
 
 
 def _cost_concepts(ability: TypedMirrorNode) -> tuple[ConceptNode, ...]:
@@ -852,9 +1055,24 @@ def _spell_alt_cost_paylife_concepts(root: TypedMirrorNode) -> tuple[ConceptNode
     return tuple(out)
 
 
-def _keyword_cost_paylife_concepts(root: TypedMirrorNode) -> tuple[ConceptNode, ...]:
-    """Role=cost ``PayLife`` concepts inside a KEYWORD's own alternative-cost
-    payload (CR 702 — Flashback/Warp/Blitz/Morph "Pay N life" variants) —
+# The keyword-cost leaves :func:`_keyword_cost_concepts` decorates: a life
+# payment and (phase v0.104.0 types Sabin, Master Monk's "Blitz—{2}{R}{R}, Discard a
+# card" as a ``Composite[Mana, Discard]``) a discard.
+_KEYWORD_COST_TAGS: frozenset[str] = _PAYLIFE_COST_TAGS | {"Discard"}
+# Keywords whose cost is an upkeep trigger's payment to keep the permanent (CR
+# 702.30a echo, 702.24a cumulative upkeep: "sacrifice it unless you pay"), not a
+# way to cast the card. Their discard (Deepcavern Imp's "Echo—Discard a card",
+# Vexing Sphinx's "Cumulative upkeep—Discard a card") is no discard outlet (Dan,
+# 2026-10-09): a forced payment to keep the permanent, not a discard you make on
+# demand. Only their life payments are read.
+_UPKEEP_PAYMENT_KEYWORDS: frozenset[str] = frozenset({"Echo", "CumulativeUpkeep"})
+
+
+def _keyword_cost_concepts(root: TypedMirrorNode) -> tuple[ConceptNode, ...]:
+    """Role=cost ``PayLife`` (and ``Discard``, :data:`_KEYWORD_COST_TAGS`)
+    concepts inside a KEYWORD's own alternative-cost payload (CR 702 —
+    Flashback/Warp/Blitz/Morph "Pay N life" variants, Sabin, Master Monk's
+    "Blitz—{2}{R}{R}, Discard a card") —
     Deep Analysis's "Flashback—{1}{U}, Pay 3 life.", Timeline Culler's
     "Warp—{B}, Pay 2 life.", Tenacious Underdog's "Blitz—{2}{B}{B}, Pay 2
     life.", Zombie Cutthroat's "Morph—Pay 5 life." Each keyword rides
@@ -884,8 +1102,13 @@ def _keyword_cost_paylife_concepts(root: TypedMirrorNode) -> tuple[ConceptNode, 
     for kw in kws:
         if isinstance(kw, MirrorVariant) and kw.key == "Ward":
             continue
+        tags = (
+            _PAYLIFE_COST_TAGS
+            if isinstance(kw, MirrorVariant) and kw.key in _UPKEEP_PAYMENT_KEYWORDS
+            else _KEYWORD_COST_TAGS
+        )
         for n in iter_typed_nodes(kw):
-            if tag_of(n) in _PAYLIFE_COST_TAGS:
+            if tag_of(n) in tags:
                 cn = _decorate_effect(n, "cost")
                 if cn is not None:
                     out.append(cn)
@@ -901,10 +1124,10 @@ def _keyword_effect_units(root: TypedMirrorNode) -> list[AbilityUnit]:
     ``triggers`` / ``static_abilities`` / ``replacements`` walks never reach,
     so a card whose ONLY structured content lives here previously carried
     ZERO ability units (no arm could ever fire on it). Distinct from
-    :func:`_keyword_cost_paylife_concepts` (role=cost, merges onto an
+    :func:`_keyword_cost_concepts` (role=cost, merges onto an
     ``"ability"``-origin Spell unit): this is the keyword's own role=effect
     body, decorated the same way any other origin's effect chain is
-    (:func:`_walk_effect_chain`), so e.g. a ``Mana`` effect tag reads as the
+    (:func:`walk_effect_chain`), so e.g. a ``Mana`` effect tag reads as the
     ordinary ``ramp`` concept.
 
     v0.23.0 corpus census: 9 commander-legal cards carry an ``EffectCost``
@@ -938,7 +1161,7 @@ def _keyword_effect_units(root: TypedMirrorNode) -> list[AbilityUnit]:
                 node=inner,
                 kind=tag_of(effect),
                 trigger_event=None,
-                effects=tuple(_walk_effect_chain(effect)),
+                effects=tuple(walk_effect_chain(effect)),
                 costs=(),
                 statics=(),
             )
@@ -1014,12 +1237,7 @@ def _nested_static_concepts(
         if not isinstance(node, TypedMirrorNode) or id(node) in seen:
             continue
         seen.add(id(node))
-        for fname in (*_EFFECT_CHILD_FIELDS, "mode_abilities"):
-            child = getattr(node, fname, MISSING)
-            if isinstance(child, TypedMirrorNode):
-                stack.append(child)
-            elif _present(child) and isinstance(child, list):
-                stack.extend(child)
+        stack.extend(effect_children(node))
         if tag_of(node) != "GenericEffect":
             continue
         target = getattr(node, "target", MISSING)
@@ -1050,6 +1268,122 @@ def _nested_static_concepts(
                     )
                 )
     return tuple(out)
+
+
+#: The partner—[text] groups phase v0.94.0 collapses to ``Partner{Generic}``
+#: (both Ellies, Joel, Abby: "Partner—Survivors"; Kratos, Stoic Father and Atreus:
+#: "Partner—Father & son"). CR 702.124f: different partner abilities can't be
+#: combined, so read as plain they would wrongly pair with every partner card. The
+#: group is read off the card's own ``Partner—`` line, only where phase says
+#: Generic, and served as ``("Group", name)`` to every reader. Guarded by
+#: ``test_survivors_partner_is_still_generic_canary``.
+PARTNER_GROUPS_PHASE_COLLAPSES = ("Survivors", "Father & son")
+
+
+def _corrected_partner_kind(
+    variant: str, data: object, oracle: object
+) -> tuple[str, str]:
+    if variant == "Generic" and isinstance(oracle, str):
+        for line in oracle.splitlines():
+            for group in PARTNER_GROUPS_PHASE_COLLAPSES:
+                if line.startswith(f"Partner\u2014{group}"):
+                    return "Group", group
+    return variant, data if isinstance(data, str) else ""
+
+
+#: Phase v0.94.0 fails a keyword whose cost has a non-mana part: it leaves the
+#: keyword off the card and parks its line as an ``Unimplemented`` residue —
+#: Zombie Cutthroat's "Morph—Pay 5 life.", Dragon's Eye Savants' "Morph—Reveal a
+#: blue card in your hand.", Timeline Culler's "Warp—{B}, Pay 2 life.",
+#: Shadowgrange Archfiend's madness,
+#: Escape Velocity's escape (parked as "~—…", the card's name read for the
+#: keyword). Each oracle "<Keyword>—" line whose cost phase parked as a residue is
+#: recovered, for ``card_alt_costs`` and (warp, blitz) ``card_curve_costs`` alike.
+#: Plot and retrace are left out (a card can mention plot without a plot cost;
+#: retrace prints none). The ``keyword_dropped_paylife`` ledger bridge reads the
+#: rows this recovers. Guarded by ``test_dropped_keyword_costs_canary``. (v0.104.0
+#: carries every blitz cost, Tenacious Underdog's ``Composite`` included.)
+_RECOVERABLE_KEYWORDS: dict[str, str] = {
+    kind: key
+    for key, (kind, _) in ALT_COST_KEYWORDS.items()
+    if key not in ("Plot", "Retrace")
+}
+
+
+def _printed_part(part: str) -> tuple[str, int | None]:
+    """One comma-separated part of a printed cost, for ``mana_value_paying_life``:
+    mana symbols, a life payment ("Pay 2 life"), or anything else."""
+    if part.startswith("{"):
+        return "mana", mana_value_of_cost(part)
+    if part.startswith("Pay ") and part.endswith(" life"):
+        return "life", None
+    return "other", None
+
+
+#: Phase v0.94.0 also misreads two keyword shapes, corrected here. "Suspend X—{X}…"
+#: (Detritivore, Aeon Chronicler, Benalish Commander, Fungal Behemoth, Roiling
+#: Horror) parses as count 0 with an empty {0} cost, so it is read off the card's
+#: line instead (CR 702.62a's "Suspend N—[cost]", N here X). Warbringer's "Dash costs
+#: you pay cost {2} less" (its ruling: the ability reduces dash costs) parses as a
+#: second ``Dash`` with an empty cost, dropped beside the real one; Memory Crystal's
+#: "Buyback costs cost {2} less" (its rulings: it changes buyback costs) as a lone
+#: ``Buyback`` with an empty cost — a buyback always has one (CR 702.27a). Guarded by
+#: ``test_misread_keyword_canary``.
+def _misread_keyword(kw: object, keys: list[str]) -> bool:
+    if not isinstance(kw, MirrorVariant):
+        return False
+    if kw.key == "Suspend" and getattr(kw.inner, "count", None) == 0:
+        return True
+    cost = keyword_cost(kw)
+    empty = tag_of(cost) == "Cost" and not getattr(cost, "shards", None)
+    if not empty or getattr(cost, "generic", 0):
+        return False
+    return keys.count(kw.key) > 1 or kw.key == "Buyback"
+
+
+def _dropped_keyword_costs(
+    root: TypedMirrorNode, present: set[str]
+) -> tuple[list[AltCost], list[int]]:
+    """The alternative-cost rows and curve costs of the keywords phase parked as
+    residues (see :data:`_RECOVERABLE_KEYWORDS`)."""
+    rows: list[AltCost] = []
+    curve: list[int] = []
+    oracle = getattr(root, "oracle_text", None)
+    parked = [
+        str(getattr(n, "description", "") or "").partition("\u2014")[2].rstrip(".")
+        for n in _iter_typed_nodes(root)
+        if tag_of(n) == "Unimplemented"
+    ]
+    parked = [p.strip() for p in parked if p.strip()]
+    if not isinstance(oracle, str) or not parked:
+        return rows, curve
+    for line in oracle.splitlines():
+        head, dash, rest = line.partition("\u2014")
+        if not dash:
+            continue
+        head = head.strip().lower()
+        count = ""
+        key = _RECOVERABLE_KEYWORDS.get(head)
+        if key is None:  # "Suspend X—", "Impending 4—": the keyword, then N
+            word, _, count = head.partition(" ")
+            key = _RECOVERABLE_KEYWORDS.get(word)
+            if key not in ("Suspend", "Impending"):
+                continue
+        if key in present or not any(rest.strip().startswith(p) for p in parked):
+            continue
+        cost = rest.split(" (")[0].split(". ")[0].strip().rstrip(".")
+        kind, cost_kind = ALT_COST_KEYWORDS[key]
+        if key in FACE_DOWN_KEYWORDS:
+            rows.extend(face_down_rows(kind, cost))
+            continue
+        shown = f"{count.upper()}\u2014{cost}" if count else cost
+        rows.append(AltCost(kind, shown, cost_kind))
+        if key in CURVE_COST_KEYWORDS:
+            parts = (_printed_part(p.strip()) for p in cost.split(","))
+            mv = mana_value_paying_life(parts)
+            if mv is not None:
+                curve.append(mv)
+    return rows, curve
 
 
 def build_concept_tree(
@@ -1092,13 +1426,16 @@ def build_concept_tree(
     # ``deck_copy_limit`` union (mirrors old-IR ``card_ir._allows_many_copies``).
     dcl = getattr(root, "deck_copy_limit", None)
     many_copies = False
+    deck_copy_cap: int | None = None
     if isinstance(dcl, TypedMirrorNode):
         dcl_tag = tag_of(dcl)
         if dcl_tag == "Unlimited":
             many_copies = True
         elif dcl_tag == "UpTo":
             dcl_data = getattr(dcl, "data", None)
-            many_copies = isinstance(dcl_data, int) and dcl_data >= 2
+            if isinstance(dcl_data, int):
+                deck_copy_cap = dcl_data
+                many_copies = dcl_data >= 2
     # task #87: the card's own printed ``Enchant`` keyword filter's core
     # type words (see ``ConceptTree.card_enchant_core_types``'s own
     # docstring) — a root-level array, never surfaced by any per-ability
@@ -1110,6 +1447,44 @@ def build_concept_tree(
             if isinstance(kw, MirrorVariant) and kw.key == "Enchant":
                 card_enchant_core_types = filter_core_types(kw.inner)
                 break
+    card_partner_kinds: list[tuple[str, str]] = []
+    for kw in kws_root if isinstance(kws_root, list) else ():
+        if not isinstance(kw, MirrorVariant) or kw.key != "Partner":
+            continue
+        variant = tag_of(kw.inner)
+        if variant:
+            card_partner_kinds.append(
+                _corrected_partner_kind(
+                    variant,
+                    getattr(kw.inner, "data", ""),
+                    getattr(root, "oracle_text", None),
+                )
+            )
+    # Phase's own Commander-eligibility verdict (``root.is_commander``; see the
+    # ``ConceptTree.can_be_commander`` field).
+    can_be_commander = getattr(root, "is_commander", None) is True
+    card_curve_costs: list[int] = []
+    card_alt_costs: list[AltCost] = []
+    present_keywords: set[str] = set()
+    card_keywords: list[str] = []
+    kw_list = kws_root if isinstance(kws_root, list) else []
+    kw_keys = [kw.key for kw in kw_list if isinstance(kw, MirrorVariant)]
+    for kw in kw_list:
+        if _misread_keyword(kw, kw_keys):
+            continue
+        if (cost := keyword_curve_cost(kw)) is not None:
+            card_curve_costs.append(cost)
+        card_alt_costs.extend(keyword_alt_costs(kw))
+        name = kw.key if isinstance(kw, MirrorVariant) else str(kw)
+        present_keywords.add(name)
+        card_keywords.append(name)
+    dropped_rows, dropped_curve = _dropped_keyword_costs(root, present_keywords)
+    card_alt_costs.extend(dropped_rows)
+    # A keyword phase parked as a residue (Escape Velocity's escape) still names it.
+    card_keywords.extend(
+        row.kind for row in dropped_rows if row.kind not in card_keywords
+    )
+    card_curve_costs.extend(dropped_curve)
     # ADR-0039 grammar sprint (task #82): a modal SPELL's card-root
     # ``modal.mode_descriptions`` (CR 700.2), positionally paired with
     # ``root.abilities`` (Fatal Lore, Season of the Burrow) — see the
@@ -1139,10 +1514,10 @@ def build_concept_tree(
     alt_costs = _spell_alt_cost_paylife_concepts(root)
     alt_attached = False
     # A keyword's own alternative-cost PayLife leaf (CR 702 — Flashback's
-    # "Pay N life" variant, see :func:`_keyword_cost_paylife_concepts`)
+    # "Pay N life" variant, see :func:`_keyword_cost_concepts`)
     # merges the SAME way — a FOURTH independent root-level cost surface
     # (``keywords``, distinct from ``additional_cost``/``casting_options``).
-    kw_costs = _keyword_cost_paylife_concepts(root)
+    kw_costs = _keyword_cost_concepts(root)
     kw_attached = False
     abilities = getattr(root, "abilities", ()) or ()
     for i, ab in enumerate(abilities):
@@ -1166,7 +1541,7 @@ def build_concept_tree(
                 node=ab,
                 kind=kind,
                 trigger_event=None,
-                effects=tuple(_walk_effect_chain(ab)),
+                effects=tuple(walk_effect_chain(ab)),
                 costs=costs,
                 statics=_nested_static_concepts(ab),
             )
@@ -1258,7 +1633,7 @@ def build_concept_tree(
             continue
         execute = getattr(trig, "execute", MISSING)
         effects = (
-            tuple(_walk_effect_chain(execute))
+            tuple(walk_effect_chain(execute))
             if isinstance(execute, TypedMirrorNode)
             else ()
         )
@@ -1307,7 +1682,7 @@ def build_concept_tree(
                 node=rp,
                 kind="replacement",
                 trigger_event=None,
-                effects=tuple(_walk_effect_chain(rp)),
+                effects=tuple(walk_effect_chain(rp)),
                 costs=(),
                 statics=_nested_static_concepts(rp),
             )
@@ -1328,8 +1703,14 @@ def build_concept_tree(
         has_printed_cost=has_printed_cost,
         oracle=oracle if isinstance(oracle, str) else "",
         many_copies=many_copies,
+        deck_copy_cap=deck_copy_cap,
+        card_partner_kinds=tuple(card_partner_kinds),
+        can_be_commander=can_be_commander,
         card_modal_mode_descriptions=card_modal_mode_descriptions,
         card_enchant_core_types=card_enchant_core_types,
+        card_curve_costs=tuple(card_curve_costs),
+        card_alt_costs=tuple(card_alt_costs),
+        card_keywords=tuple(card_keywords),
     )
     # ADR-0038 — substrate-wide Unimplemented recovery runs INSIDE the tree
     # build so every consumer (signal lanes, compat projection, convergence +

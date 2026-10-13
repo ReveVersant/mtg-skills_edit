@@ -1,8 +1,11 @@
 """deck-forge session state: the canonical in-progress deck and its mutations.
 
 A ``DeckSession`` owns the deck as ordered name→quantity maps per zone and emits the
-canonical parsed-deck dict (``{format, commanders, cards, sideboard, companion}``)
-that the rest of ``mtg_utils`` already speaks. To analyse a session, join it to the
+canonical parsed-deck dict (``{format, commanders, cards, sideboard, companion,
+pool}``) that the rest of ``mtg_utils`` already speaks. For a pool-bounded format
+(sealed / draft) the sideboard is DERIVED — the pool less the main deck — so "the
+sideboard is the unused pool" holds by construction and containment collapses to
+"the deck is drawn from the pool". To analyse a session, join it to the
 bulk index with ``HydratedDeck.from_session(session, by_name)`` (see
 ``mtg_utils.hydrated_deck``).
 """
@@ -15,33 +18,12 @@ from pathlib import Path
 
 from mtg_utils._deck_forge.agent_bridge import AgentBridge
 from mtg_utils._deck_forge.collection import CollectionStore
+from mtg_utils._deck_forge.discovery import DiscoveryCache
 from mtg_utils._deck_forge.events import EventHub
 from mtg_utils._deck_forge.persistence import BuildStore
 from mtg_utils._name_index import NameIndex
-from mtg_utils.format_config import (
-    COMMANDER_FORMATS,
-    FORMAT_CONFIGS,
-    is_arena_format,
-    is_arena_only_format,
-)
-
-# "companion" is the outside-the-game zone (CR 702.139a-b: a companion is neither
-# deck nor sideboard); consumers that count deck size must exclude it deliberately.
-_ZONES = ("commanders", "cards", "sideboard", "companion")
-# The Arena Brawl formats default to digital (Brawl / Historic Brawl can also be paper;
-# Competitive Brawl is Arena-only); commander is paper-only. Medium drives the active
-# Collection slot and the cost mode (wildcards vs USD). Derived from the configs.
-_ARENA_FORMATS = tuple(f for f in COMMANDER_FORMATS if is_arena_format(f))
-
-
-def _default_medium(fmt: str) -> str:
-    return "digital" if fmt in _ARENA_FORMATS else "paper"
-
-
-def _size_choosable(fmt: str, medium: str) -> bool:
-    """Only paper Historic Brawl (a.k.a. paper "Brawl") may be 60 OR 100 cards; every
-    other (format, medium) has a fixed size."""
-    return fmt == "historic_brawl" and medium == "paper"
+from mtg_utils.formats import FORMATS, Format
+from mtg_utils.hydrated_deck import ZONES
 
 
 class DeckSession:
@@ -57,38 +39,41 @@ class DeckSession:
         # and back; the properties re-derive the effective value live.
         self._medium_override = medium
         self._deck_size_override = deck_size
-        self._zones: dict[str, dict[str, int]] = {z: {} for z in _ZONES}
+        self._zones: dict[str, dict[str, int]] = {z: {} for z in ZONES}
         # Chosen printing per (zone, card name) → Scryfall printing id. Sparse: a card
         # with no entry uses the default (cheapest) printing, so existing builds and the
         # no-bulk path are unaffected. All copies of a card share one printing.
-        self._printings: dict[str, dict[str, str]] = {z: {} for z in _ZONES}
+        self._printings: dict[str, dict[str, str]] = {z: {} for z in ZONES}
         # Chosen finish ("foil" | "etched") per (zone, card name). Rides the pinned
         # printing: only a pinned card can carry a finish, and re-pinning without one
         # clears it (the plain nonfoil default).
-        self._finishes: dict[str, dict[str, str]] = {z: {} for z in _ZONES}
+        self._finishes: dict[str, dict[str, str]] = {z: {} for z in ZONES}
 
     @property
     def medium(self) -> str:
-        """Effective medium: commander is always paper and Competitive Brawl is always
-        digital (Arena-only); Brawl/Historic Brawl honor the override, defaulting to
-        digital (Arena is the common case for those)."""
-        if self.format not in _ARENA_FORMATS:
-            return "paper"
-        if is_arena_only_format(self.format):
-            return "digital"
-        return self._medium_override or _default_medium(self.format)
+        """Effective medium — the Format resolves the raw override (commander is always
+        paper, Competitive Brawl always digital, Brawl / Historic Brawl honour the
+        override and default to digital). Drives the active Collection slot and the
+        cost mode (wildcards vs USD)."""
+        return self.fmt.resolve_medium(self._medium_override)
 
     @property
     def deck_size(self) -> int:
-        """Effective deck size: the format default, except paper Historic Brawl may
-        override to 60 or 100 (both are legal for paper "Brawl")."""
-        default = FORMAT_CONFIGS.get(self.format, {}).get("deck_size", 100)
-        if _size_choosable(self.format, self.medium) and self._deck_size_override in (
-            60,
-            100,
-        ):
-            return self._deck_size_override
-        return default
+        """Effective deck size — the Format resolves the raw override under the
+        effective medium (only paper Historic Brawl may choose 60 or 100; elsewhere the
+        override lies dormant)."""
+        return self.fmt.resolve_deck_size(self._deck_size_override, self.medium)
+
+    @property
+    def fmt(self) -> Format:
+        """THE Format of this build (ADR-0045) — every format fact the hub reads comes
+        through here, never a second lookup of the table."""
+        return FORMATS[self.format]
+
+    @property
+    def pool_bounded(self) -> bool:
+        """A limited build: the sideboard is the pool less the main deck."""
+        return self.fmt.pool_bounded
 
     def set_medium(self, medium: str) -> None:
         self._medium_override = medium
@@ -98,13 +83,19 @@ class DeckSession:
 
     @classmethod
     def from_deck_dict(cls, deck: dict) -> DeckSession:
-        """Rebuild a session from a canonical parsed-deck dict (for resume/load)."""
+        """Rebuild a session from a canonical parsed-deck dict (for resume/load). A
+        pool-bounded deck's sideboard is derived, so its stored list is not loaded;
+        a pool-bounded dict with no pool (a list parsed before the zone existed)
+        pools its cards and sideboard."""
         session = cls(
-            deck.get("format", "commander"),
+            Format.for_deck(deck).name,
             medium=deck.get("medium"),
             deck_size=deck.get("deck_size"),
         )
-        for zone in _ZONES:
+        zones: tuple[str, ...] = ZONES
+        if session.pool_bounded and deck.get("pool"):
+            zones = tuple(z for z in ZONES if z != "sideboard")
+        for zone in zones:
             for entry in deck.get(zone) or []:
                 session.add(entry["name"], int(entry.get("quantity", 1)), zone=zone)
                 if entry.get("printing_id"):
@@ -114,6 +105,8 @@ class DeckSession:
                         zone=zone,
                         finish=entry.get("finish"),
                     )
+        if session.pool_bounded and not deck.get("pool"):
+            session.pool_everything()  # a dict from before the pool zone existed
         return session
 
     def add(self, name: str, qty: int = 1, *, zone: str = "cards") -> int:
@@ -172,47 +165,97 @@ class DeckSession:
     def finish_of(self, name: str, *, zone: str = "cards") -> str | None:
         return self._finishes.get(zone, {}).get(name)
 
+    def pool_everything(self) -> None:
+        """Make the build's cards its pool: every copy the main deck runs is in the
+        pool (at least), the stored sideboard joins the pool and is cleared (it is
+        derived from here on). What a build does entering a pool-bounded format,
+        and what a pre-pool dict does on load."""
+        pool = self._zones["pool"]
+        for name, qty in self._zones["cards"].items():
+            pool[name] = max(pool.get(name, 0), qty)
+        for name, qty in self._zones["sideboard"].items():
+            pool[name] = pool.get(name, 0) + qty
+        self.replace_zone("sideboard", {})
+
+    def derived_sideboard(self) -> dict[str, int]:
+        """A pool-bounded build's sideboard: the pool less the main deck, in pool
+        order (empty for any other format, whose sideboard is stored)."""
+        if not self.pool_bounded:
+            return {}
+        cards = self._zones["cards"]
+        return {
+            n: q - cards.get(n, 0)
+            for n, q in self._zones["pool"].items()
+            if q - cards.get(n, 0) > 0
+        }
+
+    def _entries(self, quantities: Mapping[str, int], pins: str) -> list:
+        """Entries for ``quantities`` with the printing / finish pinned under
+        ``pins`` (the zone whose pins apply — the pool's, for the derived sideboard)."""
+        prints = self._printings.get(pins, {})
+        finishes = self._finishes.get(pins, {})
+        return [
+            {
+                "name": n,
+                "quantity": q,
+                **({"printing_id": prints[n]} if n in prints else {}),
+                **({"finish": finishes[n]} if n in finishes else {}),
+            }
+            for n, q in quantities.items()
+        ]
+
     def to_deck_dict(self) -> dict:
         """Emit the canonical parsed-deck dict consumed across ``mtg_utils``. ``medium``
         and ``deck_size`` are the effective values (medium drives slot/cost; deck_size
-        flows into mana_audit's land math and the footer target)."""
+        flows into mana_audit's land math and the footer target). A pool-bounded
+        build's sideboard is derived (the pool less the main deck)."""
+        zones = {zone: self._entries(self._zones[zone], zone) for zone in ZONES}
+        if self.pool_bounded:
+            zones["sideboard"] = self._entries(self.derived_sideboard(), "pool")
         return {
             "format": self.format,
             "medium": self.medium,
             "deck_size": self.deck_size,
-            **{
-                zone: [
-                    {
-                        "name": n,
-                        "quantity": q,
-                        **(
-                            {"printing_id": self._printings[zone][n]}
-                            if n in self._printings.get(zone, {})
-                            else {}
-                        ),
-                        **(
-                            {"finish": self._finishes[zone][n]}
-                            if n in self._finishes.get(zone, {})
-                            else {}
-                        ),
-                    }
-                    for n, q in self._zones[zone].items()
-                ]
-                for zone in _ZONES
-            },
+            **zones,
         }
+
+    def replace_zone(self, zone: str, quantities: Mapping[str, int]) -> None:
+        """Set a zone's contents wholesale (a seeded build, a format switch),
+        dropping the pins of any name that leaves it."""
+        bucket = self._bucket(zone)
+        bucket.clear()
+        bucket.update({n: int(q) for n, q in quantities.items() if int(q) > 0})
+        for pinned in (self._printings[zone], self._finishes[zone]):
+            for name in list(pinned):
+                if name not in bucket:
+                    pinned.pop(name, None)
+
+    def quantities(self, zone: str) -> dict[str, int]:
+        """A zone's name → copies — THE read of what a zone holds: the derived
+        sideboard for a pool-bounded build, the stored bucket otherwise (a copy)."""
+        if zone == "sideboard" and self.pool_bounded:
+            return self.derived_sideboard()
+        return dict(self._bucket(zone))
+
+    def quantity_of(self, name: str, *, zone: str = "cards") -> int:
+        """How many copies of ``name`` a zone holds (0 when absent)."""
+        return self.quantities(zone).get(name, 0)
+
+    def quantity_sum(self, zone: str) -> int:
+        """The copies a zone holds in total."""
+        return sum(self.quantities(zone).values())
 
     def card_names(self) -> list[str]:
         """Every distinct card name across all zones (for hydration lookups)."""
         seen: dict[str, None] = {}
-        for zone in _ZONES:
+        for zone in ZONES:
             for name in self._zones[zone]:
                 seen.setdefault(name, None)
         return list(seen)
 
     def _bucket(self, zone: str) -> dict[str, int]:
         if zone not in self._zones:
-            msg = f"unknown zone {zone!r}; expected one of {_ZONES}"
+            msg = f"unknown zone {zone!r}; expected one of {ZONES}"
             raise ValueError(msg)
         return self._zones[zone]
 
@@ -276,40 +319,53 @@ class ForgeState:
     # slot's ownership matches flavor/printed names — the ADR-0018 Arena-alias promise.
     name_aliases: dict[str, str] = field(default_factory=dict)
     # Arena wildcard costing for digital builds: the bulk path + a lazily-built, cached
-    # Arena rarity index per FORMAT (``build_rarity_index`` walks all of bulk, so it's
-    # computed once per format and reused; keyed by format, not legality key, because
-    # competitive_brawl shares historic_brawl's key with a different ban policy).
+    # Arena rarity index per FORMAT (``CardPool.rarity_index`` walks all of bulk, so
+    # it's computed once per format and reused; keyed by format, since the format's
+    # legality read, not its key alone, decides membership).
     bulk_path: Path | None = None
     rarity_index: dict[str, NameIndex] = field(default_factory=dict)
-    # Lazily-built novelty support: per-format signal-rarity table over the whole legal
-    # commander pool (fmt -> (freq, total)). Cached because the sweep over every
-    # commander-eligible bulk card is the one expensive part of Commander discovery.
-    commander_signal_freq: dict = field(default_factory=dict)
-    # Lazily-built support-ranking caches (ADR-0018 amended / Q9): a deduped record pool
-    # (the density denominator) plus per-lane serve density (lane-key -> pool fraction
-    # serving it). Format-relative density weights a distinctive collection lane above a
-    # merely-broad one (artifacts), so "Most supported" reflects real depth.
-    density_pool: list[dict] = field(default_factory=list)
-    lane_density: dict[str, float] = field(default_factory=dict)
-    # Whether ``lane_density`` has been seeded from its on-disk sidecar yet (once per
-    # state) — so the ~55s first-discovery density sweep is paid once per bulk version,
-    # not once per server start. See engine._load_lane_density.
-    density_sidecar_loaded: bool = False
-    # Per-Collection-slot: lane-key → frozenset of owned card NAMES serving that lane.
-    # Computed once per distinct lane (not per commander-and-lane), so discovery
-    # scores via set intersection, not millions of per-card regex matches. Keyed by
-    # slot; invalidated when that slot's collection changes (set/clear_collection).
-    lane_collection_serves: dict[str, dict[str, frozenset[str]]] = field(
-        default_factory=dict
-    )
+    # Commander discovery's memoized sweeps (lane density, per-collection served-name
+    # sets, the Novelty signal-rarity table) — shared across the threadpool and the
+    # post-import background warm, so it owns its own lock. See ``discovery``.
+    discovery: DiscoveryCache = field(default_factory=DiscoveryCache)
     # Printing selection (picking a set/art for a card). ``printings_by_oracle`` maps a
     # card's oracle_id → every legal printing's record (for the picker list);
     # ``printing_by_id`` maps a Scryfall printing id → its record (to resolve a chosen
     # printing's image/price/set on the deck view + export). Both empty without bulk.
     printings_by_oracle: dict[str, list[dict]] = field(default_factory=dict)
     printing_by_id: dict[str, dict] = field(default_factory=dict)
+    # ``set-scan`` readouts memoized per set code (a whole-bulk walk each).
+    set_scans: dict[str, dict] = field(default_factory=dict)
+    # The last meta context ``engine.meta_context`` read (ADR-0059): ``(key, snapshot,
+    # context)``, the key the deck, its medium and the archetype choice, and the
+    # snapshot object the cache served (a new object once a refresh rewrites it).
+    # Spares every Find keystroke the archetype match and share/core reads.
+    meta_memo: tuple | None = None
+    # The main deck a pool seed replaced (name → copies), for one undo. Runtime,
+    # scoped to the live build (``switch_build`` drops it), never persisted.
+    seed_undo: dict[str, int] | None = None
+    # The one long-running hub job in flight, or None: ``{job, label, done, total,
+    # eta_s}`` — the signals-index build on first launch (a one-time ~2-4 min pass
+    # a Find or discovery request otherwise waits on with no word). Set from the
+    # worker thread running it, read into every snapshot, pushed over SSE as it
+    # moves. Runtime only; never persisted.
+    busy: dict | None = None
+    # Whether the Meta panel's Untapped sign-in window is open (one at a time).
+    meta_login_open: bool = False
+    # ``report_busy(job, label, done, total)`` — the transport's reporter for a long
+    # job (installed by the production entry; None in tests / agent-less use, and
+    # a job just skips reporting). A worker thread calls it; it folds the step into
+    # ``busy`` and broadcasts it.
+    report_busy: Callable[[str, str, int, int], None] | None = None
     # Resolves a folded object's name → its card (ADR-0025): a commander's ventured
     # dungeon, whose oracle is appended to the commander's before signal extraction.
     # Dungeons are excluded from `by_name` (unaddable), so this is a separate raw-bulk
     # lookup, built once at launch. None when no bulk → no folding (graceful).
     object_resolver: Callable[[str], dict | None] | None = None
+
+    @property
+    def active_slot(self) -> str:
+        """The Collection slot read for this build: ``paper`` for a paper build,
+        ``arena`` for a digital one. Keyed off medium, not format — so a paper Historic
+        Brawl reads the paper slot. Reads are strictly single-slot."""
+        return "paper" if self.session.medium == "paper" else "arena"

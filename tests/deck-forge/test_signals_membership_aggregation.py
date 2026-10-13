@@ -6,14 +6,15 @@ stat-line becomes a "X tribal / X payoffs" pair (the reported UI overload).
 
 from fastapi.testclient import TestClient
 
+from mtg_utils._analysis import signal_trees
+from mtg_utils._analysis.signals import extract_signals
+from mtg_utils._card_ir import trees
 from mtg_utils._card_ir.crosswalk import ConceptTree
-from mtg_utils._deck_forge import _ir_lookup
 from mtg_utils._deck_forge.app import build_app
 from mtg_utils._deck_forge.engine import _AVENUE_CAP
-from mtg_utils._deck_forge.signals import extract_signals
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
 from mtg_utils.deck import split_type_line
-from mtg_utils.testkit import test_card, test_signals
+from mtg_utils.testkit import test_card, test_card_ir, test_signals
 
 
 def _text_only_tree(card: dict) -> ConceptTree:
@@ -41,13 +42,14 @@ def _text_only_tree(card: dict) -> ConceptTree:
 
 
 def _wire_trees(monkeypatch, cards: list[dict]) -> None:
-    """Wire ``_ir_lookup.trees_for`` (the concept-tree resolver — extract_signals's ONLY
-    signal source, ADR-0039 task #80 step 6) with a text-only tree per card,
+    """Wire the tree resolver ``signal_trees_for`` reads (``trees_for`` — the
+    concept-tree owner, extract_signals's ONLY signal source) with a text-only tree per card,
     keyed by ``oracle_id``, for an engine-level (``TestClient``) test whose
     fixtures have no real phase record to resolve."""
     by_oid = {c["oracle_id"]: (_text_only_tree(c),) for c in cards}
+    signal_trees.clear_caches()
     monkeypatch.setattr(
-        _ir_lookup,
+        trees,
         "trees_for",
         lambda card, bulk=None, **_kw: by_oid.get(card.get("oracle_id") or "", ()),  # noqa: ARG005
     )
@@ -80,6 +82,7 @@ def test_membership_off_drops_voltron_but_not_own_subtype_type_matters():
 def test_membership_flag_does_not_touch_oracle_signals():
     # a real oracle payoff fires regardless of the flag.
     card = test_card("Goblin King")  # "Other Goblins get +1/+1 and have mountainwalk."
+    test_card_ir("Goblin King")  # CI-safe: seed the trees memo from the snapshot
     on = extract_signals(card, include_membership=True)
     off = extract_signals(card, include_membership=False)
     on_ids = {(s.key, s.subject, s.confidence) for s in on}

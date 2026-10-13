@@ -11,33 +11,32 @@ the ``ir_for`` / ``trees_for`` the concept-tree resolver/B resolvers, the hybrid
 dispatch, the residual-empty key partition, and the DFC face-union. The
 membership-floor behavior pins moved to ``test_signals_floor.py`` in the same
 step (named for what they test). CI-safe: the concept trees come from the
-committed ``crosswalk_fixture_cards.json`` phase records + the committed mirror
-schema — no bulk / sidecar / phase / network.
+committed card snapshot's phase records (``mtg_utils.testkit``) + the committed
+mirror schema — no bulk / sidecar / phase / network.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from functools import lru_cache
 
 import pytest
 
-from mtg_utils._card_ir.crosswalk import build_concept_tree
-from mtg_utils._card_ir.mirror import strict_load_card
-from mtg_utils._card_ir.mirror.build import fixtures_dir, load_committed_schema
-from mtg_utils._deck_forge import _ir_lookup as il
-from mtg_utils._deck_forge.lanes import (
+from mtg_utils._analysis.lanes import (
     SERVED_SIGNAL_KEYS,
     extract_crosswalk_signals,
 )
-from mtg_utils._deck_forge.signals import (
+from mtg_utils._analysis.signals import (
     extract_signals,
     producible_static_keys,
 )
+from mtg_utils._card_ir import compat_lookup as il
+from mtg_utils._card_ir import trees as ct
+from mtg_utils._card_ir.crosswalk import build_concept_tree
+from mtg_utils._card_ir.mirror import strict_load_card
+from mtg_utils._card_ir.mirror.build import load_committed_schema
 from mtg_utils.card_ir import Card, Face
-
-FIXTURE = "crosswalk_fixture_cards.json"
+from mtg_utils.testkit import test_card, test_phase_records
 
 
 def _returns(value: object) -> Callable[..., object]:
@@ -47,14 +46,6 @@ def _returns(value: object) -> Callable[..., object]:
         return value
 
     return _fn
-
-
-@lru_cache(maxsize=1)
-def _fixture_records() -> list[dict]:
-    path = fixtures_dir() / FIXTURE
-    if not path.exists():
-        pytest.skip(f"{FIXTURE} not present")
-    return list(json.loads(path.read_text())["cards"].values())
 
 
 @lru_cache(maxsize=1)
@@ -70,34 +61,25 @@ def _tree_for_record(rec: dict):
     )
 
 
-def _bulk(rec: dict) -> dict:
-    """A minimal Scryfall-shaped record joined to a phase record by oracle_id."""
-    return {
-        "oracle_id": rec.get("scryfall_oracle_id") or "",
-        "name": rec.get("name") or "",
-        "oracle_text": rec.get("oracle_text") or "",
-        "type_line": "Legendary Creature — Human",
-        "keywords": [],
-    }
+def _ported_phase_records() -> list[dict]:
+    """Goblin Rabblemaster's stored phase records (the snapshot's raw phase input)."""
+    return test_phase_records("Goblin Rabblemaster")
 
 
 @lru_cache(maxsize=1)
 def _ported_case() -> tuple[dict, object, str]:
-    """A fixture card whose crosswalk fires at least one PORTED key: return
-    (bulk_record, concept_tree, one_ported_key)."""
-    for rec in _fixture_records():
-        oid = rec.get("scryfall_oracle_id")
-        if not oid:
-            continue
-        try:
-            tree = _tree_for_record(rec)
-        except Exception:  # noqa: BLE001 — skip drift/odd cards in the search
-            continue
-        sigs = extract_crosswalk_signals(tree, keywords=frozenset())
-        ported = [s.key for s in sigs if s.key in SERVED_SIGNAL_KEYS]
-        if ported:
-            return _bulk(rec), tree, ported[0]
-    pytest.skip("no PORTED-firing card found in fixture")
+    """A real card whose crosswalk fires at least one PORTED key: return
+    (bulk_record, concept_tree, one_ported_key). Goblin Rabblemaster fires
+    token_maker (among others) from its combat trigger; its bulk record is the
+    real one from the snapshot (ADR-0056), not a type line bolted onto a
+    searched-for record."""
+    bulk = test_card("Goblin Rabblemaster")
+    (rec,) = _ported_phase_records()
+    tree = _tree_for_record(rec)
+    sigs = extract_crosswalk_signals(tree, keywords=frozenset())
+    ported = [s.key for s in sigs if s.key in SERVED_SIGNAL_KEYS]
+    assert ported, "Goblin Rabblemaster no longer fires a PORTED key"
+    return bulk, tree, ported[0]
 
 
 @pytest.fixture(autouse=True)
@@ -136,25 +118,25 @@ def test_ir_for_returns_none_without_oracle_id(monkeypatch):
 
 
 def test_trees_for_degrades_without_phase_data(monkeypatch):
-    monkeypatch.setattr(il, "_phase_record_index", _returns(None))
-    assert il.trees_for({"oracle_id": "x"}) == ()
+    monkeypatch.setattr(ct, "_phase_record_index", _returns(None))
+    assert ct.trees_for({"oracle_id": "x"}) == ()
 
 
 def test_trees_for_none_without_oracle_id():
-    assert il.trees_for({"name": "no oid"}) == ()
+    assert ct.trees_for({"name": "no oid"}) == ()
 
 
 def test_trees_for_builds_and_memoizes(monkeypatch):
     bulk, _tree, _key = _ported_case()
     oid = bulk["oracle_id"]
-    # Feed the resolver our fixture record + schema directly.
-    rec = next(r for r in _fixture_records() if r.get("scryfall_oracle_id") == oid)
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
-    got = il.trees_for(bulk)
+    # Feed the resolver the card's stored phase record + schema directly.
+    (rec,) = _ported_phase_records()
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
+    got = ct.trees_for(bulk)
     assert got != ()
     assert got[0].oracle_id == oid
-    assert oid in il._TREES_MEMO  # memoized
+    assert oid in ct._TREES_MEMO  # memoized
 
 
 # ── DFC face-union (ADR-0035/0038 task #74) ─────────────────────────────────
@@ -169,13 +151,11 @@ def test_trees_for_returns_every_face_for_a_dfc(monkeypatch):
     records (a DFC); ``trees_for`` must return BOTH, not first-record-wins — the
     task #74 bug (a first-record-wins index dropped whichever face iterated second,
     silently starving any lane whose only node lives on that face)."""
-    recs = tuple(
-        r for r in _fixture_records() if r.get("scryfall_oracle_id") == _AANG_OID
-    )
-    assert len(recs) == 2, "fixture must carry both Avatar Aang faces"
-    monkeypatch.setattr(il, "_phase_record_index", _returns({_AANG_OID: recs}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
-    trees = il.trees_for({"oracle_id": _AANG_OID})
+    recs = tuple(test_phase_records("Avatar Aang // Aang, Master of Elements"))
+    assert len(recs) == 2, "the snapshot must carry both Avatar Aang faces"
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({_AANG_OID: recs}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
+    trees = ct.trees_for({"oracle_id": _AANG_OID})
     assert {t.name for t in trees} == {"Avatar Aang", "Aang, Master of Elements"}
 
 
@@ -215,12 +195,10 @@ def test_text_only_tree_added_for_a_phase_missing_face(monkeypatch):
     """A bulk face with no name-matched phase record among the oid's group
     becomes an extra zero-unit ConceptTree carrying its own bulk oracle
     text, ONLY when the caller supplies ``bulk=``."""
-    rec = next(
-        r for r in _fixture_records() if r.get("name") == '"Name Sticker" Goblin'
-    )
+    (rec,) = test_phase_records('"Name Sticker" Goblin')
     oid = rec["scryfall_oracle_id"]
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
     bulk = _synthetic_bulk(
         oid,
         '"Name Sticker" Goblin',
@@ -234,13 +212,13 @@ def test_text_only_tree_added_for_a_phase_missing_face(monkeypatch):
     )
 
     # No ``bulk=`` → phase-record trees only (the pre-W2c shape, unchanged).
-    trees_no_bulk = il.trees_for({"oracle_id": oid})
+    trees_no_bulk = ct.trees_for({"oracle_id": oid})
     assert {t.name for t in trees_no_bulk} == {'"Name Sticker" Goblin'}
 
     il.clear_caches()
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
-    trees = il.trees_for({"oracle_id": oid}, bulk=bulk)
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
+    trees = ct.trees_for({"oracle_id": oid}, bulk=bulk)
     names = {t.name for t in trees}
     assert names == {'"Name Sticker" Goblin', "Fabricated Ghost Face"}
     ghost = next(t for t in trees if t.name == "Fabricated Ghost Face")
@@ -254,33 +232,29 @@ def test_text_only_tree_added_for_a_phase_missing_face(monkeypatch):
 def test_vanilla_single_face_bulk_yields_no_text_only_tree(monkeypatch):
     """A ``bulk`` record with no (or a single) ``card_faces`` entry never
     synthesizes a text-only tree — the ``len(faces) != 2`` gate."""
-    rec = next(
-        r for r in _fixture_records() if r.get("name") == '"Name Sticker" Goblin'
-    )
+    (rec,) = test_phase_records('"Name Sticker" Goblin')
     oid = rec["scryfall_oracle_id"]
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
     vanilla_bulk = {"oracle_id": oid, "name": '"Name Sticker" Goblin', "cmc": 3.0}
-    trees = il.trees_for({"oracle_id": oid}, bulk=vanilla_bulk)
+    trees = ct.trees_for({"oracle_id": oid}, bulk=vanilla_bulk)
     assert {t.name for t in trees} == {'"Name Sticker" Goblin'}
 
 
 def test_empty_oracle_phase_missing_face_yields_no_tree(monkeypatch):
     """A phase-missing face with blank ``oracle_text`` carries nothing to
     read, so it is skipped rather than synthesizing an empty tree."""
-    rec = next(
-        r for r in _fixture_records() if r.get("name") == '"Name Sticker" Goblin'
-    )
+    (rec,) = test_phase_records('"Name Sticker" Goblin')
     oid = rec["scryfall_oracle_id"]
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
     bulk = _synthetic_bulk(
         oid,
         '"Name Sticker" Goblin',
         rec["oracle_text"],
         second_face={"name": "Blank Face", "oracle_text": "", "type_line": "Land"},
     )
-    trees = il.trees_for({"oracle_id": oid}, bulk=bulk)
+    trees = ct.trees_for({"oracle_id": oid}, bulk=bulk)
     assert {t.name for t in trees} == {'"Name Sticker" Goblin'}
 
 
@@ -290,12 +264,10 @@ def test_three_way_split_excluded_from_text_only_synthesis(monkeypatch):
     two faces on a split/aftermath/adventure/transform/modal_dfc card, so
     ``len(card_faces) != 2`` is the defer-not-hack gate (see the module
     comment above ``_TEXT_ONLY_EXCLUDED_LAYOUTS`` in ``_ir_lookup``)."""
-    rec = next(
-        r for r in _fixture_records() if r.get("name") == '"Name Sticker" Goblin'
-    )
+    (rec,) = test_phase_records('"Name Sticker" Goblin')
     oid = rec["scryfall_oracle_id"]
-    monkeypatch.setattr(il, "_phase_record_index", _returns({oid: (rec,)}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({oid: (rec,)}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
     bulk = {
         "oracle_id": oid,
         "name": '"Name Sticker" Goblin // B // C',
@@ -311,7 +283,7 @@ def test_three_way_split_excluded_from_text_only_synthesis(monkeypatch):
             {"name": "C", "oracle_text": "Another effect.", "type_line": "Instant"},
         ],
     }
-    trees = il.trees_for({"oracle_id": oid}, bulk=bulk)
+    trees = ct.trees_for({"oracle_id": oid}, bulk=bulk)
     assert {t.name for t in trees} == {'"Name Sticker" Goblin'}
 
 
@@ -323,18 +295,11 @@ def test_avatar_aang_union_fires_all_four_bend_keys(monkeypatch):
     silently drop them. The union of both faces' trees must fire all three bend
     lanes plus the keyword-sourced firebending_makers — the whole card's bend
     profile, regardless of which face happened to be read first."""
-    recs = tuple(
-        r for r in _fixture_records() if r.get("scryfall_oracle_id") == _AANG_OID
-    )
-    bulk = {
-        "oracle_id": _AANG_OID,
-        "name": "Avatar Aang // Aang, Master of Elements",
-        "oracle_text": "\n".join(r.get("oracle_text") or "" for r in recs),
-        "type_line": "Legendary Creature — Human Avatar Ally",
-        "keywords": ["Flying", "Firebending"],
-    }
-    monkeypatch.setattr(il, "_phase_record_index", _returns({_AANG_OID: recs}))
-    monkeypatch.setattr(il, "_committed_schema", _returns(_schema()))
+    recs = tuple(test_phase_records("Avatar Aang // Aang, Master of Elements"))
+    bulk = test_card("Avatar Aang // Aang, Master of Elements")
+    assert bulk["oracle_id"] == _AANG_OID
+    monkeypatch.setattr(ct, "_phase_record_index", _returns({_AANG_OID: recs}))
+    monkeypatch.setattr(ct, "_committed_schema", _returns(_schema()))
     keys = {s.key for s in extract_signals(bulk)}
     assert keys >= _BEND_KEYS
 
@@ -343,9 +308,7 @@ def test_avatar_aang_regression_no_fire_control(monkeypatch):
     """A no-bend card stays silent on all four keys through the same union path —
     the fix doesn't turn the bend lanes into a blanket floor."""
     bulk, tree, _key = _ported_case()
-    if tree.oracle_id == _AANG_OID:
-        pytest.skip("ported-case card is Avatar Aang itself")
-    monkeypatch.setattr(il, "trees_for", _returns((tree,)))
+    monkeypatch.setattr(ct, "trees_for", _returns((tree,)))
     keys = {s.key for s in extract_signals(bulk)}
     assert not (_BEND_KEYS & keys)
 
@@ -355,7 +318,7 @@ def test_avatar_aang_regression_no_fire_control(monkeypatch):
 
 def test_hybrid_serves_ported_from_crosswalk(monkeypatch):
     bulk, tree, ported_key = _ported_case()
-    monkeypatch.setattr(il, "trees_for", _returns((tree,)))
+    monkeypatch.setattr(ct, "trees_for", _returns((tree,)))
     on = {s.key for s in extract_signals(bulk)}
     assert ported_key in on
 
@@ -365,7 +328,7 @@ def test_hybrid_no_signal_when_tree_unavailable(monkeypatch):
     fallback (ADR-0039 task #80 step 6: the legacy regex / Card-IR paths are
     gone) — a graceful empty answer for that lane, never a crash."""
     bulk, _tree, ported_key = _ported_case()
-    monkeypatch.setattr(il, "trees_for", _returns(()))
+    monkeypatch.setattr(ct, "trees_for", _returns(()))
     on = {s.key for s in extract_signals(bulk)}
     assert ported_key not in on
 
@@ -374,7 +337,7 @@ def test_hybrid_reconciliation_single_fire(monkeypatch):
     """No duplicate (key, scope, subject) survives the shared reconciliation tail,
     even though the crosswalk applies its own reconciliations before the merge."""
     bulk, tree, _key = _ported_case()
-    monkeypatch.setattr(il, "trees_for", _returns((tree,)))
+    monkeypatch.setattr(ct, "trees_for", _returns((tree,)))
     sigs = extract_signals(bulk)
     idents = [(s.key, s.scope, s.subject) for s in sigs]
     assert len(idents) == len(set(idents))
@@ -403,7 +366,7 @@ def test_producible_includes_crosswalk_only_lanes():
 def test_gate_resolves_every_producible_key():
     """The import-time key-agreement gate passes — every crosswalk-produced key
     (incl. the 3 PORTED-only lanes) resolves to a serve/search spec."""
-    from mtg_utils._deck_forge.signal_specs import (
+    from mtg_utils._analysis.signal_specs import (
         _assert_every_producible_key_resolves,
     )
 

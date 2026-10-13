@@ -22,24 +22,25 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mtg_utils._name_index import NameIndex, build_name_index
-from mtg_utils.bulk_loader import load_bulk_cards
+from mtg_utils._name_index import NameIndex
 from mtg_utils.card_classify import (
-    SKIP_LAYOUTS,
     color_sources,
     is_creature,
     is_land,
-    is_ramp,
     land_fetch_profile,
 )
+from mtg_utils.card_pool import CardPool
 from mtg_utils.names import normalize_card_name
 from mtg_utils.names import slug as slug  # noqa: PLC0414 (re-export; home is names.py)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+
+    from mtg_utils._analysis.roles import DeckMana
 
 
 # Card-type words used as fallback art keys after subtypes miss; also
@@ -93,6 +94,22 @@ def hydrate(card: dict) -> dict:
     if faces and not out.get("type_line"):
         out["type_line"] = " // ".join(f.get("type_line") or "" for f in faces)
     return out
+
+
+#: The zones whose cards a builder must own to play the deck: the commanders, the
+#: main deck, the sideboard and the companion (never an opened pool).
+OWNED_ZONES: tuple[str, ...] = ("commanders", "cards", "sideboard", "companion")
+
+
+def deck_entries(deck: Mapping, zones: tuple[str, ...] = OWNED_ZONES) -> list[dict]:
+    """Every well-formed entry (a dict with a string ``name``) in ``zones``, in zone
+    then deck order — the one walk the ownership readers share."""
+    return [
+        entry
+        for zone in zones
+        for entry in deck.get(zone) or []
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    ]
 
 
 def walk_cards(
@@ -184,39 +201,19 @@ def discover_tokens(
     return sorted(by_oid.values(), key=sort_key)
 
 
-def _prefer_oracle(existing: dict, new: dict) -> dict:
-    """Tiebreak for the proxy/art path: keep a printing WITH oracle text over a
-    text-less placeholder (so a card never renders a blank proxy); else first wins."""
-    if not existing.get("oracle_text") and new.get("oracle_text"):
-        return new
-    return existing
-
-
 def load_bulk_indexes(bulk_path: Path) -> tuple[NameIndex, dict[str, dict]]:
-    """Build ``(by_name, by_id)`` indexes from Scryfall bulk data.
-
-    ``by_name`` is a folding name index (NFKD + every face + Arena aliases, via the
-    shared name-index core) that skips token / art-series layouts so a card-name lookup
-    never returns a token, and keeps a printing with oracle text over a text-less
-    placeholder. ``by_id`` includes EVERYTHING, tokens included — needed to resolve
-    ``all_parts`` token references — so it stays a plain id-keyed dict in the same pass.
-    """
-    cards = load_bulk_cards(bulk_path)
-    by_id: dict[str, dict] = {}
-    for card in cards:
-        cid = card.get("id")
-        if cid:
-            by_id[cid] = card
-    by_name = build_name_index(
-        cards,
-        reduce=_prefer_oracle,
-        prefilter=lambda card: card.get("layout") not in SKIP_LAYOUTS,
-    )
-    return by_name, by_id
+    """``(by_name, by_id)`` for the proxy / art path — the ``CardPool``'s indexes
+    (ADR-0046): ``by_name`` resolves a deck name to one game-layout printing (never a
+    token, a text-bearing printing preferred); ``by_id`` includes EVERYTHING, tokens
+    included, to resolve ``all_parts`` token references."""
+    pool = CardPool.load(bulk_path)
+    return pool.by_name, pool.by_id
 
 
 def accumulate_deck_metrics(
     pairs: Iterable[tuple[int, dict | None]],
+    *,
+    deck_mana: DeckMana | None = None,
 ) -> dict:
     """Single-pass deck metrics over ``(quantity, card-record-or-None)`` pairs.
 
@@ -224,8 +221,13 @@ def accumulate_deck_metrics(
     creature / ramp / game-changer counts, CMC curve, color sources, and the
     nonland-CMC average). Returns raw values — Counters and an unrounded
     ``avg_cmc`` — so each caller formats as it needs. A ``None`` record (an
-    un-hydratable name) counts toward ``total`` only.
+    un-hydratable name) counts toward ``total`` only. Ramp is judged under
+    ``deck_mana`` (``hd.deck_mana``): a rock whose mana is dead for it isn't ramp.
     """
+    # Lazy: this module is also proxy-print's / fetch-art's deck walk, which must not
+    # pay for the analysis stack on import.
+    from mtg_utils._analysis.roles import is_ramp
+
     total = 0
     land_count = creature_count = ramp_count = game_changer_count = 0
     nonland_cmcs: list[float] = []
@@ -243,7 +245,7 @@ def accumulate_deck_metrics(
             curve[int(cmc)] += qty
         if is_creature(card):
             creature_count += qty
-        if is_ramp(card):
+        if is_ramp(card, deck_mana=deck_mana):
             ramp_count += qty
         if card.get("game_changer"):
             game_changer_count += qty

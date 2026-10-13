@@ -11,11 +11,13 @@ from mtg_utils._mtgjson.load import (
     ALLPRICES_NAME,
     ALLPRINTINGS_NAME,
     MTGJSON_FILES,
+    STALE_COMPETITIVE_BRAWL_WARNING,
     _group_faces,
     flatten,
     source_files,
 )
 from mtg_utils.card_classify import get_mana_cost, get_oracle_text
+from mtg_utils.testkit import mtgjson_printing, mtgjson_sets
 
 
 # ── normalize_legalities ──────────────────────────────────────────────────────
@@ -181,6 +183,29 @@ def test_translate_single_face_core_fields():
     assert set(rec["games"]) == {"paper", "arena", "mtgo"}
     # New pre-split arrays exposed for the _subtypes precision gate.
     assert rec["types"] == ["Sorcery"]
+
+
+def test_translate_carries_printing_style():
+    """A printing's style (what makes a basic land printing special: full-art,
+    borderless, a special frame, a promo) rides onto the record."""
+    plain = adapter.translate_card([_sunfall()])
+    assert plain["full_art"] is False
+    assert plain["frame_effects"] == []
+    assert plain["promo"] is False
+    styled = {
+        **_sunfall(),
+        "isFullArt": True,
+        "borderColor": "borderless",
+        "frameEffects": ["showcase"],
+        "isPromo": True,
+        "promoTypes": ["boosterfun"],
+    }
+    rec = adapter.translate_card([styled])
+    assert rec["full_art"] is True
+    assert rec["border_color"] == "borderless"
+    assert rec["frame_effects"] == ["showcase"]
+    assert rec["promo"] is True
+    assert rec["promo_types"] == ["boosterfun"]
 
 
 def test_translate_single_face_has_image_uris():
@@ -513,28 +538,29 @@ def test_produced_mana_omitted_when_empty():
 
 
 def test_meld_piece_emits_meld_result_all_part():
+    # Fictional meld pair (ADR-0056): only the piece → result wiring is under test.
     piece = {
-        "name": "Bruna // Brisela",
-        "faceName": "Bruna",
+        "name": "Meld Piece // Melded Whole",
+        "faceName": "Meld Piece",
         "layout": "meld",
-        "type": "Creature — Angel",
+        "type": "Creature — Test",
         "otherFaceIds": ["result"],
-        "uuid": "bruna",
+        "uuid": "piece",
         "identifiers": {"scryfallId": "bb22", "scryfallOracleId": "ob"},
     }
     result = {
-        "name": "Brisela, Voice of Nightmares",
-        "faceName": "Brisela",
+        "name": "Melded Whole",
+        "faceName": "Melded Whole",
         "layout": "meld",
-        "type": "Creature — Eldrazi Angel",
-        "otherFaceIds": ["bruna", "gisela"],
+        "type": "Creature — Test",
+        "otherFaceIds": ["piece", "other-piece"],
         "uuid": "result",
         "identifiers": {"scryfallId": "cc33", "scryfallOracleId": "obr"},
     }
     rec = adapter.translate_card([piece], card_by_uuid={"result": result})
     meld = [p for p in rec["all_parts"] if p["component"] == "meld_result"]
     assert len(meld) == 1
-    assert meld[0]["name"] == "Brisela"
+    assert meld[0]["name"] == "Melded Whole"
 
 
 # ── oracle-level legality aggregation ───────────────────────────────────────────
@@ -566,18 +592,78 @@ def test_translate_uses_oracle_legalities_index():
     assert rec["legalities"]["modern"] == "not_legal"  # index overrides own
 
 
-def test_gate_arena_formats_forces_not_legal_off_arena():
-    leg = dict.fromkeys(adapter._LEGALITY_FORMATS, "legal")
-    out = adapter.gate_arena_formats(leg, arena_available=False)
-    assert out["historic"] == "not_legal"
-    assert out["brawl"] == "not_legal"
-    assert out["timeless"] == "not_legal"
-    assert out["commander"] == "legal"  # paper format untouched
+def test_flatten_carries_the_competitive_brawl_key():
+    # Mana Drain: ordinary Brawl bans it, Competitive Brawl allows it. Sol Ring has
+    # no status there, so MTGJSON omits the key and the adapter fills not_legal.
+    drain = mtgjson_printing("Mana Drain", "ema", "mythic", ["arena", "paper"])
+    ring = mtgjson_printing("Sol Ring", "cmr", "uncommon", ["paper"])
+    by_name = {r["name"]: r for r in flatten(mtgjson_sets(drain, ring)["data"])}
+    assert by_name["Mana Drain"]["legalities"]["brawl"] == "banned"
+    assert by_name["Mana Drain"]["legalities"]["competitivebrawl"] == "legal"
+    assert by_name["Sol Ring"]["legalities"]["competitivebrawl"] == "not_legal"
 
 
-def test_gate_arena_formats_noop_when_arena_available():
-    leg = dict.fromkeys(adapter._LEGALITY_FORMATS, "legal")
-    assert adapter.gate_arena_formats(leg, arena_available=True) == leg
+def test_flatten_warns_once_when_the_file_predates_the_competitive_brawl_key(capsys):
+    # A file older than MTGJSON's key carries it on no card: every record reads
+    # not_legal in Competitive Brawl, and flatten says so once.
+    drain = mtgjson_printing("Mana Drain", "ema", "mythic", ["arena", "paper"])
+    del drain["legalities"]["competitivebrawl"]
+    ring = mtgjson_printing("Sol Ring", "cmr", "uncommon", ["paper"])
+    out = flatten(mtgjson_sets(drain, ring)["data"])
+    assert {r["legalities"]["competitivebrawl"] for r in out} == {"not_legal"}
+    assert capsys.readouterr().err.count(STALE_COMPETITIVE_BRAWL_WARNING) == 1
+
+
+def test_flatten_is_quiet_when_the_file_carries_the_key(capsys):
+    drain = mtgjson_printing("Mana Drain", "ema", "mythic", ["arena", "paper"])
+    flatten(mtgjson_sets(drain)["data"])
+    assert STALE_COMPETITIVE_BRAWL_WARNING not in capsys.readouterr().err
+
+
+def _printing(name="Card", **over):
+    base = {
+        "name": name,
+        "uuid": "u1",
+        "identifiers": {"scryfallOracleId": "oid-1", "scryfallId": "sid-1"},
+        "type": "Instant",
+        "types": ["Instant"],
+        "manaValue": 1.0,
+        "colorIdentity": ["R"],
+        "layout": "normal",
+        "availability": ["paper"],
+        "legalities": {"brawl": "Legal", "commander": "Legal"},
+        "setCode": "XYZ",
+        "rarity": "common",
+    }
+    base.update(over)
+    return base
+
+
+def test_translate_arena_available_from_oracle_index():
+    rec = adapter.translate_card([_printing()], arena_index={"oid-1": True})
+    assert rec["arena_available"] is True
+    rec = adapter.translate_card([_printing()], arena_index={"oid-1": False})
+    assert rec["arena_available"] is False
+
+
+def test_translate_arena_available_falls_back_to_the_printing():
+    # No oracle index (a lone printing, a token): the printing's own availability.
+    assert adapter.translate_card([_printing()])["arena_available"] is False
+    on_arena = _printing(availability=["arena", "paper"])
+    assert adapter.translate_card([on_arena])["arena_available"] is True
+
+
+def test_translate_legalities_are_never_rewritten_by_availability():
+    # The retired adapter gate forced Arena-only formats to not_legal off Arena;
+    # ``formats.Format.legality`` now gates on arena_available instead, so the
+    # aggregated status survives verbatim.
+    rec = adapter.translate_card([_printing()], arena_index={"oid-1": False})
+    assert rec["legalities"]["brawl"] == "legal"
+
+
+def test_translate_reprint_from_is_reprint():
+    assert adapter.translate_card([_printing(isReprint=True)])["reprint"] is True
+    assert adapter.translate_card([_printing()])["reprint"] is False
 
 
 def test_translate_cmc_defaults_zero_when_manavalue_absent():
@@ -684,3 +770,15 @@ def test_source_files_lists_printings_then_prices(tmp_path):
     assert source_files(printings) == [printings, tmp_path / ALLPRICES_NAME]
     # ...and download fetches exactly those names — one home, so they can't drift.
     assert MTGJSON_FILES == (ALLPRINTINGS_NAME, ALLPRICES_NAME)
+
+
+def test_translate_carries_the_arena_id_as_an_int():
+    """MTGJSON keeps a printing's Arena id at ``identifiers.mtgArenaId`` as a string;
+    the record carries it as Scryfall does, an int, so mtga-import can resolve a
+    Player.log card id. A printing Arena doesn't have carries None."""
+    on_arena = {
+        **_sunfall(),
+        "identifiers": {**_sunfall()["identifiers"], "mtgArenaId": "84516"},
+    }
+    assert adapter.translate_card([on_arena])["arena_id"] == 84516
+    assert adapter.translate_card([_sunfall()])["arena_id"] is None

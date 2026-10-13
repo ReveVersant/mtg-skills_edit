@@ -8,28 +8,15 @@ from fastapi.testclient import TestClient
 
 from mtg_utils._deck_forge.app import build_app
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
-
-
-def _basic(name, color, subtype):
-    return {
-        "name": name,
-        "type_line": f"Basic Land — {subtype}",
-        "cmc": 0.0,
-        "mana_cost": "",
-        "color_identity": [],
-        "produced_mana": [color],
-        "oracle_text": f"({{T}}: Add {{{color}}}.)",
-        "keywords": [],
-    }
-
+from mtg_utils.testkit import test_card
 
 BASICS = {
-    "Plains": _basic("Plains", "W", "Plains"),
-    "Island": _basic("Island", "U", "Island"),
-    "Swamp": _basic("Swamp", "B", "Swamp"),
-    "Mountain": _basic("Mountain", "R", "Mountain"),
-    "Forest": _basic("Forest", "G", "Forest"),
-    "Wastes": _basic("Wastes", "C", "Wastes"),
+    "Plains": test_card("Plains"),
+    "Island": test_card("Island"),
+    "Swamp": test_card("Swamp"),
+    "Mountain": test_card("Mountain"),
+    "Forest": test_card("Forest"),
+    "Wastes": test_card("Wastes"),
 }
 CMD = {
     "name": "WU Captain",
@@ -68,11 +55,12 @@ def test_trim_brings_a_flooded_deck_back_to_recommended():
     client = _client(plains=50)  # way over the flood line
     before = client.get("/api/snapshot").json()["mana"]
     assert before["land_count"] == 50
-    assert before["land_count"] > before["recommended_land_count"] + 2  # FLOOD
+    assert before["land_count"] > before["land_band"]["flood"]
+    assert before["land_band"]["status"] == "FLOOD"
 
     snap = client.post("/api/deck/trim-lands").json()
     mana = snap["mana"]
-    assert mana["land_count"] == mana["recommended_land_count"]  # trimmed to target
+    assert mana["land_count"] == mana["land_band"]["top"]  # trimmed to the target
 
 
 def test_trim_removes_over_produced_basics_first():

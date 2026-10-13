@@ -1,15 +1,31 @@
 """Tests for transparent multi-axis candidate ranking (D6)."""
 
-from mtg_utils._deck_forge.ranking import (
+import pytest
+
+from mtg_utils._analysis import ranking
+from mtg_utils._analysis.ranking import (
     _ability_is_payoff,
     _clause_role,
-    _clause_role_regex,
     rank_candidates,
     score_candidate,
 )
-from mtg_utils._deck_forge.signals import Signal
+from mtg_utils._analysis.signals import Signal
 from mtg_utils.card_ir import Ability, Card, Effect, Face, Filter, Trigger
-from mtg_utils.testkit import test_card_ir
+from mtg_utils.testkit import test_card, test_card_ir
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_card_ir(monkeypatch):
+    """The ranking joins a candidate's Card IR by ``oracle_id`` through the compat
+    sidecar (``ir_for``), which CI doesn't have. Resolve it from the snapshot
+    instead — the same compat ``Card`` production builds (``test_card_ir``) — so a
+    real card ranks on its real IR everywhere; a synthetic record (no
+    ``oracle_id``) still has none."""
+
+    def ir_for(card: dict):
+        return test_card_ir(card["name"]) if card.get("oracle_id") else None
+
+    monkeypatch.setattr(ranking, "ir_for", ir_for)
 
 
 # ── Depth-over-breadth synergy (synergy_score) ───────────────────────────────
@@ -45,60 +61,12 @@ _ARI_FOCUS = {
     "stranded": {"Edicts / forced sacrifice", "Token doubling"},
 }
 
-# Real card props (full oracle text — fixtures must embed real cards).
-_BASTION = {
-    "name": "Bastion of Remembrance",
-    "type_line": "Enchantment",
-    "cmc": 3.0,
-    "oracle_text": (
-        "When this enchantment enters, create a 1/1 white Human Soldier "
-        "creature token.\nWhenever a creature you control dies, each opponent "
-        "loses 1 life and you gain 1 life."
-    ),
-    "prices": {"usd": "1.50"},
-}
-_BLOOD_ARTIST = {
-    "name": "Blood Artist",
-    "type_line": "Creature — Vampire",
-    "cmc": 2.0,
-    "oracle_text": (
-        "Whenever this creature or another creature dies, target player loses "
-        "1 life and you gain 1 life."
-    ),
-    "prices": {"usd": "2.00"},
-}
-_MIDNIGHT_REAPER = {
-    "name": "Midnight Reaper",
-    "type_line": "Creature — Zombie Knight",
-    "cmc": 3.0,
-    "oracle_text": (
-        "Whenever a nontoken creature you control dies, this creature deals 1 "
-        "damage to you and you draw a card."
-    ),
-    "prices": {"usd": "2.00"},
-}
-_ELVEN_BOW = {
-    "name": "Elven Bow",
-    "type_line": "Artifact — Equipment",
-    "cmc": 1.0,
-    "oracle_text": (
-        "When this Equipment enters, you may pay {2}. If you do, create a 1/1 "
-        "green Elf Warrior creature token, then attach this Equipment to it.\n"
-        "Equipped creature gets +1/+2 and has reach.\nEquip {3}"
-    ),
-    "prices": {"usd": "0.20"},
-}
-_FLAYER_HUSK = {
-    "name": "Flayer Husk",
-    "type_line": "Artifact — Equipment",
-    "cmc": 1.0,
-    "oracle_text": (
-        "Living weapon (When this Equipment enters, create a 0/0 black "
-        "Phyrexian Germ creature token, then attach this to it.)\nEquipped "
-        "creature gets +1/+1.\nEquip {2}"
-    ),
-    "prices": {"usd": "0.30"},
-}
+# Real cards by name (ADR-0056); only the per-printing price is overlaid.
+_BASTION = {**test_card("Bastion of Remembrance"), "prices": {"usd": "1.50"}}
+_BLOOD_ARTIST = {**test_card("Blood Artist"), "prices": {"usd": "2.00"}}
+_MIDNIGHT_REAPER = {**test_card("Midnight Reaper"), "prices": {"usd": "2.00"}}
+_ELVEN_BOW = {**test_card("Elven Bow"), "prices": {"usd": "0.20"}}
+_FLAYER_HUSK = {**test_card("Flayer Husk"), "prices": {"usd": "0.30"}}
 
 
 def _score(card: dict) -> float:
@@ -157,29 +125,8 @@ def test_synergy_score_is_deck_relative():
 
 
 # ── Quality frontier: activated payoffs + unmet tribal gates ─────────────────
-_WALKING_BALLISTA = {
-    "name": "Walking Ballista",
-    "type_line": "Artifact Creature — Construct",
-    "cmc": 0.0,
-    "oracle_text": (
-        "This creature enters with X +1/+1 counters on it.\n{4}: Put a +1/+1 "
-        "counter on this creature.\nRemove a +1/+1 counter from this creature: "
-        "It deals 1 damage to any target."
-    ),
-    "prices": {"usd": "7.50"},
-}
-_HIRED_CLAW = {
-    "name": "Hired Claw",
-    "type_line": "Creature — Lizard Mercenary",
-    "cmc": 1.0,
-    "oracle_text": (
-        "Whenever you attack with one or more Lizards, this creature deals 1 "
-        "damage to target opponent.\n{1}{R}: Put a +1/+1 counter on this "
-        "creature. Activate only if an opponent lost life this turn and only "
-        "once each turn."
-    ),
-    "prices": {"usd": "0.70"},
-}
+_WALKING_BALLISTA = {**test_card("Walking Ballista"), "prices": {"usd": "7.50"}}
+_HIRED_CLAW = {**test_card("Hired Claw"), "prices": {"usd": "0.70"}}
 _BURN_SIGNALS = [
     _sig("direct_damage", "you"),
     _sig("attack_matters", "you"),
@@ -288,48 +235,10 @@ _KRENKO_FOCUS = {
 # Real cards (full oracle text). Siege-Gang Lieutenant: ONE payoff clause
 # serving seven lanes (sac-outlet pinger tribal piece) + a wide token clause.
 # Fires of Mount Doom: four stacked narrow payoff clauses (the text wall).
-_SIEGE_GANG_LT = {
-    "name": "Siege-Gang Lieutenant",
-    "type_line": "Creature — Goblin",
-    "cmc": 4.0,
-    "oracle_text": (
-        "Lieutenant — At the beginning of combat on your turn, if you control "
-        "your commander, create two 1/1 red Goblin creature tokens. Those "
-        "tokens gain haste until end of turn.\n{2}, Sacrifice a Goblin: This "
-        "creature deals 1 damage to any target."
-    ),
-    "prices": {"usd": "2.88"},
-}
-_FIRES_OF_MOUNT_DOOM = {
-    "name": "Fires of Mount Doom",
-    "type_line": "Legendary Enchantment",
-    "cmc": 3.0,
-    "oracle_text": (
-        "When Fires of Mount Doom enters, it deals 2 damage to target creature "
-        "an opponent controls. Destroy all Equipment attached to that "
-        "creature.\n{2}{R}: Exile the top card of your library. You may play "
-        "that card this turn. When you play a card this way, Fires of Mount "
-        "Doom deals 2 damage to each player."
-    ),
-    "prices": {"usd": "1.88"},
-}
-_EMPTY_THE_WARRENS = {
-    "name": "Empty the Warrens",
-    "type_line": "Sorcery",
-    "cmc": 4.0,
-    "oracle_text": (
-        "Create two 1/1 red Goblin creature tokens.\nStorm (When you cast "
-        "this spell, copy it for each spell cast before it this turn.)"
-    ),
-    "prices": {"usd": "0.19"},
-}
-_ASHNODS_ALTAR = {
-    "name": "Ashnod's Altar",
-    "type_line": "Artifact",
-    "cmc": 3.0,
-    "oracle_text": "Sacrifice a creature: Add {C}{C}.",
-    "prices": {"usd": "14.38"},
-}
+_SIEGE_GANG_LT = {**test_card("Siege-Gang Lieutenant"), "prices": {"usd": "2.88"}}
+_FIRES_OF_MOUNT_DOOM = {**test_card("Fires of Mount Doom"), "prices": {"usd": "1.88"}}
+_EMPTY_THE_WARRENS = {**test_card("Empty the Warrens"), "prices": {"usd": "0.19"}}
+_ASHNODS_ALTAR = {**test_card("Ashnod's Altar"), "prices": {"usd": "14.38"}}
 
 
 def _krenko_sc(card: dict) -> dict:
@@ -453,20 +362,8 @@ def test_avenue_card_type_constraint_excludes_wrong_types():
             "search": {"card_type": "Land", "oracle": "becomes a .*creature"},
         }
     ]
-    manland = {
-        "name": "Mishra's Factory",
-        "type_line": "Land",
-        "cmc": 0.0,
-        "oracle_text": "{T}: Add {C}.\n{1}: This land becomes a 2/2 Assembly-Worker artifact creature until end of turn. It's still a land.\n{T}: Target Assembly-Worker creature gets +1/+1 until end of turn.",
-        "prices": {"usd": "1"},
-    }
-    clone = {
-        "name": "Silent Hallcreeper",
-        "type_line": "Enchantment Creature — Horror",
-        "cmc": 5.0,
-        "oracle_text": "This creature can't be blocked.\nWhenever this creature deals combat damage to a player, choose one that hasn't been chosen —\n• Put two +1/+1 counters on this creature.\n• Draw a card.\n• This creature becomes a copy of another target creature you control.",
-        "prices": {"usd": "1"},
-    }
+    manland = {**test_card("Mishra's Factory"), "prices": {"usd": "1"}}
+    clone = {**test_card("Silent Hallcreeper"), "prices": {"usd": "1"}}
     assert (
         "Creature-lands"
         in score_candidate(manland, active_signals=[], avenues=avenues)["served"]
@@ -542,12 +439,10 @@ def test_partner_widening_synergy_breaks_ties_within_a_widening_tier():
 
 
 # ── Card IR role clustering (ADR-0027, A3) ───────────────────────────────────
-# The synthetic dict fixtures above carry no oracle_id, so they exercise the
-# regex fallback (``ir is None``). These tests exercise the IR path by injecting a
-# constructed ``Card`` IR via ``_ir_resolved`` — the same join ``rank_candidates``
-# does by oracle_id at runtime. They assert the structured classifier mirrors the
-# regex tiers where both agree, and is strictly MORE accurate where the regex
-# over-/under-fires (the ADR's "adjudicated correctness, not regex parity").
+# These tests drive the classifier directly with constructed abilities, or inject
+# a ``Card`` IR through the module's snapshot IR join — the same join ``rank_candidates`` does by
+# oracle_id at runtime. A card with no IR (the synthetic fixtures above) scores
+# every clause as an enabler.
 
 
 def _ir(*abilities: Ability) -> Card:
@@ -646,9 +541,8 @@ def test_ir_static_team_anthem_is_a_payoff_across_ability_kinds():
     assert _ability_is_payoff(equip_buff) is False
 
 
-def test_ir_clause_role_credits_tribal_anthem_the_regex_misses():
-    # "Sliver creatures you control have vigilance" — a real typed anthem the
-    # regex (_STATIC_PAYOFF_RE, which needs "creatures you control get/…") misses.
+def test_ir_clause_role_credits_tribal_anthem():
+    # "Sliver creatures you control have vigilance" — a typed anthem is a payoff.
     clause = "Sliver creatures you control have vigilance."
     sliver_anthem = _ir(
         Ability(
@@ -664,27 +558,43 @@ def test_ir_clause_role_credits_tribal_anthem_the_regex_misses():
         )
     )
     payoff_raws = ["sliver creatures you control have vigilance"]
-    assert _clause_role_regex(clause) == "enabler"  # regex under-fires
     assert _clause_role(clause, sliver_anthem, payoff_raws) == "payoff"
+
+
+def test_a_card_with_no_ir_scores_every_clause_as_an_enabler():
+    # No IR (a card newer than the phase pin, a synthetic record): the signal path
+    # never guesses from text, so even a drain trigger is an enabler and no tribal
+    # gate applies.
+    clause = "Whenever you attack with one or more Lizards, each opponent loses 1 life."
+    assert _clause_role(clause, None, []) == "enabler"
+    card = {
+        "name": "Test Lizard Drainer",
+        "type_line": "Creature — Lizard",
+        "cmc": 2.0,
+        "oracle_text": clause,
+        "prices": {"usd": "0.30"},
+    }
+    sigs = [_sig("lifeloss_matters", "opponents"), _sig("attack_matters", "you")]
+    sc = score_candidate(card, active_signals=sigs, deck_tribes=frozenset({"human"}))
+    assert sc["clusters"]
+    assert {c["role"] for c in sc["clusters"]} <= {"enabler", "structural"}
 
 
 def test_ir_path_does_not_scramble_ranked_order():
     # The injected IR path must keep the aristocrats order the regex path produces
     # (payoffs above box-tickers) — equivalent-or-better, never scrambled. Both IRs
     # are the REAL projected Card IR (Bastion: etb make_token + dies drain payoff;
-    # Elven Bow: etb make_token + equip pump enabler), injected via _ir_resolved
-    # exactly as rank_candidates joins by oracle_id at runtime.
+    # Elven Bow: etb make_token + equip pump enabler), joined by oracle_id exactly
+    # as rank_candidates joins at runtime (the module's snapshot IR join).
     bastion = score_candidate(
         _BASTION,
         active_signals=_ARI_SIGNALS,
         focus_sets=_ARI_FOCUS,
-        _ir_resolved=(test_card_ir("Bastion of Remembrance"),),
     )["synergy_score"]
     elven_bow = score_candidate(
         _ELVEN_BOW,
         active_signals=_ARI_SIGNALS,
         focus_sets=_ARI_FOCUS,
-        _ir_resolved=(test_card_ir("Elven Bow"),),
     )["synergy_score"]
     # The real death-payoff outscores the incidental token-equipment (the crux),
     # exactly as the regex path does — the IR clusters by structured ability.
@@ -762,16 +672,9 @@ def test_dead_gate_discounts_breadth_too():
         "emerging": set(),
         "stranded": set(),
     }
-    card = {
-        "name": "Lizard Raid Captain",
-        "type_line": "Creature — Lizard",
-        "cmc": 2.0,
-        "oracle_text": (
-            "Whenever you attack with one or more Lizards, this creature "
-            "deals 2 damage to target opponent and that player loses 2 life."
-        ),
-        "prices": {"usd": "0.30"},
-    }
+    # Hired Claw: "Whenever you attack with one or more Lizards, this creature
+    # deals 1 damage to target opponent" — one gated clause serving three lanes.
+    card = _HIRED_CLAW
     with_tribe = score_candidate(
         card, active_signals=sigs, focus_sets=focus, deck_tribes=frozenset({"lizard"})
     )
@@ -829,12 +732,10 @@ def test_structural_serves_form_one_cluster_with_breadth():
 # pin the DISARM — the readout survives, and the sort is invariant to any
 # rate_index.
 def test_rate_rides_the_readout_but_never_the_sort():
-    from mtg_utils._deck_forge.rate import build_rate_index, rate_for
-    from mtg_utils.testkit import snapshot_records, test_card, test_card_ir
+    from mtg_utils._analysis.rate import build_rate_index, rate_for
+    from mtg_utils.testkit import snapshot_records
 
     index = build_rate_index(snapshot_records())
-    test_card_ir("Lightning Bolt")
-    test_card_ir("Fires of Mount Doom")
     bolt, fires = test_card("Lightning Bolt"), test_card("Fires of Mount Doom")
     ranked = rank_candidates(
         [fires, bolt],
@@ -857,12 +758,10 @@ def test_rate_rides_the_readout_but_never_the_sort():
 def test_sort_is_invariant_to_any_rate_index():
     # THE F-B regression assertion: passing any rate_index must never
     # change ranking order relative to no index at all.
-    from mtg_utils._deck_forge.rate import build_rate_index
-    from mtg_utils.testkit import snapshot_records, test_card, test_card_ir
+    from mtg_utils._analysis.rate import build_rate_index
+    from mtg_utils.testkit import snapshot_records
 
     index = build_rate_index(snapshot_records())
-    for name in ("Lightning Bolt", "Fires of Mount Doom", "Guttersnipe"):
-        test_card_ir(name)
     pool = [
         test_card("Lightning Bolt"),
         test_card("Fires of Mount Doom"),
@@ -914,3 +813,43 @@ def test_sort_is_total_and_input_order_independent():
         list(reversed(cards)), active_signals=_ARI_SIGNALS, focus_sets=_ARI_FOCUS
     )
     assert [r["card"]["name"] for r in fwd] == [r["card"]["name"] for r in rev]
+
+
+# ── Meta share tiebreak (ADR-0059) ───────────────────────────────────────────
+# On a digital build with a meta archetype, the share of its ladder lists running a
+# card breaks synergy ties — after synergy, before price. Without one the order is
+# exactly synergy, price, curve, name.
+_META_SHARES = {"Rare Token Maker": 0.6, "Token Maker": 0.1}
+
+
+def test_meta_share_breaks_synergy_ties_before_price():
+    ranked = rank_candidates(
+        [TOKEN_MAKER, DUAL_PURPOSE, NO_LISTING],
+        active_signals=[ETB, LIFE],
+        rank_by="fit",
+        meta_share=lambda name: _META_SHARES.get(name, 0.0),
+    )
+    # Synergy still leads (fit 2, in no list); among the fit-1 pair, the card more
+    # lists run beats the cheaper one — even with no listing.
+    assert [r["card"]["name"] for r in ranked] == [
+        "Lifegain Tokens",
+        "Rare Token Maker",
+        "Token Maker",
+    ]
+    assert [r["score"]["meta_share"] for r in ranked] == [0.0, 0.6, 0.1]
+
+
+def test_without_a_meta_read_the_ranking_is_unchanged():
+    cards = [TOKEN_MAKER, DUAL_PURPOSE, NO_LISTING]
+    plain = rank_candidates(cards, active_signals=[ETB, LIFE], rank_by="fit")
+    assert [r["card"]["name"] for r in plain] == [
+        "Lifegain Tokens",
+        "Token Maker",
+        "Rare Token Maker",
+    ]
+    assert not any("meta_share" in r["score"] for r in plain)
+    # A meta read in which no list runs any candidate changes nothing but the readout.
+    zero = rank_candidates(
+        cards, active_signals=[ETB, LIFE], rank_by="fit", meta_share=lambda _n: 0.0
+    )
+    assert [r["card"]["name"] for r in zero] == [r["card"]["name"] for r in plain]

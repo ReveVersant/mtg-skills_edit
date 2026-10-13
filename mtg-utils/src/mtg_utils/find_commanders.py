@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import click
 
-from mtg_utils._name_index import NameIndex, build_name_index
+from mtg_utils._name_index import NameIndex
 from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
-from mtg_utils.bulk_loader import load_bulk_cards
 from mtg_utils.card_classify import (
-    SKIP_LAYOUTS,
+    PartnerAbility,
+    can_partner,
     color_identity_subset,
     get_oracle_text,
-    is_commander,
+    partner_abilities,
 )
+from mtg_utils.card_pool import CardPool
 from mtg_utils.deck import collect_card_entries
-from mtg_utils.format_config import FORMAT_CONFIGS
+from mtg_utils.formats import FORMATS, get_format
 
 CARD_FIELDS = (
     "name",
@@ -31,43 +31,44 @@ CARD_FIELDS = (
 )
 
 
-# Anchor "Partner with" to start-of-string or after newline so flavor text or
-# embedded "partner with" inside other rules text can't match. Capture stops at
-# end-of-line or reminder text in parens.
+#: The partner abilities ``is_partner`` reports (CR 702.124h-j, 702.124m): partner,
+#: partner—[text], partner with [name], Doctor's companion (which pairs with a Time
+#: Lord Doctor). Choose a Background (702.124k) is reported on its own.
+_PAIRING_KINDS = frozenset({"plain", "group", "with", "doctors_companion"})
 
 
-_PARTNER_WITH_RE = re.compile(r"(?:^|\n)Partner with ([^\n(]+?)\s*(?=\(|\n|$)")
+def _partner_fields(abilities: frozenset[PartnerAbility]) -> dict:
+    """The candidate's pairing fields from ``card_classify.partner_abilities`` —
+    the pairing kinds: its partner abilities (CR 702.124a: partner, partner—[text],
+    partner with [name], choose a Background, Doctor's companion; read off the
+    trees' ``Partner`` keywords, legendary-gated) plus the type-line kinds a partner
+    ability pairs with (a Background, a Time Lord Doctor — 702.124k, 702.124m),
+    which aren't partner abilities themselves. ``partner_kinds`` lists them as
+    ``{"kind", "value"}`` (``group`` carries its partner—[text], ``with`` its named
+    partner); ``is_partner``, ``partner_with`` (702.124j) and
+    ``has_background_clause`` (702.124k) derive from them."""
+    ordered = sorted(abilities)
+    kinds = {a.kind for a in ordered}
+    return {
+        "partner_kinds": [{"kind": a.kind, "value": a.value} for a in ordered],
+        "is_partner": bool(kinds & _PAIRING_KINDS),
+        "partner_with": next((a.value for a in ordered if a.kind == "with"), None),
+        "has_background_clause": "choose_background" in kinds,
+    }
 
 
-def _is_partner(oracle: str) -> bool:
-    """Check whether oracle text grants a partner-style pairing ability.
-
-    Matches "Partner" (standalone keyword), "Partner with" (named pair),
-    "Friends forever", and "Doctor's companion". Excludes "Choose a Background"
-    which is reported separately via has_background_clause.
-    """
-    lowered = oracle.lower()
-    if "friends forever" in lowered or "doctor's companion" in lowered:
-        return True
-    # "Partner" appears in many flavor strings; require it as a standalone
-    # keyword (start of line or after a newline, followed by end-of-line,
-    # comma, period, or " with").
-    return bool(re.search(r"(?:^|\n)Partner(?:\s+with\b|[\s.,\n]|$)", oracle))
-
-
-def _partner_with_target(oracle: str) -> str | None:
-    """Extract the named partner from "Partner with X" oracle text."""
-    match = _PARTNER_WITH_RE.search(oracle)
-    if not match:
-        return None
-    # A partner name never ends in a period; drop a trailing one (DFC faces are
-    # sentence-terminated when folded, so a face ending "...Partner with X" gains a
-    # period that must not become part of the captured name).
-    return match.group(1).strip().removesuffix(".").strip() or None
-
-
-def _has_background_clause(oracle: str) -> bool:
-    return "choose a background" in oracle.lower()
+def _pairings(rows: list[tuple[dict, frozenset[PartnerAbility], dict]]) -> None:
+    """Fill each candidate's ``pairs_with`` (rows are ``(candidate, its pairing
+    kinds, its card)``): the other candidates it can share the command zone with
+    (``card_classify.can_partner`` — one kind of each card must match, CR 702.124f:
+    different partner abilities can't be combined, so a Survivors card pairs only
+    with Survivors, a plain partner only with partner)."""
+    for cand, mine, _card in rows:
+        cand["pairs_with"] = [
+            other["name"]
+            for other, _kinds, card in rows
+            if mine and other is not cand and can_partner(mine, card)
+        ]
 
 
 def _build_owned_index(parsed_deck: dict, min_quantity: int) -> dict[str, int]:
@@ -90,33 +91,13 @@ def _build_owned_index(parsed_deck: dict, min_quantity: int) -> dict[str, int]:
     return {key: qty for key, (_name, qty) in entries.items()}
 
 
-def _load_bulk_index(bulk_path: Path) -> NameIndex:
-    """Build a folding name -> card index from Scryfall bulk data.
-
-    Keyed by canonical name, every face (card_faces[], handling MDFC / transform / flip
-    / adventure / meld), and Arena printed_name / flavor_name aliases — all NFKD-folded
-    via the shared name-index core, so a collection listing a front face ("Bruna, the
-    Fading Light"), an Arena display name, or ASCII spelling still matches. First-seen
-    wins among printings (bulk lists the canonical printing first and find-commanders
-    surfaces no prices). Tokens / memorabilia / non-game layouts are skipped. Preserves
-    the full Scryfall record (find-commanders needs edhrec_rank and other fields).
-    """
-    return build_name_index(
-        load_bulk_cards(bulk_path),
-        prefilter=lambda card: (
-            card.get("layout") not in SKIP_LAYOUTS
-            and card.get("set_type") not in ("token", "memorabilia")
-        ),
-    )
-
-
-def _build_candidate(card: dict, owned_quantity: int) -> dict:
+def _build_candidate(
+    card: dict, owned_quantity: int, abilities: frozenset[PartnerAbility]
+) -> dict:
     oracle = get_oracle_text(card)
     result = {field: card.get(field) for field in CARD_FIELDS}
     result["oracle_text"] = oracle or None
-    result["is_partner"] = _is_partner(oracle)
-    result["partner_with"] = _partner_with_target(oracle)
-    result["has_background_clause"] = _has_background_clause(oracle)
+    result.update(_partner_fields(abilities))
     result["owned_quantity"] = owned_quantity
     # game_changer collapses to bool because the agent only cares about
     # presence; edhrec_rank deliberately stays None when missing so the
@@ -137,37 +118,32 @@ def find_commanders(
 
     Filters by:
       - owned quantity >= min_quantity
-      - format legality (FORMAT_CONFIGS[format]["legality_key"])
-      - commander eligibility (card_classify.is_commander)
+      - format legality + commander eligibility (``Format.commander_eligibility``)
       - optional color-identity subset
     """
-    if format not in FORMAT_CONFIGS:
-        msg = f"Unknown format: {format!r}. Valid: {', '.join(FORMAT_CONFIGS)}"
-        raise ValueError(msg)
-    legality_key = FORMAT_CONFIGS[format]["legality_key"]
+    fmt = get_format(format)
     allowed_colors = set(color_identity.upper()) if color_identity else None
 
     owned = _build_owned_index(parsed_deck, min_quantity)
 
-    candidates: list[dict] = []
+    rows: list[tuple[dict, frozenset[PartnerAbility], dict]] = []
     for name_key, qty in owned.items():
         card = bulk_index.get(name_key)
         if card is None:
             continue
-        legalities = card.get("legalities") or {}
-        if legalities.get(legality_key) not in ("legal", "restricted"):
-            continue
-        if not is_commander(card, format=format)["eligible"]:
+        if not fmt.commander_eligibility(card)["eligible"]:
             continue
         if allowed_colors is not None and not color_identity_subset(
             card.get("color_identity") or [],
             allowed_colors,
         ):
             continue
-        candidates.append(_build_candidate(card, qty))
+        abilities = partner_abilities(card)
+        rows.append((_build_candidate(card, qty, abilities), abilities, card))
 
-    candidates.sort(key=lambda c: c["name"])
-    return candidates
+    rows.sort(key=lambda row: row[0]["name"])
+    _pairings(rows)
+    return [cand for cand, _abilities, _card in rows]
 
 
 def _default_output_path(
@@ -200,7 +176,8 @@ def _render_text_table(candidates: list[dict], *, format: str) -> str:  # noqa: 
 
     Column set is chosen for decision-making: EDHREC rank, color identity, CMC,
     name, truncated type_line, and a flags column that surfaces PARTNER /
-    BACKGROUND / GC (game_changer) signals in a single glance.
+    BACKGROUND / GC (game_changer) signals in a single glance. An "Owned pairings"
+    list follows when two candidates can be commanders together (``pairs_with``).
     """
     if not candidates:
         return f"find-commanders: 0 candidates (format={format})\n"
@@ -234,6 +211,18 @@ def _render_text_table(candidates: list[dict], *, format: str) -> str:  # noqa: 
             f"  {rank_str}  {ci:<5} {cmc_str}  {name:<36}  {type_line:<36}  {flag_str}",
         )
 
+    pairs = sorted(
+        {
+            tuple(sorted((c["name"], other)))
+            for c in candidates
+            for other in c.get("pairs_with") or ()
+        }
+    )
+    if pairs:
+        lines.append("")
+        lines.append(f"Owned pairings ({len(pairs)}):")
+        lines.extend(f"  {a} + {b}" for a, b in pairs)
+
     return "\n".join(lines) + "\n"
 
 
@@ -251,7 +240,7 @@ def _render_text_table(candidates: list[dict], *, format: str) -> str:  # noqa: 
 @click.option(
     "--format",
     "fmt",
-    type=click.Choice(sorted(FORMAT_CONFIGS)),
+    type=click.Choice(sorted(FORMATS)),
     default="commander",
     help="Target format (default: commander).",
 )
@@ -286,7 +275,7 @@ def main(
     """Find commander-eligible cards in a parsed deck/collection JSON."""
     parsed_deck_content = parsed_deck_path.read_text(encoding="utf-8")
     parsed_deck = json.loads(parsed_deck_content)
-    bulk_index = _load_bulk_index(bulk_data)
+    bulk_index = CardPool.load(bulk_data).by_name
     candidates = find_commanders(
         parsed_deck,
         bulk_index,

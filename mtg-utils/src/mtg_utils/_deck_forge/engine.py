@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import functools
 import json
-import math
+import time
+import uuid
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from mtg_utils import mark_owned, price_check, theme_presets
-from mtg_utils._deck_forge import collection, staples, views
-from mtg_utils._deck_forge.budgets import role_of, slot_budgets
-from mtg_utils._deck_forge.ranking import rank_candidates
-from mtg_utils._deck_forge.signal_specs import (
+from mtg_utils import card_search, mark_owned, ownership
+from mtg_utils._analysis import staples
+from mtg_utils._analysis.budgets import banded_slot_budgets, template_for
+from mtg_utils._analysis.ranking import rank_candidates
+from mtg_utils._analysis.roles import role_of
+from mtg_utils._analysis.signal_specs import (
     Serve,
     payoff_search,
     payoff_serve,
@@ -31,27 +34,50 @@ from mtg_utils._deck_forge.signal_specs import (
     source_split,
     spec_for,
 )
-from mtg_utils._deck_forge.signals import (
+from mtg_utils._analysis.signals import (
     Signal,
     extract_signals,
     rank_deck_signals,
 )
+from mtg_utils._arena_meta import meta as arena_meta
+from mtg_utils._arena_meta import untapped
+from mtg_utils._arena_meta.report import build_report, wildcard_cost_fn
+from mtg_utils._deck_forge import collection, views
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils._gauntlet_build import build_gauntlet_deck
 from mtg_utils._name_index import NameIndex
-from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
-from mtg_utils.card_classify import is_basic_land, is_commander, valid_partner_search
+from mtg_utils._tuner.tune import TuneParams
+from mtg_utils.card_classify import (
+    classifying_type_line,
+    get_colors,
+    is_basic_land,
+    is_land,
+    valid_partner_search,
+)
+from mtg_utils.card_pool import CardPool, printing_of
+from mtg_utils.companion import is_companion
+from mtg_utils.deck import deck_entries
 from mtg_utils.deck_stats import deck_stats, detect_bracket
-from mtg_utils.format_config import COMMANDER_FORMATS, FORMAT_CONFIGS
-from mtg_utils.hydrated_deck import HydratedDeck
-from mtg_utils.legality_audit import legality_audit
-from mtg_utils.mana_audit import mana_audit
-from mtg_utils.scryfall_lookup import build_rarity_index
+from mtg_utils.formats import (
+    FOIL_FINISHES,
+    FORMATS,
+    Coverage,
+    Format,
+    family_size_choices,
+    format_options,
+)
+from mtg_utils.hydrated_deck import ZONES, HydratedDeck
+from mtg_utils.legality_audit import card_copy_limit, legality_audit
+from mtg_utils.mana_audit import (
+    limited_land_target,
+    mana_audit,
+    reconcile_basic_lands,
+)
+from mtg_utils.mtga_import import read_arena_wildcards
+from mtg_utils.names import normalize_card_name
+from mtg_utils.parse_deck import parse_deck_text
+from mtg_utils.set_scan import pool_color_pairs, set_scan
 
-# Deck size per Commander-family format, from the configs (commander 100 / brawl 60 /
-# historic_brawl 100 / competitive_brawl 100).
-_DECK_SIZE = {f: int(FORMAT_CONFIGS[f]["deck_size"]) for f in COMMANDER_FORMATS}
-SUPPORTED_FORMATS = frozenset(_DECK_SIZE)
-_PAPER_FORMATS = {"commander"}
 # deck_minimum is intentionally excluded: a deck-in-progress is always below the size
 # minimum, so it's the normal building state, not a warning.
 _AUDIT_CATEGORIES = (
@@ -60,6 +86,7 @@ _AUDIT_CATEGORIES = (
     "color_identity",
     "copy_limits",
     "sideboard_size",
+    "pool_containment",
 )
 # Low-land defensibility heuristic (D8): a low avg CMC backed by cheap card advantage.
 _DEFENSIBLE_AVG_CMC = 2.3
@@ -76,6 +103,7 @@ _EXPLORE_KEYS = (
     "cmc_max",
     "price_min",
     "price_max",
+    "partner_of",
 )
 # The ranked-candidate pool the Find surface ranks over; the route windows the caller's
 # page size into it, so this bounds how deep "Show more" can page on one request.
@@ -105,14 +133,6 @@ def hydrate_session(state: ForgeState) -> HydratedDeck:
     return HydratedDeck.from_session(state.session, state.by_name)
 
 
-def deck_size(fmt: str) -> int:
-    return _DECK_SIZE.get(fmt, 100)
-
-
-def paper_only(fmt: str | None) -> bool:
-    return fmt in _PAPER_FORMATS
-
-
 def deck_color_identity(state: ForgeState) -> str:
     """Union of the commanders' color identities (the deck's color identity)."""
     colors: set[str] = set()
@@ -123,6 +143,61 @@ def deck_color_identity(state: ForgeState) -> str:
     return "".join(sorted(colors))
 
 
+def deck_colors(state: ForgeState) -> str:
+    """The colors a candidate search is scoped to, by family: the commanders' color
+    identity where there is a command zone (CR 903.4 — the rule), else the castable
+    colors of the nonland cards the build already runs (a description, so the Find
+    pips stay unlocked — a splash is the builder's call, not a rule)."""
+    if state.session.fmt.has_commander:
+        return deck_color_identity(state)
+    colors: set[str] = set()
+    deck = state.session.to_deck_dict()
+    for zone in built_zones(state):
+        for entry in deck.get(zone) or []:
+            record = state.by_name.get(entry["name"])
+            if record and _casts(record):
+                colors.update(get_colors(record))
+    return "".join(sorted(colors))
+
+
+def built_zones(state: ForgeState) -> tuple[str, ...]:
+    """The zones a build's own cards live in — the main deck plus a STORED sideboard.
+    A pool-bounded build's sideboard is the unused pool, which is not something the
+    builder chose to run, so there it is the main deck alone. The one answer for
+    every read of "the cards this deck runs" that is not the counted deck
+    (``HydratedDeck.deck_records``): colours, ownership, combos, finalize evidence."""
+    return ("cards",) if state.session.pool_bounded else ("cards", "sideboard")
+
+
+def deck_names(state: ForgeState) -> set[str]:
+    """Every distinct name the build runs: commanders, the built zones, the companion
+    — never an opened pool."""
+    names: set[str] = set()
+    for zone in ("commanders", *built_zones(state), "companion"):
+        names.update(state.session.quantities(zone))
+    return names
+
+
+def _casts(record: dict) -> bool:
+    """Whether a card is something the deck CASTS (its colours are the deck's): any
+    nonland, and a modal DFC with a spell face (a Sorcery // Land is cast for its
+    front; a Land // Land is not). A transform card is judged by its front."""
+    if not is_land(record):
+        return True
+    faces = record.get("card_faces") or []
+    if record.get("layout") == "modal_dfc" and faces:
+        return any("Land" not in (f.get("type_line") or "") for f in faces)
+    return "Land" not in classifying_type_line(record)
+
+
+def check_commander_family(state: ForgeState) -> None:
+    """The family rule for a Commander-only surface (commander discovery): the
+    build's format has a command zone."""
+    fmt = state.session.fmt
+    if not fmt.has_commander:
+        raise DeckRuleError(f"{fmt.label} has no command zone")
+
+
 def is_paper(state: ForgeState) -> bool:
     """Whether this build is paper (vs digital/Arena). Drives the Collection slot and
     the cost mode (USD vs wildcards). Commander is always paper; Brawl / Historic Brawl
@@ -131,10 +206,8 @@ def is_paper(state: ForgeState) -> bool:
 
 
 def active_slot(state: ForgeState) -> str:
-    """The Collection slot read for this build: ``paper`` for a paper build, ``arena``
-    for a digital one. Keyed off medium, not format — so a paper Historic Brawl reads
-    the paper slot. Reads are strictly single-slot."""
-    return "paper" if is_paper(state) else "arena"
+    """The Collection slot read for this build (``ForgeState.active_slot``)."""
+    return state.active_slot
 
 
 def _is_basic(record: dict | None) -> bool:
@@ -143,17 +216,18 @@ def _is_basic(record: dict | None) -> bool:
 
 def owned_quantities(state: ForgeState) -> dict[str, int]:
     """Owned-copy map (deck card name → count) against the ACTIVE Collection slot only —
-    empty when that slot holds no imported Collection. Basic lands are excluded: owning
-    basics is assumed, so they never read as an un-owned 'miss' nor clutter the
-    readout. DERIVED fresh each call from the cached per-slot lookup; never stored."""
+    empty when that slot holds no imported Collection. The names are the deck's
+    (:func:`deck_names`: never an opened pool, whose cards are owned by definition).
+    Every card is read, basic lands included: whether a basic counts as owned is
+    ``Format.coverage``'s call (the six basic land types are free; Snow-Covered basics
+    are collected like any card). DERIVED fresh each call from the cached per-slot
+    lookup; never stored."""
     idx = state.collection_index.get(active_slot(state))
     if not idx:
         return {}
     entries, lookup = idx
     out: dict[str, int] = {}
-    for name in state.session.card_names():
-        if _is_basic(state.by_name.get(name)):
-            continue
+    for name in sorted(deck_names(state)):
         qty = mark_owned.owned_quantity(name, entries, lookup)
         if qty is not None:
             out[name] = qty
@@ -161,24 +235,21 @@ def owned_quantities(state: ForgeState) -> dict[str, int]:
 
 
 def owned_collection(state: ForgeState) -> dict[str, int]:
-    """EVERY owned card in the active Collection slot (name -> copies), basics excluded.
+    """EVERY owned card in the active Collection slot (name -> copies).
 
     Distinct from :func:`owned_quantities`, which is deck-scoped (the "X of Y owned"
     readout). The tuner judges *candidate* adds — cards NOT yet in the deck — so a
     deck-scoped map makes every candidate read as un-owned: at a zero wildcard budget
     nothing would be affordable (no owned-card fills), and owned-but-not-in-deck cards
     would wrongly burn budget. This whole-slot map lets the tuner treat any owned
-    candidate as free. Keyed by the collection's own names (canonical for Untapped/Arena
-    and Moxfield exports), which match the canonical names ``card_search`` returns."""
+    candidate as free (``Format.coverage`` decides basics). Keyed by the collection's
+    own names (canonical for Untapped/Arena and Moxfield exports), which match the
+    canonical names ``card_search`` returns."""
     idx = state.collection_index.get(active_slot(state))
     if not idx:
         return {}
     entries, _lookup = idx
-    return {
-        name: qty
-        for name, qty in entries.values()
-        if qty >= 1 and not _is_basic(state.by_name.get(name))
-    }
+    return {name: qty for name, qty in entries.values() if qty >= 1}
 
 
 def owned_of(state: ForgeState, name: str) -> int | None:
@@ -192,6 +263,42 @@ def owned_of(state: ForgeState, name: str) -> int | None:
     return mark_owned.owned_quantity(name, entries, lookup)
 
 
+def coverage(state: ForgeState, owned: Mapping[str, int], entry: Mapping) -> Coverage:
+    """How far the active Collection slot covers a deck entry (``{name, quantity}``,
+    plus its ``printing_id`` / ``finish`` pins), given ``owned`` (name → owned copies,
+    :func:`owned_quantities`): ``Format.coverage`` for the build's medium, served per
+    row so every readout — the footer total, the per-group subtotals, each row's label,
+    the owned tick, the "N of M owned" count, the Owned-only facet — reads it and the
+    browser derives nothing. In paper a pinned printing or finish is the entry's
+    printing request (only a special basic printing counts,
+    ``ownership.requested_printing_owned``). An opened pool is owned outright."""
+    if state.session.pool_bounded:
+        return Coverage(0, "owned")
+    name = entry["name"]
+    requested = None
+    printing_id = entry.get("printing_id")
+    if is_paper(state) and (printing_id or entry.get("finish")):
+        record = state.printing_by_id.get(printing_id) if printing_id else None
+        requested = ownership.requested_printing_owned(
+            name, entry, record, owned_printing_detail(state, name)
+        )
+    return Format.coverage(
+        state.session.medium,
+        name,
+        entry["quantity"],
+        owned.get(name, 0),
+        requested_owned=requested,
+    )
+
+
+def candidate_coverage(state: ForgeState, name: str) -> Coverage:
+    """How far the active Collection slot covers adding one copy of ``name`` — for a
+    card shown outside the deck (a Find result, a combo piece) — by :func:`coverage`."""
+    return coverage(
+        state, {name: owned_of(state, name) or 0}, {"name": name, "quantity": 1}
+    )
+
+
 def set_collection(state: ForgeState, slot: str, pile: dict) -> None:
     """Load a parsed Collection ``pile`` into ``slot``: cache its precomputed ownership
     lookup (so snapshots stay O(deck size)) and persist. The single mutation point for a
@@ -203,8 +310,7 @@ def set_collection(state: ForgeState, slot: str, pile: dict) -> None:
     )
     # Per-printing detail (set/collector/foil), for entries that carry it — sparse,
     # so a plain name-only pile yields an empty index (tri-state: printing unknown).
-    state.collection_printings[slot] = collection.printing_index(pile)
-    state.lane_collection_serves.pop(slot, None)  # stale: the slot's cards changed
+    state.collection_printings[slot] = ownership.printing_index(pile)
     if state.collection_store is not None:
         state.collection_store.save(state.collections)
 
@@ -214,7 +320,6 @@ def clear_collection(state: ForgeState, slot: str) -> None:
     state.collections.pop(slot, None)
     state.collection_index.pop(slot, None)
     state.collection_printings.pop(slot, None)
-    state.lane_collection_serves.pop(slot, None)  # stale: the slot's cards are gone
     if state.collection_store is not None:
         state.collection_store.save(state.collections)
 
@@ -272,562 +377,146 @@ def pin_imported_printings(
     the resolved printing actually offers it. Unresolvable pairs stay unpinned (the
     cheapest default) and invalid finishes are dropped — an import never errors on
     printing detail."""
-    for zone in ("commanders", "cards", "sideboard", "companion"):
+    for zone in ZONES:
         for entry in parsed.get(zone) or []:
             name = entry.get("name")
             set_code = (entry.get("set") or "").lower()
             collector = str(entry.get("collector_number") or "")
             if not (name and set_code and collector):
                 continue
-            record = state.by_name.get(name)
-            oracle_id = record.get("oracle_id") if record else None
-            match = next(
-                (
-                    p
-                    for p in state.printings_by_oracle.get(oracle_id or "", [])
-                    if (p.get("set") or "").lower() == set_code
-                    and str(p.get("collector_number") or "") == collector
-                ),
-                None,
+            match = printing_of(
+                state.by_name, state.printings_by_oracle, name, set_code, collector
             )
             if match is None:
                 continue
             finish = entry.get("finish")
-            if finish not in ("foil", "etched") or finish not in (
+            if finish not in FOIL_FINISHES or finish not in (
                 match.get("finishes") or []
             ):
                 finish = None
             session.set_printing(name, match.get("id"), zone=zone, finish=finish)
 
 
-def collection_summary(state: ForgeState, owned: dict[str, int]) -> dict:
+def collection_summary(state: ForgeState, owned: Mapping[str, int]) -> dict:
     """The Collection readout the SPA renders: which slot is active, each slot's size,
-    and the deck's owned count vs its non-basic distinct total (the 'N of M owned')."""
-    deck_total = sum(
-        1 for n in state.session.card_names() if not _is_basic(state.by_name.get(n))
-    )
+    and the 'N of M owned' count — of the deck's distinct cards that aren't free (a
+    basic land), how many the collection covers (:func:`coverage`). Seventeen Hare
+    Apparent with one owned is not owned."""
+    by_name = {e["name"]: coverage(state, owned, e) for e in _deck_rows(state)}
+    covered, total = ownership.covered_count(by_name.values())
     return {
         "active_slot": active_slot(state),
         "slots": collection.slot_sizes(state.collections),
-        "owned": len(owned),
-        "deck_total": deck_total,
+        "owned": covered,
+        "deck_total": total,
     }
+
+
+def _deck_rows(state: ForgeState) -> list[dict]:
+    """The build's deck entries — commanders, the built zones and the companion, never
+    an opened pool (:func:`deck_names`' zones) — with their printing pins."""
+    zones = ("commanders", *built_zones(state), "companion")
+    return deck_entries(state.session.to_deck_dict(), zones)
 
 
 def _rarity_index(state: ForgeState) -> NameIndex | None:
     """The Arena rarity index for the current format, built once from bulk and
-    cached on the state per FORMAT (``build_rarity_index`` walks all of bulk).
-    Keyed by format rather than legality key because Competitive Brawl shares
-    Historic Brawl's ``brawl`` key but admits the cards that key marks banned."""
+    cached on the state per FORMAT (the pool's own memo shares it across states).
+    Keyed by format rather than legality key: the format's legality read (with its
+    Arena-pool gate), not the key alone, decides which printings count."""
     if state.bulk_path is None:
         return None
     fmt = state.session.format
     cached = state.rarity_index.get(fmt)
     if cached is None:
-        config = FORMAT_CONFIGS.get(fmt, {})
-        cached = build_rarity_index(
-            state.bulk_path,
-            _legality_key(fmt),
-            arena_only=True,
-            ignore_key_bans=config.get("ignores_legality_key_bans", False),
-            banned_cards=config.get("banned_cards"),
-        )
+        pool = CardPool.load(state.bulk_path)
+        cached = pool.rarity_index(FORMATS[fmt], arena_only=True)
         state.rarity_index[fmt] = cached
     return cached
 
 
 def wildcard_cost(state: ForgeState) -> dict | None:
-    """Arena wildcard cost for a DIGITAL build — ``{mythic, rare, uncommon, common}``
-    needed for cards NOT already owned in the active (arena) Collection slot, reusing
-    ``price_check``'s Arena costing (4-cap-exemption aware). ``None`` for paper builds
-    (USD cost) or with no bulk. Basic lands are stripped — Arena never charges wildcards
-    for them."""
+    """Arena wildcard cost for a DIGITAL build — ``{mythic, rare, uncommon, common}``:
+    each deck row's served shortfall (:func:`coverage`), summed by its Arena rarity,
+    so the footer total is exactly the sum of the rows. ``None`` for paper builds
+    (USD cost), an opened pool (owned outright) or with no bulk."""
     if is_paper(state) or state.bulk_path is None:
         return None
+    if state.session.pool_bounded:
+        return None  # an opened pool is owned; nothing is crafted
     rarity_index = _rarity_index(state)
     if not rarity_index:
         return None
-    deck = state.session.to_deck_dict()
-    no_basics = dict(deck)
-    # The companion zone is deliberately absent from this walk (and from
-    # price_check's own deck walk): a companion is outside the game (CR 702.139a),
-    # and the Arena Commander-family formats deck-forge serves have no companion
-    # mechanic, so it never costs wildcards here.
-    for zone in ("commanders", "cards", "sideboard"):
-        if zone in deck:
-            no_basics[zone] = [
-                e
-                for e in (deck.get(zone) or [])
-                if not _is_basic(state.by_name.get(e["name"]))
-            ]
-    owned = owned_quantities(state)  # deck cards owned in the active slot (basics-free)
-    owned_cards = [{"name": n, "quantity": q} for n, q in owned.items()]
-    result = price_check.arena_wildcard_cost(
-        no_basics, rarity_index, owned_cards=owned_cards
-    )
-    return result["wildcard_cost"]
+    owned = owned_quantities(state)
+    totals = {"mythic": 0, "rare": 0, "uncommon": 0, "common": 0}
+    # Every row costs, the companion included: on Arena it is a sideboard card you
+    # must own (a Historic / Timeless build's Yorion is crafted like any other). A card
+    # absent from the Arena rarity index (not on Arena) costs nothing we can price.
+    for entry in _deck_rows(state):
+        listed = rarity_index.get(entry["name"].lower())
+        if listed is not None:
+            rarity = listed["rarity"]
+            short = coverage(state, owned, entry).short
+            totals[rarity] = totals.get(rarity, 0) + short
+    return totals
 
 
 # Commander discovery (ADR-0018). "Best" is intent-driven, never EDHREC popularity:
 # Support depth (how much of a commander's strategy your collection already fills) or
 # Novelty (signal rarity), each over the active Collection slot.
-_DISCOVER_SORTS = ("support", "novelty")
-_SUPPORT_FLOOR = 5  # owned in-identity cards a lane needs to count as supported
+# --- builds and lanes -----------------------------------------------------------
 
 
-def _resolve_record(state: ForgeState, name: str) -> dict | None:
-    """A collection card name → its bulk record via the case- and diacritic-folding
-    name index (``NameIndex.get``; an empty dict in the no-bulk path)."""
-    return state.by_name.get(name)
+def switch_build(
+    state: ForgeState, session: DeckSession, *, name: str, build_id: str | None = None
+) -> None:
+    """Make ``session`` the live build — a new one, an import, a load, or the fresh
+    build that replaces a deleted one. ``build_id=None`` mints an id.
+
+    The ONE place the hub becomes a different build, because the four things that
+    change together must: the session, its id, its name, and the per-build runtime
+    lanes. ``agent_avenues`` (lanes the session-agent posted) and
+    ``focused_avenue_ids`` (the human's focus pins) are scoped to one deck — carried
+    across a switch they surface the prior commander's lanes and scope candidate
+    scoring (``scoring_basis``) to another build's pins."""
+    state.session = session
+    state.build_id = build_id or uuid.uuid4().hex[:8]
+    state.build_name = name
+    state.agent_avenues.clear()
+    state.focused_avenue_ids.clear()
+    state.seed_undo = None
 
 
-def _resolved_collection(state: ForgeState, slot: str | None = None) -> list[dict]:
-    """Every collection card in ``slot`` (default: the active slot) resolved to a bulk
-    record (un-resolvable names dropped — no data, no reasoning). The explicit ``slot``
-    lets background warming target a just-imported slot that isn't the active one."""
-    pile = state.collections.get(slot or active_slot(state)) or {}
-    out: dict[str, dict] = {}
-    # "companion" included: a pasted Arena deck export used as a collection still
-    # OWNS its companion card, even though it sits outside the deck (CR 702.139a).
-    for section in ("commanders", "cards", "sideboard", "companion"):
-        for entry in pile.get(section) or []:
-            name = entry.get("name")
-            if not name:
-                continue
-            rec = _resolve_record(state, name)
-            if rec is not None and rec["name"] not in out:
-                out[rec["name"]] = rec
-    return list(out.values())
+def add_agent_avenue(
+    state: ForgeState, *, label: str, description: str, search: dict
+) -> dict:
+    """Post a session-agent lane onto the live build; returns the new avenue."""
+    state.agent_avenue_seq += 1
+    avenue = {
+        "id": f"agent:{state.agent_avenue_seq}",
+        "label": label,
+        "description": description,
+        "scope": "",
+        "source": "agent",
+        "search": search,
+    }
+    state.agent_avenues.append(avenue)
+    return avenue
 
 
-def owned_commander_records(state: ForgeState) -> list[dict]:
-    """Bulk records for the commander-eligible cards in the active Collection slot."""
-    fmt = state.session.format
-    return [r for r in _resolved_collection(state) if is_commander(r, fmt)["eligible"]]
+def remove_avenue(state: ForgeState, avenue_id: str) -> None:
+    """Drop an agent lane — and its focus pin: a removed lane can't stay focused."""
+    state.agent_avenues[:] = [a for a in state.agent_avenues if a["id"] != avenue_id]
+    state.focused_avenue_ids.discard(avenue_id)
 
 
-def _commander_lanes(record: dict) -> list[tuple[str, Serve, str]]:
-    """The commander's text-opened lanes as ``(label, serve, key)`` triples, deduped by
-    label. The generic Staples lane is NOT a signal spec, so it's naturally excluded —
-    owning good-stuff isn't commander-specific support (Q9).
-
-    ``include_membership=False`` (Q9 amended): a lane the commander opens only from what
-    it *is* (a vanilla artifact legend → "artifacts matter"; a Goblin that says nothing
-    about Goblins → "Goblin tribal") is NOT stated support — it's the broad "lists every
-    artifact" lane the user flagged. We count only lanes the commander's TEXT opens, so
-    a real artifacts-matter / tribal commander keeps its lane while a coincidental
-    member doesn't inflate its support."""
-    out: list[tuple[str, Serve, str]] = []
-    seen: set[str] = set()
-    for sig in _signals(record, include_membership=False):
-        spec = spec_for(sig)
-        if spec is None or spec.label in seen:
-            continue
-        seen.add(spec.label)
-        out.append((spec.label, spec.serve, f"{sig.key}:{sig.subject}"))
-    return out
-
-
-def _density_pool(state: ForgeState) -> list[dict]:
-    """The deduped bulk-record pool used as the lane-density denominator, cached on the
-    state (``by_name`` folds every face/alias, so dedup by canonical name)."""
-    if not state.density_pool:
-        seen: set[str] = set()
-        pool: list[dict] = []
-        for rec in state.by_name.values():
-            name = rec.get("name", "")
-            if name in seen:
-                continue
-            seen.add(name)
-            pool.append(rec)
-        state.density_pool = pool
-    return state.density_pool
-
-
-def _lane_density(state: ForgeState, key: str, serve: Serve) -> float:
-    """Fraction of the whole legal pool that serves a lane, cached per lane-key. A broad
-    lane (artifacts ~0.1) yields a low ``-log(p)`` weight; a distinctive one (a niche
-    tribe ~0.002) a high one — so collection DEPTH in a rare lane outweighs raw breadth.
-    Floored at one hit so a lane that exists always carries some weight."""
-    cached = state.lane_density.get(key)
-    if cached is not None:
-        return cached
-    pool = _density_pool(state)
-    total = len(pool) or 1
-    hits = sum(1 for c in pool if serve.matches(c))
-    p = max(hits, 1) / total
-    state.lane_density[key] = p
-    return p
-
-
-_DENSITY_SIDECAR_PREFIX = "deck-forge-lane-density"
-
-
-@functools.lru_cache(maxsize=1)
-def _serve_fingerprint() -> str:
-    """Serve-definition fingerprint for the discovery sidecars (verified-
-    review F8): a warm lane-density / served-names sidecar computed under
-    OLD serve definitions must invalidate when any serve arm changes, not
-    only when the bulk file does — the B-1/B-6 serve fixes were silently
-    suppressed for warm deployments. Covers the whole extraction closure
-    (``signals_index._content_hash`` — emitted idents feed the
-    ``Serve.signal_idents`` arm) plus the two serve-defining modules that
-    closure deliberately excludes (``signal_specs`` / ``theme_presets``,
-    the one-way import rule). Memoized per process — it reads ~40 source
-    files."""
-    import contextlib
-    import hashlib
-
-    from mtg_utils._deck_forge import signal_specs as _specs_mod
-    from mtg_utils._deck_forge import signals_index
-
-    hasher = hashlib.sha256()
-    hasher.update(signals_index.content_hash().encode())
-    for mod in (_specs_mod, theme_presets):
-        with contextlib.suppress(OSError, TypeError):
-            mod_path = Path(mod.__file__)
-            if mod_path.name == "__init__.py":
-                # A package (signal_specs is one since the 2026-07-25 split):
-                # hash EVERY module in it, sorted for determinism — an edit to
-                # a data_*.py must invalidate even though __init__.py is
-                # untouched.
-                for part in sorted(mod_path.parent.glob("*.py")):
-                    hasher.update(part.read_bytes())
-            else:
-                hasher.update(mod_path.read_bytes())
-    return hasher.hexdigest()[:16]
-
-
-def _density_sidecar_path(state: ForgeState) -> Path | None:
-    """On-disk path for the lane-density cache, keyed by the BULK file's fingerprint
-    (mtime+size via ``sha_keyed_path``) AND the serve-definition fingerprint
-    (verified-review F8). A ``download-mtgjson`` refresh OR a serve change alters
-    the key, so a stale sidecar is transparently ignored, not served. ``None``
-    without bulk."""
-    if state.bulk_path is None:
-        return None
-    return sha_keyed_path(
-        _DENSITY_SIDECAR_PREFIX, state.bulk_path, _serve_fingerprint()
-    )
-
-
-def _load_lane_density(state: ForgeState) -> None:
-    """Seed ``lane_density`` from its sidecar, ONCE per state. The ~55s first-discovery
-    density sweep (every lane scanned over the 34k-card pool) is thus paid once per bulk
-    version, not once per server start. A missing/unreadable/changed-bulk sidecar is a
-    silent no-op (the sweep just recomputes and re-saves)."""
-    if state.density_sidecar_loaded:
-        return
-    state.density_sidecar_loaded = True
-    path = _density_sidecar_path(state)
-    if path is None or not path.exists():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, (int, float)):
-                state.lane_density.setdefault(k, float(v))
-
-
-def _save_lane_density(state: ForgeState) -> None:
-    """Persist the accumulated lane-density cache to its bulk-keyed sidecar (atomic
-    write, so concurrent discovery threads never see a half-written file)."""
-    path = _density_sidecar_path(state)
-    if path is not None:
-        atomic_write_json(path, dict(state.lane_density))
-
-
-_SERVED_SIDECAR_PREFIX = "deck-forge-served"
-
-
-def _served_sidecar_path(state: ForgeState, coll: list[dict]) -> Path | None:
-    """Sidecar path for a collection's per-lane served-name sets, content-addressed by
-    the bulk fingerprint AND the collection's exact owned-name set. Each distinct
-    collection thus gets its own cache (so multiple collections each stay warm), and a
-    changed collection or bulk starts fresh (different key). ``None`` without bulk."""
-    if state.bulk_path is None:
-        return None
-    names = sorted(c.get("name", "") for c in coll)
-    return sha_keyed_path(
-        _SERVED_SIDECAR_PREFIX, state.bulk_path, names, _serve_fingerprint()
-    )
-
-
-def _load_collection_serves(state: ForgeState, slot: str, coll: list[dict]) -> None:
-    """Seed ``slot``'s per-lane served-name cache from its content-addressed sidecar,
-    ONCE per (process, slot) — saving the ~10s collection scan on restart / switch.
-    In-memory presence is the 'loaded' flag; set/clear_collection clears it so a changed
-    collection re-seeds from ITS sidecar."""
-    if slot in state.lane_collection_serves:
-        return
-    cache: dict[str, frozenset[str]] = {}
-    state.lane_collection_serves[slot] = cache
-    path = _served_sidecar_path(state, coll)
-    if path is None or not path.exists():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if isinstance(data, dict):
-        for k, names in data.items():
-            if isinstance(names, list):
-                cache[str(k)] = frozenset(str(n) for n in names)
-
-
-def _save_collection_serves(state: ForgeState, slot: str, coll: list[dict]) -> None:
-    """Persist ``slot``'s served-name sets to its content-addressed sidecar."""
-    path = _served_sidecar_path(state, coll)
-    if path is None:
-        return
-    cache = state.lane_collection_serves.get(slot) or {}
-    atomic_write_json(path, {k: sorted(v) for k, v in cache.items()})
-
-
-def warm_discovery_caches(state: ForgeState, slot: str, fmt: str | None = None) -> None:
-    """Compute + persist BOTH discovery caches (bulk-keyed lane density, and ``slot``'s
-    content-addressed served-name sets) WITHOUT ranking, so the next discover is fast.
-    Run in the background right after a collection import (see app.py), so the ~65s cold
-    cost is never paid at discover time. Heavy CPU — call off the event loop. A pure
-    read of state besides the caches it fills (idempotent).
-
-    ``fmt`` is the format captured at SCHEDULE time: this runs later in a background
-    thread, and ``state.session.format`` may have changed by then (a format switch
-    mid-warm), which would warm commander eligibility for the wrong format. ``None``
-    falls back to the live read (direct callers).
-
-    Seeds ``theme_presets``'s signal-ident memo from the persisted whole-pool
-    signals-index sidecar FIRST (verified-review Fix 6): a tribal lane's
-    ``Serve.signal_idents`` arm (task #96) reads that memo per pool card
-    inside ``_lane_density``'s scan below, and an unseeded memo pays a LIVE
-    ``extract_signals`` call per cold card over the whole
-    ~34.6k-card density pool (~141s measured for one lane) instead of a
-    dict lookup. Idempotent and cheap on an already-seeded/warm sidecar."""
-    theme_presets.seed_signal_key_index(state.bulk_path)
-    coll = _resolved_collection(state, slot)
-    if not coll:
-        return
-    fmt = fmt or state.session.format
-    _load_lane_density(state)
-    _load_collection_serves(state, slot, coll)
-    density_before = len(state.lane_density)
-    served_before = len(state.lane_collection_serves.get(slot) or {})
-    for rec in coll:
-        if not is_commander(rec, fmt)["eligible"]:
-            continue
-        for _label, serve, key in _commander_lanes(rec):
-            _lane_density(state, key, serve)
-            _slot_lane_serves(state, slot, key, serve, coll)
-    if len(state.lane_density) > density_before:
-        _save_lane_density(state)
-    if len(state.lane_collection_serves.get(slot) or {}) > served_before:
-        _save_collection_serves(state, slot, coll)
-
-
-def _slot_lane_serves(
-    state: ForgeState, slot: str, key: str, serve: Serve, coll: list[dict]
-) -> frozenset[str]:
-    """Owned card NAMES (in ``slot``'s collection) that serve a lane, cached per
-    (slot, key). Scanned ONCE per distinct lane, so support is a set intersection,
-    not a per-commander regex scan (the ~30s discovery hot path). Invalidated when
-    the slot's collection changes (``set_collection`` / ``clear_collection``)."""
-    cache = state.lane_collection_serves.setdefault(slot, {})
-    hit = cache.get(key)
-    if hit is not None:
-        return hit
-    names = frozenset(c["name"] for c in coll if serve.matches(c))
-    cache[key] = names
-    return names
-
-
-def _support_depth(
-    state: ForgeState,
-    record: dict,
-    in_names: set[str],
-    slot: str,
-    coll: list[dict],
-) -> tuple[float, list, int]:
-    """Format-relative owned support (ADR-0018 / Q9 amended): sum over the
-    commander's text-opened lanes of ``own(L) * -log(p_L)``, where ``own(L)`` =
-    in-identity owned cards serving lane L and ``p_L`` = that lane's serve density in
-    the legal pool. The old within-collection IDF peaked at mid-breadth, so a
-    merely-broad lane (artifacts) always won; the pool-relative weight instead makes a
-    distinctive lane you own deeply outrank a broad one (reflects the collection, not
-    lane width).
-
-    ``own(L)`` counts the lane's served-names also in ``in_names`` (a set intersection
-    over the cached served-name set), so no regex runs per commander: the scan is once
-    per distinct lane. Returns ``(score, breakdown, # supported)``."""
-    if not in_names:
-        return 0.0, [], 0
-    score = 0.0
-    breakdown: list[dict] = []
-    supported = 0
-    for label, serve, key in _commander_lanes(record):
-        k = len(_slot_lane_serves(state, slot, key, serve, coll) & in_names)
-        if k == 0:
-            continue
-        score += k * -math.log(_lane_density(state, key, serve))
-        breakdown.append({"label": label, "owned": k})
-        if k >= _SUPPORT_FLOOR:
-            supported += 1
-    breakdown.sort(key=lambda b: -b["owned"])
-    return score, breakdown, supported
-
-
-def _signal_key_subjects(rec: dict, index: dict[str, tuple[str, ...]] | None) -> set:
-    """``{(key, subject)}`` for *rec* — from the persisted whole-pool signals-index
-    sidecar (task #90) when one is available and covers this ``oracle_id``, else the
-    live ``extract_signals`` fallback (a card the sidecar somehow doesn't cover,
-    or no sidecar at all — no bulk, or it isn't buildable). Both routes read the SAME
-    default configuration (``include_membership=True``), so this never diverges from a
-    pure-live sweep, only skips re-running it."""
-    oid = rec.get("oracle_id")
-    if index is not None and oid in index:
-        out = set()
-        for ident in index[oid]:
-            key, _scope, subject = ident.split("|", 2)
-            out.add((key, subject))
-        return out
-    return {(s.key, s.subject) for s in _signals(rec)}
-
-
-def _signal_freq(state: ForgeState) -> tuple[dict, int]:
-    """Per-format signal-rarity table over the whole legal commander pool, cached on the
-    state (the one expensive sweep in discovery). Maps ``(key, subject)`` → occurrences,
-    plus the commander count, for the Novelty IDF.
-
-    Reads the persisted whole-pool signals-index sidecar (task #90,
-    ``_deck_forge.signals_index``) when available — building it on first touch (a
-    one-time ~2-4 min pass, logged) instead of running ``extract_signals`` live
-    for every commander-eligible card in the bulk every time this cold-starts. A missing
-    sidecar (no bulk, or one that can't be built) degrades to the original per-record
-    live sweep, unchanged."""
-    fmt = state.session.format
-    cached = state.commander_signal_freq.get(fmt)
-    if cached is not None:
-        return cached
-    freq: dict[tuple[str, str], int] = {}
-    total = 0
-    # by_name folds and indexes every face/alias, so the same record appears under
-    # several keys — dedup by canonical name so each commander is counted once.
-    seen: set[str] = set()
-    from mtg_utils._deck_forge.signals_index import load_signals_index
-
-    index = load_signals_index(state.bulk_path)
-    for rec in state.by_name.values():
-        name = rec.get("name", "")
-        if name in seen:
-            continue
-        seen.add(name)
-        if not is_commander(rec, fmt)["eligible"]:
-            continue
-        total += 1
-        for key in _signal_key_subjects(rec, index):
-            freq[key] = freq.get(key, 0) + 1
-    state.commander_signal_freq[fmt] = (freq, total)
-    return freq, total
-
-
-def _novelty(record: dict, freq: dict, total: int) -> float:
-    """Signal rarity: summed inverse-frequency of the commander's signals over the pool,
-    so an off-beat hook outranks tokens / counters / ramp. Blind by design to commanders
-    whose ability fires no detector (they score 0) — the accepted limit of signal-based
-    novelty."""
-    keys = {(s.key, s.subject) for s in _signals(record, include_membership=True)}
-    return sum(math.log((total + 1) / freq.get(key, 1)) for key in keys)
-
-
-def discover_commanders(
-    state: ForgeState,
-    *,
-    sort: str = "support",
-    colors: str | None = None,
-    theme: str | None = None,
-    limit: int = 24,
-) -> list[dict]:
-    """Intent-ranked owned commanders from the active Collection slot (ADR-0018).
-
-    ``support`` (default) ranks by breadth-down-weighted owned support; ``novelty``
-    ranks by signal rarity, HARD-GATED to commanders you own some support for.
-    ``colors`` (a color-identity subset) and ``theme`` (a ``theme_presets`` lane) narrow
-    the pool. Never uses EDHREC popularity.
-
-    Seeds ``theme_presets``'s signal-ident memo from the persisted whole-pool
-    signals-index sidecar FIRST (verified-review Fix 6) — same rationale as
-    ``warm_discovery_caches``: this is the FOREGROUND discovery path (called
-    on every discover, not just after a collection import), and its
-    ``_support_depth`` → ``_lane_density`` calls below walk the same
-    whole-pool density pool a tribal lane's ``signal_idents`` arm would
-    otherwise live-extract per cold card."""
-    theme_presets.seed_signal_key_index(state.bulk_path)
-    if sort not in _DISCOVER_SORTS:
-        sort = "support"
-    records = owned_commander_records(state)
-    if colors:
-        allowed = set(colors.upper())
-        records = [r for r in records if set(r.get("color_identity") or []) <= allowed]
-    if theme:
-        records = [r for r in records if theme_presets.matches(theme, r)]
-
-    coll = _resolved_collection(state)
-    slot = active_slot(state)
-    fmt = state.session.format
-    freq, total = _signal_freq(state) if sort == "novelty" else ({}, 0)
-    # Seed both discovery caches from their sidecars so this skips the ~55s pool sweep
-    # (density) and the ~10s collection scan (served sets). New lanes still compute
-    # lazily and persist at the end. (Imports warm these in the background already.)
-    _load_lane_density(state)
-    _load_collection_serves(state, slot, coll)
-    density_before = len(state.lane_density)
-    served_before = len(state.lane_collection_serves.get(slot) or {})
-
-    results: list[dict] = []
-    for rec in records:
-        identity = set(rec.get("color_identity") or [])
-        # Support is OTHER owned cards that feed the commander's lanes — the commander
-        # itself is the build's centerpiece, not its own support, so exclude it (and it
-        # keeps the breadth denominator honest: a lane can't read as 100%-of-pool just
-        # because the commander matches its own lane). Names (not records): support is a
-        # set intersection against the per-lane served-name cache.
-        in_names = {
-            c["name"]
-            for c in coll
-            if c["name"] != rec["name"]
-            and set(c.get("color_identity") or []) <= identity
-        }
-        depth, lanes, supported = _support_depth(state, rec, in_names, slot, coll)
-        item = {
-            "name": rec["name"],
-            **views.project(rec, fmt),
-            "support_depth": round(depth, 2),
-            "lanes": lanes,
-            "supported_lanes": supported,
-        }
-        if sort == "novelty":
-            item["novelty"] = round(_novelty(rec, freq, total), 2)
-        results.append(item)
-
-    if sort == "novelty":
-        # Hard support gate: only the buildable weird ones (own SOME support), then sort
-        # by strangeness, with support depth as the tiebreak. Gate on a non-empty lane
-        # breakdown (own ≥ 1 supporting card) rather than support_depth > 0 — the IDF
-        # weight is 0 for a single lane every owned card serves (k == N), and such a
-        # commander is still buildable, so it must not be silently dropped.
-        results = [r for r in results if r["lanes"]]
-        results.sort(key=lambda r: (-r["novelty"], -r["support_depth"], r["name"]))
+def toggle_avenue_focus(state: ForgeState, avenue_id: str) -> None:
+    """Flip a lane's 'focused' pin (#2): the candidate ✦ score then counts only the
+    focused lanes. A toggle, so the pin button can flip it either way."""
+    if avenue_id in state.focused_avenue_ids:
+        state.focused_avenue_ids.discard(avenue_id)
     else:
-        results.sort(
-            key=lambda r: (-r["support_depth"], -r["supported_lanes"], r["name"])
-        )
-    if len(state.lane_density) > density_before:
-        _save_lane_density(state)  # new densities computed this call — persist them
-    if len(state.lane_collection_serves.get(slot) or {}) > served_before:
-        _save_collection_serves(state, slot, coll)  # new served sets — persist them
-    return results[:limit]
+        state.focused_avenue_ids.add(avenue_id)
 
 
 def partner_search(state: ForgeState) -> dict | None:
@@ -844,22 +533,19 @@ def partner_search(state: ForgeState) -> dict | None:
     return valid_partner_search(record)
 
 
-def _legality_key(fmt: str) -> str:
-    cfg = FORMAT_CONFIGS.get(fmt)
-    return cfg["legality_key"] if cfg else "commander"
-
-
 def staple_pool(state: ForgeState) -> list[dict]:
     """The curated 'good stuff' staples offered to this deck — the hardcoded staple
     list (see ``staples``) filtered to the deck's color identity AND format legality,
-    resolved from the bulk index. Empty without bulk. This is the candidate source for
-    the always-present Staples avenue (a name list, not a search pattern)."""
-    if not state.by_name:
+    resolved from the bulk index. Empty without bulk, and empty outside the Commander
+    family — the list is curated for Commander (``staples``), and offered to a
+    Legacy deck it would name Sol Ring. This is the candidate source for the
+    always-present Staples avenue (a name list, not a search pattern)."""
+    if not state.by_name or not state.session.fmt.has_commander:
         return []
     return staples.staples_for(
         deck_color_identity(state),
         state.by_name,
-        legality_key=_legality_key(state.session.format),
+        fmt=state.session.fmt,
     )
 
 
@@ -903,13 +589,15 @@ def _violation_message(category: str, violation: dict) -> dict:
     return {"category": category, "message": f"{label}: {body}".strip(": ")}
 
 
-def _overflow_warnings(hd: HydratedDeck, max_cards: int | None) -> list[dict]:
+def _overflow_warnings(hd: HydratedDeck) -> list[dict]:
     """Two failure modes the shared ``legality_audit`` deliberately doesn't own, because
     they're build-surface concerns: a deck that has grown PAST its size cap (the mirror
-    of the excluded ``deck_minimum`` — under is normal building, over is never legal),
+    of the excluded ``deck_minimum`` — under is normal building, over is never legal;
+    only an exact-size family HAS a cap, a constructed size is a floor — CR 100.2a),
     and card names that resolved to no Scryfall record (a typo or a failed paste-import,
     which ADR-0012 otherwise DROPs silently from the hydrated records)."""
     out: list[dict] = []
+    max_cards = hd.format.size_cap
     if max_cards is not None:
         # Commanders + maindeck only: the companion is revealed from outside the
         # game and is not part of the deck or sideboard (CR 702.139a-b), so it
@@ -928,7 +616,7 @@ def _overflow_warnings(hd: HydratedDeck, max_cards: int | None) -> list[dict]:
             )
     unimported = [
         e["name"]
-        for zone in ("commanders", "cards", "sideboard", "companion")
+        for zone in ZONES
         for e in hd.deck.get(zone) or []
         if e.get("name") and e["name"] not in hd.by_name
     ]
@@ -959,8 +647,12 @@ def _companion_message(v: dict) -> str:
     )
 
 
-def legality_warnings(hd: HydratedDeck, *, max_cards: int | None = None) -> list[dict]:
-    audit = legality_audit(hd)
+def legality_warnings(hd: HydratedDeck, *, audit: dict | None = None) -> list[dict]:
+    """The live warning list: every audited category, the size cap where the family
+    has one, and the companion checks. ``hd.format`` carries the build's effective
+    size, so the cap is derived here — no caller passes one. ``audit`` is a
+    ``legality_audit`` result the caller already has (finalize reads it twice)."""
+    audit = legality_audit(hd) if audit is None else audit
     violations = audit.get("violations") or {}
     return (
         [
@@ -968,12 +660,13 @@ def legality_warnings(hd: HydratedDeck, *, max_cards: int | None = None) -> list
             for cat in _AUDIT_CATEGORIES
             for v in (violations.get(cat) or [])
         ]
-        + _overflow_warnings(hd, max_cards)
+        + _overflow_warnings(hd)
         # Companion violations (the shared ``check_companion``: max one, must
-        # have the ability, condition met over commanders + maindeck with
-        # deck_minimum=None — every deck-forge format is exact-size, CR 903.5a /
-        # 903.12d) surface as warnings like deck_maximum: through /api/audit and
-        # the finalize gate (legality_status FAIL), never a hard error.
+        # have the ability, condition met over commanders + maindeck — with
+        # deck_minimum=None for the exact-size Commander family, CR 903.5a /
+        # 903.12d, and the format's minimum for constructed) surface as warnings
+        # like deck_maximum: through /api/audit and the finalize gate
+        # (legality_status FAIL), never a hard error.
         + [
             {"category": "companion", "message": _companion_message(v)}
             for v in (violations.get("companion") or [])
@@ -981,20 +674,684 @@ def legality_warnings(hd: HydratedDeck, *, max_cards: int | None = None) -> list
     )
 
 
+class DeckRuleError(ValueError):
+    """A deck rule rejected the request (a printing that isn't the card's, a second
+    companion, an unsupported import format). The transport adapter maps it to one
+    400 in one place; engine tests assert on it directly (ADR-0013)."""
+
+
+# --- land plans -----------------------------------------------------------------
+
+
+def _apply_land_plan(state: ForgeState, plan: dict) -> dict[str, dict[str, int]]:
+    """Apply a ``reconcile_basic_lands`` plan to the session: removals first, then
+    adds — only basics the loaded index can hydrate. Returns what was applied."""
+    applied: dict[str, dict[str, int]] = {"add": {}, "remove": {}}
+    for name, qty in plan["remove"].items():
+        state.session.remove(name, qty, zone="cards")
+        applied["remove"][name] = qty
+    for name, qty in plan["add"].items():
+        if name in state.by_name:
+            state.session.add(name, qty, zone="cards")
+            applied["add"][name] = qty
+    return applied
+
+
+def balance_lands(state: ForgeState) -> dict[str, dict[str, int]]:
+    """Fix the mana base: add basics up to the land band's floor and rebalance the
+    basics to color demand (swapping over- for under-produced colors at the current
+    count when already at/above the floor). Mutates the session; returns the
+    applied ``{add, remove}``."""
+    return _apply_land_plan(state, reconcile_basic_lands(hydrate_session(state)))
+
+
+def trim_lands(state: ForgeState) -> dict[str, dict[str, int]]:
+    """The FLOOD remedy: trim basics back down to the land band's top, over-produced
+    colors first. A no-op (empty plan) at or under the top — soft, never a gate,
+    because an all-lands combo deck is a legitimate build (CONTEXT: Flood line)."""
+    hd = hydrate_session(state)
+    audit = mana_audit(hd)
+    top = audit["land_band"]["top"]
+    if audit["land_count"] <= top:
+        return {"add": {}, "remove": {}}
+    return _apply_land_plan(state, reconcile_basic_lands(hd, target_total=top))
+
+
+# --- format / medium / size / zone rules -----------------------------------------
+
+
+def check_format(fmt: str) -> None:
+    """The format rule: a build is one of the formats the table declares (ADR-0045);
+    every family the Format module knows is served."""
+    if fmt not in FORMATS:
+        raise DeckRuleError(f"unknown format: {fmt!r}")
+
+
+def set_format(state: ForgeState, fmt: str) -> None:
+    """Change the build's format (:func:`check_format`). The deck's cards are kept;
+    everything format-dependent re-derives on the next snapshot. Crossing the
+    pool boundary keeps the cards playable: entering a pool-bounded format with no
+    pool yet pools everything the build holds (its sideboard becomes derived);
+    leaving one stores the derived sideboard as a real one."""
+    check_format(fmt)
+    session = state.session
+    was_pool = session.pool_bounded
+    now_pool = FORMATS[fmt].pool_bounded
+    if was_pool and not now_pool:
+        # The unused pool becomes a stored sideboard; the pool is emptied (a
+        # database-pooled format carries none — re-entering re-pools), and a seed's
+        # undo goes with it (it held a deck drawn from that pool).
+        session.replace_zone("sideboard", session.derived_sideboard())
+        session.replace_zone("pool", {})
+        state.seed_undo = None
+    session.format = fmt
+    if now_pool and not was_pool:
+        session.pool_everything()
+
+
+def set_medium(state: ForgeState, medium: str) -> None:
+    """The medium rule: paper vs digital, only where the format is played that way
+    (``Format.media``, ADR-0045). The medium drives the active Collection slot and
+    the cost mode — digital → Arena slot + wildcards; paper → paper slot + USD
+    (ADR-0018, amended)."""
+    fmt = state.session.fmt
+    if medium not in fmt.media:
+        raise DeckRuleError(
+            f"{fmt.name} is not played in {medium!r} (media: {', '.join(fmt.media)})"
+        )
+    state.session.set_medium(medium)
+
+
+def set_deck_size(state: ForgeState, deck_size: int) -> None:
+    """The deck-size rule, by family (ADR-0045): a constructed build takes any size
+    its Format calls valid (a floor — an 80-card Yorion deck); a Commander-family
+    build takes any size some format of the family may choose — only paper Historic
+    Brawl honors a choice (60 or 100 are both legal paper "Brawl"), every other
+    (format, medium) keeps its fixed size, so the override lies dormant until it
+    applies. The guard is derived from the format table, never a hand-list."""
+    fmt = state.session.fmt
+    if fmt.size_is_minimum:
+        if not fmt.is_valid_deck_size(deck_size):
+            raise DeckRuleError(f"{deck_size} is not a valid {fmt.label} deck size")
+    else:
+        choices = family_size_choices(fmt.family)
+        if deck_size not in choices:
+            raise DeckRuleError(f"deck size must be one of {list(choices)}")
+    state.session.set_deck_size(deck_size)
+
+
+def check_zone(zone: str) -> None:
+    """The zone rule: a request names one of the deck's zones (``ZONES``)."""
+    if zone not in ZONES:
+        raise DeckRuleError(f"unknown zone {zone!r}")
+
+
+def check_zone_open(state: ForgeState, zone: str) -> None:
+    """The family's zone rule: only a format with a command zone has commanders;
+    only a pool-bounded format has a pool, and there the sideboard is DERIVED (the
+    pool less the deck) — nothing is added to it, a card is cut from the deck or
+    added to the pool. A sideboard the family caps at zero is NOT refused here —
+    the size audit warns (``sideboard_size``), so a build in progress may park
+    cards while swapping."""
+    check_zone(zone)
+    fmt = state.session.fmt
+    if zone == "commanders" and not fmt.has_commander:
+        raise DeckRuleError(f"{fmt.label} has no command zone")
+    if zone == "pool" and not fmt.pool_bounded:
+        raise DeckRuleError(f"{fmt.label} has no pool — only sealed / draft do")
+    if zone == "sideboard" and fmt.pool_bounded:
+        raise DeckRuleError(
+            "the sideboard is the unused pool — cut a card from the deck to "
+            "sideboard it, or add it to the pool"
+        )
+
+
+def check_pool_remove(state: ForgeState, name: str, qty: int, zone: str) -> None:
+    """The pool-bounded remove rule: a pool copy the deck still runs cannot leave
+    the pool (cut it from the deck first), and the derived sideboard is never
+    removed from directly."""
+    if not state.session.pool_bounded:
+        return
+    if zone == "sideboard":
+        raise DeckRuleError(
+            "the sideboard is the unused pool — remove the card from the pool instead"
+        )
+    if zone == "pool":
+        left = state.session.quantity_of(name, zone="pool") - qty
+        used = state.session.quantity_of(name, zone="cards")
+        if left < used:
+            raise DeckRuleError(
+                f"{name}: the deck runs {used}; cut it from the deck before "
+                "removing it from the pool"
+            )
+
+
+# --- copy limits -----------------------------------------------------------------
+
+
+def copy_limit(state: ForgeState, record: dict) -> int | None:
+    """How many copies of one card the build may run (``None`` = unlimited) — the
+    audit's own ``card_copy_limit`` under the build's Format, so the hub and
+    ``legality_audit.check_copy_limits`` cannot drift. In a pool-bounded build the
+    limit IS what the pool holds (CR 100.2b: as many duplicates as the product
+    included; basics unlimited) — so the one add rule is also pool containment."""
+    fmt = state.session.fmt
+    if fmt.pool_bounded:
+        if is_basic_land(record):
+            return None
+        return state.session.quantity_of(record.get("name", ""), zone="pool")
+    return card_copy_limit(record, fmt)
+
+
+def copies_of(state: ForgeState, name: str) -> int:
+    """The copies of ``name`` the build holds across EVERY zone: the copy limit spans
+    the deck and the sideboard (CR 100.4a), the command zone (CR 903.5a: a Commander
+    deck's singleton rule includes its commander), and the companion (a sideboard
+    card on Arena). Wider than the audit's cards + sideboard count — the hub is the
+    stricter of the two by design. In a pool-bounded build the copies are the main
+    deck's (the pool is the limit, the derived sideboard the remainder)."""
+    if state.session.pool_bounded:
+        zones: tuple[str, ...] = ("cards", "companion")
+    else:
+        zones = ZONES
+    return sum(state.session.quantity_of(name, zone=z) for z in zones)
+
+
+def at_copy_limit(state: ForgeState, record: dict) -> bool:
+    """Whether the build already runs every copy of this card it may — the one rule
+    Find strips by, so a 2-of in a 4-of format stays findable."""
+    limit = copy_limit(state, record)
+    return limit is not None and copies_of(state, record.get("name", "")) >= limit
+
+
+def check_copy_add(
+    state: ForgeState, name: str, qty: int, *, zone: str = "cards"
+) -> None:
+    """The copy-limit rule for an add, raising ``DeckRuleError`` when ``qty`` more
+    copies would exceed :func:`copy_limit`. Mirrors ``check_companion_add``: the hub
+    never over-adds, so the SPA's stepper can't run past the format. An add to the
+    pool itself is never limited — the pool IS the limit."""
+    if zone == "pool":
+        return
+    record = state.by_name.get(name)
+    if record is None:
+        return  # the route 404s an unknown name before any rule
+    limit = copy_limit(state, record)
+    if limit is None:
+        return
+    have = copies_of(state, name)
+    if have + qty > limit:
+        fmt = state.session.fmt
+        if fmt.pool_bounded:
+            raise DeckRuleError(
+                f"{name}: not in the pool (CR 100.2b)"
+                if limit == 0
+                else f"{name}: the pool holds {limit} and the deck runs {have}"
+            )
+        raise DeckRuleError(
+            f"{name}: {have + qty} copies would exceed the {fmt.label} limit of "
+            f"{limit} (you have {have})"
+        )
+
+
+def add_card(state: ForgeState, name: str, qty: int, *, zone: str) -> None:
+    """Add copies to a zone under every rule: the zone is one the family has, the
+    companion zone's own rules, the copy limit (which is pool containment in a
+    pool-bounded build). Raises ``DeckRuleError``; an unknown name is the route's
+    404 (a lookup miss, not a rule)."""
+    check_zone_open(state, zone)
+    if zone == "companion":
+        check_companion_add(state, name, qty)
+    else:
+        check_copy_add(state, name, qty, zone=zone)
+    state.session.add(name, qty, zone=zone)
+
+
+def remove_card(state: ForgeState, name: str, qty: int, *, zone: str) -> None:
+    """Remove copies from a zone under the pool-bounded rules (a pool copy the deck
+    runs stays; the derived sideboard is never removed from directly)."""
+    check_zone(zone)
+    check_pool_remove(state, name, qty, zone)
+    state.session.remove(name, qty, zone=zone)
+
+
+def move_card(
+    state: ForgeState, name: str, *, from_zone: str, to_zone: str, qty: int = 1
+) -> None:
+    """Move ``qty`` copies of ``name`` between two zones in one step (main deck ⇄
+    sideboard, promote to commander, reveal as companion), carrying a pinned
+    printing along. Every rule runs BEFORE the session changes, so a refused move
+    leaves the build untouched. The copy limit is not consulted: a move keeps the
+    build's total."""
+    check_zone(from_zone)
+    if from_zone == to_zone:
+        raise DeckRuleError(f"{name} is already in {to_zone}")
+    have = state.session.quantity_of(name, zone=from_zone)
+    if have < qty:
+        raise DeckRuleError(f"{name}: only {have} in {from_zone}, cannot move {qty}")
+    if state.session.pool_bounded:
+        # The pool and its derived sideboard are one thing to move against: a card
+        # leaves the deck into it (a remove) or enters the deck from it (an add the
+        # pool bounds); the pool itself never changes by a move.
+        unused = ("sideboard", "pool")
+        if from_zone == "cards" and to_zone in unused:
+            state.session.remove(name, qty, zone="cards")
+            return
+        if from_zone in unused and to_zone == "cards":
+            check_copy_add(state, name, qty)
+            state.session.add(name, qty, zone="cards")
+            return
+        if from_zone in unused and to_zone in unused:
+            raise DeckRuleError(f"{name} is already in the pool")
+    check_zone_open(state, to_zone)
+    if to_zone == "companion":
+        check_companion_add(state, name, qty)
+    printing = state.session.printing_of(name, zone=from_zone)
+    finish = state.session.finish_of(name, zone=from_zone)
+    state.session.remove(name, qty, zone=from_zone)
+    state.session.add(name, qty, zone=to_zone)
+    if printing and state.session.printing_of(name, zone=to_zone) is None:
+        state.session.set_printing(name, printing, zone=to_zone, finish=finish)
+
+
+# --- the companion zone ---------------------------------------------------------
+
+
+def check_companion_add(state: ForgeState, name: str, qty: int) -> None:
+    """The zone rules for adding to the companion zone, raising ``DeckRuleError``:
+    (a) at most ONE card may occupy it (CR 103.2b) — an occupied zone is refused;
+    the user removes the old occupant first, it is never silently replaced; (b) the
+    card must carry the companion ability (CR 702.139a), read off its record."""
+    occupied = state.session.to_deck_dict().get("companion") or []
+    if occupied:
+        raise DeckRuleError(
+            f"companion zone already holds {occupied[0]['name']}; a player may "
+            "reveal at most one companion (CR 103.2b) — remove it first"
+        )
+    if qty != 1:
+        raise DeckRuleError(
+            "the companion zone holds exactly one card (CR 103.2b: at most one "
+            "companion)"
+        )
+    record = state.by_name.get(name)
+    if record is None or not is_companion(record):
+        raise DeckRuleError(f"{name} has no companion ability (CR 702.139a)")
+
+
+def settle_companion_zone(parsed: dict, by_name: Mapping[str, dict]) -> list[str]:
+    """Route an imported list's companion zone in place: the FIRST plausible
+    companion keeps the zone (an unknown name stays — it surfaces as ``unknown``
+    like any other zone); overflow entries (CR 103.2b: at most one companion), extra
+    copies, and cards the index PROVES have no companion ability (CR 702.139a) are
+    demoted to ``cards`` with a warning, never dropped. Returns the warnings."""
+    warnings: list[str] = []
+    kept: list[dict] = []
+    demoted: list[dict] = []
+    for entry in parsed.get("companion") or []:
+        record = by_name.get(entry.get("name", ""))
+        if record is not None and not is_companion(record):
+            demoted.append(entry)
+            warnings.append(
+                f"{entry['name']} has no companion ability (CR 702.139a); "
+                "moved to the deck"
+            )
+        elif kept:
+            demoted.append(entry)
+            warnings.append(
+                f"more than one companion listed; {entry['name']} moved to the "
+                "deck (CR 103.2b: at most one companion)"
+            )
+        else:
+            qty = int(entry.get("quantity", 1))
+            if qty > 1:
+                demoted.append({**entry, "quantity": qty - 1})
+                warnings.append(
+                    f"{entry['name']}: {qty} copies listed as companion; kept 1, "
+                    f"moved {qty - 1} to the deck (CR 103.2b)"
+                )
+            kept.append({**entry, "quantity": 1})
+    parsed["companion"] = kept
+    if demoted:
+        parsed["cards"] = list(parsed.get("cards") or []) + demoted
+    return warnings
+
+
+@dataclass(frozen=True)
+class ImportedDeck:
+    """What ``import_deck`` derived from a pasted list: the parsed dict (companion
+    zone settled), a fresh session over it (printings pinned), the names the index
+    cannot hydrate, and the companion warnings."""
+
+    parsed: dict
+    session: DeckSession
+    unknown: list[str]
+    warnings: list[str]
+
+
+def import_deck(
+    state: ForgeState, text: str, *, fmt: str, pool_only: bool = False
+) -> ImportedDeck:
+    """Parse a pasted / uploaded list IN-PROCESS (ADR-0017 — pure compute, no LLM)
+    into a NEW session: companion zone settled (``settle_companion_zone``), printing
+    suffixes pinned, unknown names collected. Never guesses a commander — an unmarked
+    list lands in ``cards`` for the user to promote from. Does not touch
+    ``state.session``; the transport adapter switches builds. Raises
+    ``DeckRuleError`` for an unsupported format, an unparseable paste, or an empty
+    list. For a pool-bounded format the list's cards become the opened pool
+    (``pool_only``: the whole list, no deck yet — see ``parse_deck_text``)."""
+    check_format(fmt)
+    try:
+        parsed = parse_deck_text(text, format=fmt, pool_only=pool_only)
+    except Exception as exc:
+        raise DeckRuleError(f"could not parse deck list: {exc}") from exc
+    warnings = settle_companion_zone(parsed, state.by_name)
+    session = DeckSession.from_deck_dict(parsed)
+    if not session.card_names():
+        raise DeckRuleError("no cards found in the imported list")
+    # Entries that carried a "(SET) 123" suffix (and optional *F*/*E* finish
+    # marker) auto-pin the matching printing; unresolvable pairs stay unpinned.
+    pin_imported_printings(state, session, parsed)
+    unknown = sorted(n for n in session.card_names() if n not in state.by_name)
+    return ImportedDeck(
+        parsed=parsed, session=session, unknown=unknown, warnings=warnings
+    )
+
+
+# --- printings ------------------------------------------------------------------
+
+
+def printings_for(state: ForgeState, name: str) -> list[tuple[dict, int, int]]:
+    """Every legal printing of *name* for the picker, each with its owned nonfoil /
+    foil counts in the ACTIVE Collection slot (0 when unknown). Owned printings
+    sort first (total owned desc, ties newest-first), then the rest newest-first.
+    Empty for an unknown name."""
+    record = state.by_name.get(name)
+    oracle_id = record.get("oracle_id") if record else None
+    prints = state.printings_by_oracle.get(oracle_id, []) if oracle_id else []
+    detail = owned_printing_detail(state, name) or {}
+    rows: list[tuple[dict, int, int]] = []
+    for p in prints:
+        key = ((p.get("set") or "").lower(), str(p.get("collector_number") or ""))
+        nonfoil, foil = detail.get(key, (0, 0))
+        rows.append((p, nonfoil, foil))
+    # Stable sort over the newest-first base order: the owned block first (by total
+    # owned desc, ties stay newest-first), then unowned newest-first unchanged.
+    rows.sort(key=lambda r: (0 if r[1] + r[2] > 0 else 1, -(r[1] + r[2])))
+    return rows
+
+
+def choose_printing(
+    state: ForgeState,
+    name: str,
+    printing_id: str | None,
+    *,
+    zone: str,
+    finish: str | None,
+) -> None:
+    """Pin (or clear, with a null id) the printing for *name* in *zone*. The chosen
+    printing drives the card's image / price / export set, never its gameplay text.
+    Validated against the card's own printings so a stray id can't pin a wrong
+    card's art, and a finish only rides a pinned printing that was produced in it
+    (its ``finishes`` list). Raises ``DeckRuleError``; mutates the session."""
+    chosen: dict | None = None
+    if printing_id is not None:
+        record = state.by_name.get(name)
+        oracle_id = record.get("oracle_id") if record else None
+        chosen = next(
+            (
+                p
+                for p in state.printings_by_oracle.get(oracle_id or "", [])
+                if p.get("id") == printing_id
+            ),
+            None,
+        )
+        if chosen is None:
+            raise DeckRuleError(f"not a printing of {name!r}")
+    if finish is not None:
+        if chosen is None:
+            raise DeckRuleError("finish requires a chosen printing")
+        if finish not in FOIL_FINISHES or finish not in (chosen.get("finishes") or []):
+            raise DeckRuleError(f"printing {printing_id!r} has no {finish!r} finish")
+    state.session.set_printing(name, printing_id, zone=zone, finish=finish)
+
+
+def export_deck_dict(state: ForgeState) -> dict:
+    """The session as a parsed-deck dict with each chosen printing resolved to its
+    ``set`` / ``collector_number`` (the exporters' ``(SET) <collector#>`` suffix and
+    the JSON export's printing identity). A no-op for default printings."""
+    deck = state.session.to_deck_dict()
+    for zone in ZONES:
+        for entry in deck.get(zone) or []:
+            record = state.printing_by_id.get(entry.get("printing_id") or "")
+            if record is not None:
+                entry["set"] = record.get("set")
+                entry["collector_number"] = record.get("collector_number")
+    return deck
+
+
+# --- tune -----------------------------------------------------------------------
+
+
+def pool_records(hd: HydratedDeck) -> list[dict]:
+    """The distinct records of a build's opened pool."""
+    return hd.deck_records(zones=("pool",))
+
+
+def pool_owned(state: ForgeState) -> dict[str, int] | None:
+    """A pool-bounded build's pool as name → copies (what the tuner may add and owns
+    outright), or None for any other family."""
+    if not state.session.pool_bounded:
+        return None
+    return dict(state.session.quantities("pool"))
+
+
+def search_for(state: ForgeState, hd: HydratedDeck) -> Callable[..., list[dict]]:
+    """The candidate search for THIS build: the bulk-backed ``state.search_fn`` for
+    a format whose card pool is the database, or — for a pool-bounded build — the
+    same filter implementation (``card_search.filter_records``) over the opened
+    pool's records, so Find and the tuner search the pool with the search's own
+    semantics and never name a card the builder did not open."""
+    if not state.session.pool_bounded:
+        return state.search_fn
+    return card_search.pool_search_fn(pool_records(hd), state.session.fmt)
+
+
+def pool_readout(state: ForgeState, hd: HydratedDeck) -> dict | None:
+    """The snapshot's pool panel for a pool-bounded build: its size, how much is
+    unused, and every colour pair it supports on equal footing
+    (``set_scan.pool_color_pairs``); None for any other family."""
+    if not state.session.pool_bounded:
+        return None
+    unused = state.session.derived_sideboard()
+    return {
+        "size": state.session.quantity_sum("pool"),
+        "unused": sum(unused.values()),
+        "color_pairs": pool_color_pairs(hd.deck_quantities(zones=("pool",))),
+        # Whether the last seed can be undone (its replaced deck is still held).
+        "seed_undo": state.seed_undo is not None,
+    }
+
+
+def set_scan_for(state: ForgeState, code: str) -> dict | None:
+    """What set ``code`` holds (``set_scan.set_scan`` over the pool's set index),
+    memoized per code; None for a code the bulk has no cards for. Requires bulk."""
+    key = code.lower()
+    if key not in state.set_scans:
+        assert state.bulk_path is not None  # the route checks bulk first
+        records = CardPool.load(state.bulk_path).set_records(key)
+        state.set_scans[key] = set_scan(records, code=key) if records else {}
+    return state.set_scans[key] or None
+
+
+# The curve a seeded 40 aims for (nonland slots by mana value) — the limited norm
+# a first draft starts from; the builder tunes from there.
+_SEED_CURVE = {1: 3, 2: 7, 3: 6, 4: 4, 5: 2, 6: 1}
+
+
+def seed_build(state: ForgeState, colors: str) -> dict:
+    """One click from a pool to a first 40 in ``colors`` (``_gauntlet_build``'s
+    deterministic greedy fill over the pool's own cards plus basics) — a starting
+    point the builder then tunes, never a finished deck, and never a card the pool
+    does not hold. Replaces the main deck, keeping what it replaced for ONE
+    ``undo_seed``. Raises ``DeckRuleError`` outside a
+    pool-bounded build, for bad colours, or when the pool cannot fill the colours."""
+    if not state.session.pool_bounded:
+        raise DeckRuleError("only a sealed / draft build seeds a deck from a pool")
+    wanted = [c for c in colors.upper() if c in "WUBRG"]
+    if not wanted or len(wanted) != len(set(wanted)):
+        raise DeckRuleError(
+            f"colors must be one or more distinct of WUBRG, got {colors!r}"
+        )
+    hd = hydrate_session(state)
+    # One record PER COPY (distinct objects: the builder's fallback fill dedups by
+    # identity), so a 3-of in the pool may be picked three times and never four.
+    records: list[dict] = []
+    for entry, rec in hd.entries(zones=("pool",)):
+        if rec is not None:
+            records.extend(dict(rec) for _ in range(int(entry.get("quantity", 1))))
+    deck_size = state.session.deck_size
+    lands = limited_land_target(ramp_count=0, avg_cmc=0.0, deck_size=deck_size)
+    outcome = build_gauntlet_deck(
+        records,
+        {
+            "name": "".join(wanted),
+            "colors": wanted,
+            "shape": "midrange",
+            "curve_target": _SEED_CURVE,
+        },
+        deck_size=deck_size,
+        lands=lands,
+    )
+    if outcome.status != "ok":
+        raise DeckRuleError(outcome.reason or "the pool cannot fill those colors")
+    main: dict[str, int] = {}
+    for entry in outcome.deck.get("main") or []:
+        qty = int(entry["count"])  # the gauntlet builder's contract
+        main[entry["name"]] = main.get(entry["name"], 0) + qty
+    replaced = state.session.quantities("cards")
+    state.seed_undo = replaced
+    state.session.replace_zone("cards", main)
+    return {
+        "colors": "".join(wanted),
+        "cards": sum(main.values()),
+        "lands": lands,
+        "replaced": sum(replaced.values()),
+    }
+
+
+def undo_seed(state: ForgeState) -> None:
+    """Put back the main deck the last seed replaced — one level, quantities only
+    (a printing pinned on a replaced card is not restored), and whatever was
+    edited since the seed goes with it. The pool is untouched, so the restored deck
+    is still drawn from it. Raises ``DeckRuleError`` outside a pool-bounded build
+    or when there is nothing to undo."""
+    if not state.session.pool_bounded:
+        raise DeckRuleError("only a sealed / draft build has a seed to undo")
+    if state.seed_undo is None:
+        raise DeckRuleError("nothing to undo — no seed has replaced this deck")
+    state.session.replace_zone("cards", state.seed_undo)
+    state.seed_undo = None
+
+
+SIGNALS_INDEX_JOB = "signals-index"
+SIGNALS_INDEX_LABEL = "Building the card-signal index"
+
+
+def record_busy(
+    state: ForgeState, job: str, label: str, done: int, total: int
+) -> dict | None:
+    """The state transition behind the busy meter: fold one progress report from a
+    long hub job (the one-time signals-index build; a cold commander-discovery
+    sweep) into ``state.busy`` — done, total, and a time-left estimate from the
+    pace so far — and return it (None once the job has finished, which also
+    clears it). ONE meter, first job wins: while a job is in flight a report from
+    a different ``job`` id is ignored (``state.busy`` unchanged, returned as is),
+    so two concurrent passes (a launch warm and a foreground discover) can never
+    fight over the bar or clear each other's. Pure state; the transport adapter
+    owns the broadcast."""
+    now = time.monotonic()
+    prior = state.busy
+    if prior and prior.get("job") != job:
+        return prior  # another job holds the meter until it finishes
+    started = prior["started"] if prior and prior.get("started") else now
+    finished = bool(total) and done >= total
+    if finished:
+        state.busy = None
+        return None
+    elapsed = now - started
+    eta = (elapsed / done) * (total - done) if done and total else None
+    state.busy = {
+        "job": job,
+        "label": label,
+        "done": done,
+        "total": total,
+        "eta_s": None if eta is None else round(eta),
+        "started": started,
+    }
+    return state.busy
+
+
+def tune_params(
+    state: ForgeState,
+    *,
+    budget: float | None,
+    wildcard_budget: dict[str, int] | None,
+    max_swaps: int,
+    shape_override: str | None,
+    suggest_commander: bool,
+    exclude: Collection[str] = (),
+    meta: arena_meta.MetaContext | None = None,
+) -> TuneParams:
+    """The tuner's parameters for THIS build — transport only: the medium and both
+    purses go through as-is, and ``tune`` asks the Format which currency and which
+    candidate pool the medium means (ADR-0045). ``max_swaps`` is capped high enough
+    to FILL a near-empty deck (an under-sized build can need ~40+ adds to reach 100).
+    ``exclude`` is the adds the builder rejected this session — the browser holds
+    the list per build and sends it with every run, so a rejected card's slot is
+    re-sourced from the next candidate.
+    """
+    return TuneParams(
+        budget=budget,
+        wildcard_budget=wildcard_budget,
+        max_swaps=max(0, min(max_swaps, 99)),
+        shape_override=shape_override,
+        suggest_commander=suggest_commander,
+        medium=state.session.medium,
+        exclude=frozenset(exclude),
+        meta=meta,
+    )
+
+
 def finalize_state(state: ForgeState) -> dict:
-    """The finalize REPORT (not the gating decision — the route owns the override)."""
+    """The finalize REPORT (not the gating decision — the route owns the override).
+    ``below_minimum`` is the one hard fact a size-minimum family adds: a deck under
+    its CR floor is illegal, not a judgment call, so the route never lets an
+    override lift it (the land gate stays overridable)."""
     hd = hydrate_session(state)
     mana = mana_audit(hd)
     avg_cmc = deck_stats(hd).get("avg_cmc", 0.0)
     cheap_ca = sum(
-        1 for r in hd.expanded() if "card_draw" in role_of(r) and r.get("cmc", 0) <= 2
+        1
+        for r in hd.expanded(zones=built_zones(state))
+        if "card_draw" in role_of(r) and r.get("cmc", 0) <= 2
     )
     defensible = avg_cmc <= _DEFENSIBLE_AVG_CMC and cheap_ca >= _DEFENSIBLE_CHEAP_CA
-    warnings = legality_warnings(hd, max_cards=state.session.deck_size)
+    audit = legality_audit(hd)
+    warnings = legality_warnings(hd, audit=audit)
+    deck_minimum = None
+    if hd.format.size_is_minimum:
+        short = audit["violations"].get("deck_minimum") or []
+        if short:
+            deck_minimum = {
+                "total": short[0]["total_cards"],
+                "minimum": short[0]["minimum"],
+            }
     return {
-        "land_status": mana["land_count_status"],
+        "below_minimum": deck_minimum is not None,
+        "deck_minimum": deck_minimum,
+        "land_status": mana["land_band"]["status"],
         "land_count": mana["land_count"],
-        "recommended_land_count": mana["recommended_land_count"],
+        "land_band": mana["land_band"],
         "evidence": {
             "avg_cmc": avg_cmc,
             "cheap_card_advantage": cheap_ca,
@@ -1015,20 +1372,6 @@ def ranked_deck_signals(state: ForgeState, hydrated: list[dict]) -> list:
     return rank_deck_signals(
         hydrated, commander_names, resolve_object=state.object_resolver
     )
-
-
-def signal_dict(signal: Signal) -> dict:
-    spec = spec_for(signal)
-    return {
-        "key": signal.key,
-        "scope": signal.scope,
-        "subject": signal.subject,
-        "source": signal.source,
-        "confidence": signal.confidence,
-        "label": spec.label if spec else signal.key,
-        "avenue": spec.avenue if spec else "",
-        "actionable": spec is not None,
-    }
 
 
 def avenues(state: ForgeState, hydrated: list[dict]) -> list[dict]:
@@ -1196,6 +1539,9 @@ class FindParams:
     sort: str = "cmc-asc"
     limit: int = 25
     offset: int = 0
+    # ADR-0059: the build's Arena meta archetype, as Tune takes it — None matches the
+    # deck from the arena-meta cache, "off" skips it, anything else names one.
+    meta_archetype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1253,7 +1599,9 @@ def refine_filters(base: dict, params: FindParams) -> dict:
 
 def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
     """The unified Find pipeline (ADR-0015) as a free function over ForgeState — the
-    candidate-pipeline extraction ADR-0013 parked. Three branches on focus state:
+    candidate-pipeline extraction ADR-0013 parked. Lane searches are scoped to
+    ``deck_colors`` (the identity under a commander, the castable colors otherwise).
+    Three branches on focus state:
 
     * FOCUSED avenues → OR-merge each lane's pool (a Staples lane resolves the curated
       name pool via ``staple_pool``; others ``search_fn`` the lane's ``explore_filters``
@@ -1262,16 +1610,29 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
     * no focus but user FILTERS → a manual ``search_fn`` scored against everything.
     * neither → an empty page (an idle prompt, not the whole vault).
 
-    Strips cards already in the deck, then returns the requested window of ranked rows.
-    The route serializes the rows and annotates ownership; this stops at ranked records.
+    Strips cards the deck already runs every allowed copy of (``at_copy_limit``: a
+    singleton's one, a 4-of's four, a basic's never), then returns the requested
+    window of ranked rows. The route serializes the rows and annotates ownership;
+    this stops at ranked records.
+
+    On a digital build with a tunable meta archetype in the cache (:func:`meta_context`,
+    the gate Tune reads through), the archetype's card share breaks synergy ties
+    (ADR-0059); without one the ranking is synergy, price, curve, as before.
     """
     fmt = state.session.format
-    ci = deck_color_identity(state)
+    ci = deck_colors(state)
     hd = hydrate_session(state)
-    sigs = ranked_deck_signals(state, hd.records)
-    all_avenues = avenues(state, hd.records)
+    deck_records = hd.deck_records()
+    sigs = ranked_deck_signals(state, deck_records)
+    all_avenues = avenues(state, deck_records)
     focused = [a for a in all_avenues if a.get("focused")]
-    in_deck = set(state.session.card_names())
+    search = search_for(state, hd)
+    meta = (
+        meta_context(state, hd, params.meta_archetype)
+        if focused or has_user_filters(params)
+        else None
+    )
+    meta_share = meta.share if meta is not None else None
 
     if focused:
         pool: dict[str, dict] = {}
@@ -1280,9 +1641,9 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
                 found = staple_pool(state)
             else:
                 base = explore_filters(av["search"], color_identity=ci, fmt=fmt)
-                found = state.search_fn(
+                found = search(
                     limit=_FIND_POOL,
-                    paper_only=paper_only(fmt),
+                    paper_only=FORMATS[fmt].paper_only(state.session.medium),
                     include_unreleased=params.include_unreleased,
                     **refine_filters(base, params),
                 )
@@ -1290,8 +1651,8 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
                 cname = card.get("name")
                 if cname:
                     pool.setdefault(cname, card)
-        cands = [c for c in pool.values() if c.get("name") not in in_deck]
-        active, avs = scoring_basis(state, hd.records, sigs, focused)
+        cands = [c for c in pool.values() if not at_copy_limit(state, c)]
+        active, avs = scoring_basis(state, deck_records, sigs, focused)
         # The partner avenue ranks by color widening first (ADR-0019): pass the deck's
         # current identity as the widening base when it is among the focused lanes, so
         # the broadest color-openers surface above synergy.
@@ -1305,9 +1666,11 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
             avenues=avs,
             widening_base=widening_base,
             rank_by="fit",
+            deck_mana=hd.deck_mana,
+            meta_share=meta_share,
         )
     elif has_user_filters(params):
-        records = state.search_fn(
+        records = search(
             color_identity=params.color_identity,
             exact_colors=params.exact_colors,
             oracle=params.oracle,
@@ -1318,7 +1681,11 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
             price_min=params.price_min,
             price_max=params.price_max,
             format=params.format,
-            paper_only=paper_only(params.format),
+            # The pool follows the BUILD (its format under its medium), not the
+            # filter's format: a paper table filtering by another format still buys
+            # paper printings. No format filter → no pool restriction, as before.
+            paper_only=params.format is not None
+            and state.session.fmt.paper_only(state.session.medium),
             include_unreleased=params.include_unreleased,
             preset_names=tuple(params.presets),
             is_commander_filter=params.is_commander,
@@ -1326,8 +1693,14 @@ def find_candidates(state: ForgeState, params: FindParams) -> CandidatePage:
             limit=_FIND_POOL,
             offset=0,
         )
-        cands = [c for c in records if c.get("name") not in in_deck]
-        ranked = rank_candidates(cands, active_signals=sigs, avenues=all_avenues)
+        cands = [c for c in records if not at_copy_limit(state, c)]
+        ranked = rank_candidates(
+            cands,
+            active_signals=sigs,
+            avenues=all_avenues,
+            deck_mana=hd.deck_mana,
+            meta_share=meta_share,
+        )
     else:
         ranked = []
 
@@ -1413,6 +1786,19 @@ def render_proxies(
     return len(items)
 
 
+def budgets(state: ForgeState) -> dict:
+    """The deck rule behind ``GET /api/budgets``: the family's template rows over
+    the main deck (a sideboard fills no slot), lands from the mana audit's band."""
+    hd = hydrate_session(state)
+    return banded_slot_budgets(
+        hd.expanded(zones=("cards",)),
+        mana_audit(hd)["land_band"],
+        deck_size=state.session.deck_size,
+        template=template_for(hd.format.family),
+        deck_mana=hd.deck_mana,
+    )
+
+
 def snapshot(state: ForgeState) -> dict:
     """The full canonical snapshot the SPA renders — the engine's composition root.
     Builds ONE HydratedDeck and threads it to every sub-analysis, so a request hits the
@@ -1421,30 +1807,173 @@ def snapshot(state: ForgeState) -> dict:
     stats = deck_stats(hd)
     owned = owned_quantities(state)
     mana = mana_audit(hd)
-    # ADR-0041: thread the commander's colors/CMC so the Budgets panel's "lands"
-    # row uses the same deck-specific band as the mana section's own verdict,
-    # instead of the static 36-38 Command Zone row.
-    burgess_info = mana.get("burgess_formula") or {}
+    fmt = hd.format
     return {
         "build_id": state.build_id,
         "build_name": state.build_name,
-        "deck": views.deck_view(state, owned, functools.partial(printing_owned, state)),
-        "stats": stats,
-        "bracket": detect_bracket(hd.records, stats.get("avg_cmc", 0.0)),
-        "mana": mana,
-        "budgets": slot_budgets(
-            hd.expanded(),
-            deck_size=state.session.deck_size,
-            colors=burgess_info.get("colors"),
-            commander_cmc=burgess_info.get("commander_cmc"),
+        # The long hub job in flight (the first-launch signals-index build), so a
+        # tab that opens mid-build shows the meter; None when idle.
+        "busy": state.busy,
+        # The format table the SPA's pickers read (labels, media, size choices) — the
+        # Format is the one authority; the SPA never mirrors it (ADR-0045).
+        "format_options": format_options(),
+        "deck": views.deck_view(
+            state,
+            owned,
+            functools.partial(printing_owned, state),
+            functools.partial(copy_limit, state),
+            functools.partial(coverage, state, owned),
         ),
-        "signals": [signal_dict(s) for s in ranked_deck_signals(state, hd.records)],
-        "avenues": avenues(state, hd.records),
-        "warnings": legality_warnings(hd, max_cards=state.session.deck_size),
+        "stats": stats,
+        # Commander brackets are WotC's multiplayer-Commander system: a constructed
+        # build has none, and the SPA drops the pill on null.
+        "bracket": (
+            detect_bracket(hd.deck_records(), stats.get("avg_cmc", 0.0))
+            if fmt.has_commander
+            else None
+        ),
+        # The colors Find scopes lane searches to (identity or castable, by family).
+        "deck_colors": deck_colors(state),
+        "mana": mana,
+        "budgets": banded_slot_budgets(
+            hd.expanded(zones=("cards",)),
+            mana["land_band"],
+            deck_size=state.session.deck_size,
+            template=template_for(fmt.family),
+            deck_mana=hd.deck_mana,
+        ),
+        # The counted deck (commanders + main deck): a sideboard or an opened pool
+        # never shapes the avenues.
+        "signals": [
+            views.signal_view(s) for s in ranked_deck_signals(state, hd.deck_records())
+        ],
+        "avenues": avenues(state, hd.deck_records()),
+        "warnings": legality_warnings(hd),
         "collection": collection_summary(state, owned),
         "wildcards": wildcard_cost(state),
+        # The pool panel for a sealed / draft build (None otherwise).
+        "pool": pool_readout(state, hd),
         # True when a second commander could still be added (CR 702.124 partner /
         # Background): the Find color pips stay unlocked so an off-identity partner is
         # findable; otherwise they lock to the commander's identity (A5).
         "partner_open": partner_search(state) is not None,
     }
+
+
+# --- The Arena meta (ADR-0059) ------------------------------------------------------
+# The hub reads only the arena-meta cache: Tune never waits on a browser, and the
+# Meta panel's Refresh is the one fetch. ``untapped.deck_queue`` picks the queue for
+# both, so the panel and Tune always read the same one.
+
+
+def meta_context(
+    state: ForgeState, hd: HydratedDeck, archetype: str | None = None
+) -> arena_meta.MetaContext | None:
+    """The tuner's meta context for this build, from the cache (``None`` for a
+    paper build, an uncached queue, ``archetype="off"``, no match, or an archetype
+    too thin to tune by — ``arena_meta.tunable``). ``archetype`` is passed through
+    as the one choice ``untapped.cached_deck_context`` decodes. Memoized on
+    ``state.meta_memo`` until the deck, its medium, the choice or the cached
+    snapshot changes, so Find reads it per keystroke for the cost of a ``stat``."""
+    medium = state.session.medium
+    key = (
+        json.dumps(state.session.to_deck_dict(), sort_keys=True),
+        medium,
+        archetype,
+    )
+    queue = untapped.deck_queue(hd)
+    snap = queue[2] if queue is not None else None
+    memo = state.meta_memo
+    if memo is not None and memo[0] == key and memo[1] is snap:
+        return memo[2]
+    ctx, _note = untapped.cached_deck_context(hd, medium, archetype=archetype)
+    state.meta_memo = (key, snap, ctx)
+    return ctx
+
+
+def meta_report(
+    state: ForgeState,
+    hd: HydratedDeck,
+    *,
+    archetype: str | None = None,
+    ranks: tuple[str, ...] = arena_meta.DEFAULT_RANKS,
+    previous: bool = False,
+    wildcards: Mapping[str, int] | None = None,
+) -> dict:
+    """The Meta panel: the cached report for this build's queue, the deck's match
+    (each core card marked by whether the deck runs it), and the lists the active
+    Collection can build within ``wildcards`` (a digital build with bulk)."""
+    queue = untapped.deck_queue(hd)
+    if queue is None:
+        return {
+            "available": False,
+            "reason": f"{hd.format.label} has no Arena queue Untapped tracks",
+        }
+    event, bo3, snap = queue
+    if previous:
+        snap = untapped.cached_snapshot(event, previous=True)
+    out: dict = {
+        "available": True,
+        "event": event,
+        "signed_in": untapped.profile_dir().exists(),
+        "cached": snap is not None,
+    }
+    if snap is None:
+        return out
+    cost = None
+    rarity = _rarity_index(state)
+    if not is_paper(state) and rarity is not None:
+        owned = {normalize_card_name(n): q for n, q in owned_collection(state).items()}
+        cost = wildcard_cost_fn(owned, rarity, sideboard=bo3)
+    age = untapped.snapshot_age_hours(snap)
+    out.update(
+        age_hours=None if age is None else round(age, 1),
+        stale=untapped.snapshot_is_stale(snap),
+        report=build_report(
+            snap,
+            ranks=ranks,
+            match=arena_meta.resolve(
+                snap,
+                deck=hd.deck,
+                archetype=archetype,
+                ranks=ranks,
+                lands=untapped.deck_lands(hd),
+            ),
+            held=arena_meta.deck_card_names(hd.deck),
+            cost=cost,
+            wildcards=wildcards,
+        ),
+    )
+    return out
+
+
+def arena_wildcards() -> dict:
+    """The player's Arena wildcard counts, the seed for the SPA's wildcard budget
+    (ADR-0059): ``{"wildcards": {mythic, rare, uncommon, common} | None, "source":
+    "arena-log" | None, "captured_local": <the login's local time> | None}``, read
+    from this machine's Arena log by ``mtga_import.read_arena_wildcards`` (local
+    only, never raises). No log, or none holding the counts, answers
+    ``wildcards: None``."""
+    found = read_arena_wildcards()
+    return {
+        "wildcards": found["wildcards"] if found else None,
+        "source": "arena-log" if found else None,
+        "captured_local": found["captured_local"] if found else None,
+    }
+
+
+def refresh_meta(
+    state: ForgeState,
+    hd: HydratedDeck,
+    *,
+    previous: bool = False,
+    force: bool = True,
+) -> None:
+    """Fetch this build's own queue (``untapped.deck_queues``' first — never the
+    fallback it may be reading) into the cache: always when ``force``, else only
+    when stale. Blocking; raises ``untapped.MetaError`` with what to do."""
+    queues = untapped.deck_queues(hd)
+    if not queues:
+        raise untapped.MetaError(f"{hd.format.label} has no Arena queue")
+    pool = CardPool.load(state.bulk_path) if state.bulk_path is not None else None
+    untapped.load_snapshot(queues[0][0], previous=previous, refresh=force, pool=pool)

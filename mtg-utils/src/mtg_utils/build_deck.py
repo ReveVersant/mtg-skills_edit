@@ -9,13 +9,15 @@ from pathlib import Path
 import click
 
 from mtg_utils.card_classify import build_card_lookup
-from mtg_utils.format_config import get_format_config
+from mtg_utils.card_pool import CardPool
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option, resolve_bulk_path
+from mtg_utils.formats import Format
 from mtg_utils.hydrated_deck import HydratedDeck
 from mtg_utils.names import normalize_card_name
 from mtg_utils.scryfall_lookup import lookup_single
 
 
-def _normalize_entry(entry: str | dict) -> dict:
+def normalize_entry(entry: str | dict) -> dict:
     """Normalize a cut/add entry to {"name": str, "quantity": int}."""
     if isinstance(entry, str):
         return {"name": entry, "quantity": 1}
@@ -94,8 +96,8 @@ def build_deck(
     """
     new_deck = copy.deepcopy(deck)
 
-    cuts = [_normalize_entry(c) for c in cuts]
-    adds = [_normalize_entry(a) for a in adds]
+    cuts = [normalize_entry(c) for c in cuts]
+    adds = [normalize_entry(a) for a in adds]
 
     # Apply mainboard cuts and adds
     cards = new_deck.get("cards", [])
@@ -109,11 +111,11 @@ def build_deck(
         if sideboard_cuts:
             sb_unmatched = _apply_cuts(
                 sb,
-                [_normalize_entry(c) for c in sideboard_cuts],
+                [normalize_entry(c) for c in sideboard_cuts],
             )
             unmatched_cuts.extend(f"(sideboard) {n}" for n in sb_unmatched)
         if sideboard_adds:
-            _apply_adds(sb, [_normalize_entry(a) for a in sideboard_adds])
+            _apply_adds(sb, [normalize_entry(a) for a in sideboard_adds])
         new_deck["sideboard"] = sb
 
     # Recompute the persisted totals so the returned ``.deck`` is final. This used to
@@ -137,6 +139,26 @@ def build_deck(
     return hd, unmatched_cuts
 
 
+def lookup_missing_adds(
+    adds: list[dict], hydrated: list[dict | None], bulk_path: Path | None
+) -> list[dict]:
+    """Records for the added cards the deck doesn't already hold, looked up once
+    each; a name nothing resolves is warned on stderr and left out."""
+    known = {c["name"] for c in hydrated if c}
+    found: list[dict] = []
+    for add in adds:
+        name = add["name"]
+        if name in known:
+            continue
+        card = lookup_single(name, bulk_path=bulk_path)
+        if card:
+            found.append(card)
+            known.add(name)
+        else:
+            click.echo(f"Warning: card not found in Scryfall: {name}", err=True)
+    return found
+
+
 def _count_total(deck: dict) -> tuple[int, int]:
     """Return (mainboard_total, sideboard_total)."""
     main = 0
@@ -149,7 +171,7 @@ def _count_total(deck: dict) -> tuple[int, int]:
 
 @click.command()
 @click.argument("deck_json", type=click.Path(exists=True, path_type=Path))
-@click.argument("hydrated_json", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option(
     "--cuts", "cuts_json", type=click.Path(exists=True, path_type=Path), default=None
 )
@@ -170,7 +192,6 @@ def _count_total(deck: dict) -> tuple[int, int]:
     default=None,
     help="JSON file of sideboard adds.",
 )
-@click.option("--bulk-data", type=click.Path(exists=True, path_type=Path), default=None)
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path),
@@ -179,25 +200,27 @@ def _count_total(deck: dict) -> tuple[int, int]:
 )
 def main(
     deck_json: Path,
-    hydrated_json: Path,
+    bulk_data: Path | None,
     cuts_json: Path | None,
     adds_json: Path | None,
     sb_cuts_json: Path | None,
     sb_adds_json: Path | None,
-    bulk_data: Path | None,
     output_dir: Path,
 ) -> None:
-    """Apply cuts and adds to a deck, writing new-deck.json and new-hydrated.json."""
+    """Apply cuts and adds to DECK_JSON, writing new-deck.json (with its hydrated
+    sidecar) to the output directory."""
     if output_dir is None:
         output_dir = deck_json.parent
 
-    deck = json.loads(deck_json.read_text(encoding="utf-8"))
-    hydrated: list[dict | None] = json.loads(hydrated_json.read_text(encoding="utf-8"))
+    hd_in = acquire_for_cli(deck_json, bulk_data)
+    bulk_path = resolve_bulk_path(bulk_data)
+    deck = hd_in.deck
+    hydrated: list[dict | None] = list(hd_in.records)
 
     raw_cuts = json.loads(cuts_json.read_text(encoding="utf-8")) if cuts_json else []
-    cuts: list[dict] = [_normalize_entry(c) for c in raw_cuts]
+    cuts: list[dict] = [normalize_entry(c) for c in raw_cuts]
     raw_adds = json.loads(adds_json.read_text(encoding="utf-8")) if adds_json else []
-    adds: list[dict] = [_normalize_entry(a) for a in raw_adds]
+    adds: list[dict] = [normalize_entry(a) for a in raw_adds]
 
     raw_sb_cuts = (
         json.loads(sb_cuts_json.read_text(encoding="utf-8")) if sb_cuts_json else None
@@ -206,21 +229,10 @@ def main(
         json.loads(sb_adds_json.read_text(encoding="utf-8")) if sb_adds_json else None
     )
 
-    # Look up any added cards not already in hydrated
-    hydrated_names = {c["name"] for c in hydrated if c}
-    extra_hydrated: list[dict] = []
     all_adds = list(adds)
     if raw_sb_adds:
-        all_adds.extend(_normalize_entry(a) for a in raw_sb_adds)
-    for add in all_adds:
-        name = add["name"]
-        if name not in hydrated_names:
-            card = lookup_single(name, bulk_path=bulk_data)
-            if card:
-                extra_hydrated.append(card)
-                hydrated_names.add(name)
-            else:
-                click.echo(f"Warning: card not found in Scryfall: {name}", err=True)
+        all_adds.extend(normalize_entry(a) for a in raw_sb_adds)
+    extra_hydrated = lookup_missing_adds(all_adds, hydrated, bulk_path)
 
     hd, unmatched_cuts = build_deck(
         deck,
@@ -238,16 +250,22 @@ def main(
 
     # build_deck has already recomputed and persisted the post-build totals onto
     # ``hd.deck`` (see its docstring); the CLI only reads them for size warnings.
-    config = get_format_config(new_deck)
+    fmt = Format.for_deck(new_deck)
     main_total = new_deck["total_cards"]
     sb_total = new_deck["total_sideboard"]
-    deck_size = config["deck_size"]
-    if main_total != deck_size:
+    deck_size = fmt.deck_size
+    if fmt.size_is_minimum and main_total < fmt.min_deck_size:
+        click.echo(
+            f"Warning: mainboard has {main_total} cards (at least "
+            f"{fmt.min_deck_size} needed)",
+            err=True,
+        )
+    elif not fmt.size_is_minimum and main_total != deck_size:
         click.echo(
             f"Warning: mainboard has {main_total} cards (expected {deck_size})",
             err=True,
         )
-    sb_size = config.get("sideboard_size", 0)
+    sb_size = fmt.sideboard_size
     if sb_size and sb_total > sb_size:
         click.echo(
             f"Warning: sideboard has {sb_total} cards (max {sb_size})",
@@ -256,10 +274,9 @@ def main(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "new-deck.json").write_text(
-        json.dumps(new_deck, indent=2), encoding="utf-8"
-    )
-    (output_dir / "new-hydrated.json").write_text(
-        json.dumps(hd.records, indent=2), encoding="utf-8"
-    )
-    click.echo(f"Wrote new-deck.json and new-hydrated.json to {output_dir}")
+    new_deck_path = output_dir / "new-deck.json"
+    new_deck_path.write_text(json.dumps(new_deck, indent=2), encoding="utf-8")
+    # Memoize the in-process join beside the new deck so the next tool reads it
+    # instead of re-joining (and keeps any API-fetched add without a second fetch).
+    hd.write_sidecar(new_deck_path, CardPool.load(bulk_path))
+    click.echo(f"Wrote new-deck.json to {output_dir}")

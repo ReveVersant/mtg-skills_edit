@@ -3,9 +3,11 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from mtg_utils.price_check import check_prices, main
+from mtg_utils.testkit import printing_row, test_card, test_printing
 
 
 class TestCheckPrices:
@@ -108,7 +110,7 @@ class TestCheckPrices:
     def test_owned_cards_zero_quantity_not_owned(self):
         """A zero-quantity ``owned_cards`` entry (e.g. a Moxfield wishlist
         row) is not treated as owned — price-check charges full price.
-        This pins the ``_normalize_owned_cards`` qty<1 skip behavior so a
+        This pins the ``owned_quantities`` qty<1 skip behavior so a
         future refactor can't silently let wishlist rows zero out budgets.
         """
         cards_data = [
@@ -346,24 +348,11 @@ class TestArenaWildcardMode:
         assert result["cards"][0]["owned"] is True
         assert result["cards"][0]["wildcards_needed"] == 0
 
-    def test_arena_4cap_exempt_card_charges_literal_shortfall(self, tmp_path):
-        """For cards with oracle exemption (any-number / up-to-N), owning
-        4 does NOT grant infinite supply — a deck running 17 Hare
-        Apparent with 4 owned needs 13 wildcards."""
-        cards = [
-            {
-                "name": "Hare Apparent",
-                "rarity": "common",
-                "legalities": {"brawl": "legal"},
-                "games": ["arena"],
-                "prices": {},
-                "oracle_text": (
-                    "When this creature enters, create a number of 1/1 white Rabbit creature tokens equal to the number of other creatures you control named Hare Apparent.\nA deck can have any number of cards named Hare Apparent."
-                ),
-            },
-        ]
+    def test_arena_4cap_covers_any_number_cards(self, tmp_path):
+        """Arena's 4-copies-means-unlimited rule covers "any number" cards too:
+        owning 4 Hare Apparent lets a deck run 17 of them for 0 wildcards."""
         bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
+        bulk_path.write_text(json.dumps([_arena_printing("Hare Apparent", "common")]))
 
         deck = {
             "format": "historic_brawl",
@@ -372,60 +361,15 @@ class TestArenaWildcardMode:
             "owned_cards": [{"name": "Hare Apparent", "quantity": 4}],
         }
         result = check_prices(deck, bulk_path=bulk_path)
-        assert result["wildcard_cost"]["common"] == 13
-        assert result["cards"][0]["owned"] is False
-        assert result["cards"][0]["wildcards_needed"] == 13
-
-    def test_arena_4cap_exempt_card_fully_owned(self, tmp_path):
-        """Exempt card where owned >= deck_qty: 0 wildcards."""
-        cards = [
-            {
-                "name": "Hare Apparent",
-                "rarity": "common",
-                "legalities": {"brawl": "legal"},
-                "games": ["arena"],
-                "prices": {},
-                "oracle_text": (
-                    "When this creature enters, create a number of 1/1 white Rabbit creature tokens equal to the number of other creatures you control named Hare Apparent.\nA deck can have any number of cards named Hare Apparent."
-                ),
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-
-        deck = {
-            "format": "historic_brawl",
-            "commanders": [],
-            "cards": [{"name": "Hare Apparent", "quantity": 7}],
-            "owned_cards": [{"name": "Hare Apparent", "quantity": 10}],
-        }
-        result = check_prices(deck, bulk_path=bulk_path)
         assert result["wildcard_cost"]["common"] == 0
         assert result["cards"][0]["owned"] is True
+        assert result["cards"][0]["wildcards_needed"] == 0
 
-    def test_arena_4cap_exempt_up_to_n_card(self, tmp_path):
-        """The "up to N" exemption variant (Seven Dwarves, Nazgul) must
-        also suppress the Arena 4-cap substitution: owning 4 Seven
-        Dwarves when the deck wants 7 should charge 3 wildcards, not 0.
-
-        The ``exempt_from_4cap`` flag on ``build_rarity_index`` is
-        already unit-tested for the up-to-N oracle pattern; this test
-        closes the end-to-end loop through ``_check_arena_wildcards``.
-        """
-        cards = [
-            {
-                "name": "Seven Dwarves",
-                "rarity": "rare",
-                "legalities": {"historicbrawl": "legal", "brawl": "legal"},
-                "games": ["arena"],
-                "prices": {},
-                "oracle_text": (
-                    "This creature gets +1/+1 for each other creature named Seven Dwarves you control.\nA deck can have up to seven cards named Seven Dwarves."
-                ),
-            },
-        ]
+    def test_arena_4cap_covers_up_to_n_cards(self, tmp_path):
+        """The "up to N" variant (Seven Dwarves, Nazgul) is covered the same way:
+        owning 4 Seven Dwarves fills all 7 slots."""
         bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
+        bulk_path.write_text(json.dumps([_arena_printing("Seven Dwarves", "common")]))
 
         deck = {
             "format": "historic_brawl",
@@ -434,27 +378,48 @@ class TestArenaWildcardMode:
             "owned_cards": [{"name": "Seven Dwarves", "quantity": 4}],
         }
         result = check_prices(deck, bulk_path=bulk_path)
-        assert result["wildcard_cost"]["rare"] == 3
-        assert result["cards"][0]["wildcards_needed"] == 3
-        assert result["cards"][0]["owned"] is False
+        assert result["wildcard_cost"]["common"] == 0
+        assert result["cards"][0]["wildcards_needed"] == 0
+
+    def test_arena_basic_lands_are_free(self, tmp_path):
+        """Arena gives every player unlimited basic lands: 32 unowned Forests
+        cost no wildcards and count as owned."""
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(json.dumps([_arena_printing("Forest", "common")]))
+
+        deck = {
+            "format": "historic_brawl",
+            "commanders": [],
+            "cards": [{"name": "Forest", "quantity": 32}],
+            "owned_cards": [],
+        }
+        result = check_prices(deck, bulk_path=bulk_path)
+        assert result["wildcard_cost"]["common"] == 0
+        assert result["cards"][0]["owned"] is True
+        assert result["cards"][0]["wildcards_needed"] == 0
+        assert result["owned_cards_count"] == 1
+
+    def test_arena_snow_basics_are_collected_not_free(self, tmp_path):
+        """Only the six basic land types are free on Arena: Snow-Covered basics are
+        collected like any card, so unowned ones cost wildcards."""
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(
+            json.dumps([_arena_printing("Snow-Covered Forest", "common")])
+        )
+        deck = {
+            "format": "historic_brawl",
+            "commanders": [],
+            "cards": [{"name": "Snow-Covered Forest", "quantity": 2}],
+            "owned_cards": [],
+        }
+        result = check_prices(deck, bulk_path=bulk_path)
+        assert result["wildcard_cost"]["common"] == 2
 
     def test_arena_partial_ownership_under_4cap(self, tmp_path):
-        """Owning 1-3 copies of a normal card does NOT trigger the 4-cap
-        substitution; the deck still needs wildcards for the shortfall.
-        (In singleton Historic Brawl with owned=1, this is the no-op
-        "fully owned" case, so construct a non-singleton deck.)"""
-        cards = [
-            {
-                "name": "Persistent Petitioners",
-                "rarity": "common",
-                "legalities": {"brawl": "legal"},
-                "games": ["arena"],
-                "prices": {},
-                "oracle_text": (
-                    "{1}, {T}: Target player mills a card. (They put the top card of their library into their graveyard.)\nTap four untapped Advisors you control: Target player mills twelve cards.\nA deck can have any number of cards named Persistent Petitioners."
-                ),
-            },
-        ]
+        """Owning 1-3 copies does NOT trigger the 4-cap substitution; the deck
+        still needs wildcards for the shortfall. (An "any number" card, since
+        a singleton deck with owned=1 is the no-op "fully owned" case.)"""
+        cards = [_arena_printing("Persistent Petitioners", "common")]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
 
@@ -513,15 +478,10 @@ class TestArenaIllegalOrMissing:
         return bulk_path
 
     def test_illegal_card_goes_to_illegal_or_missing(self, tmp_path):
-        # Sol Ring is only Commander-legal; not in the Brawl rarity index.
+        # Sol Ring is only Commander-legal (brawl: not_legal); not in the Brawl
+        # rarity index.
         bulk = [
-            {
-                "name": "Sol Ring",
-                "rarity": "uncommon",
-                "legalities": {"commander": "legal", "brawl": "not_legal"},
-                "games": ["arena"],
-                "prices": {},
-            },
+            _arena_printing("Sol Ring", "uncommon"),
         ]
         bulk_path = self._bulk_with(tmp_path, bulk)
 
@@ -537,20 +497,8 @@ class TestArenaIllegalOrMissing:
     def test_illegal_card_not_counted_in_wildcards(self, tmp_path):
         """A banned card must not inflate the rare wildcard count."""
         bulk = [
-            {
-                "name": "Sol Ring",
-                "rarity": "uncommon",
-                "legalities": {"commander": "legal", "brawl": "not_legal"},
-                "games": ["arena"],
-                "prices": {},
-            },
-            {
-                "name": "Cultivate",
-                "rarity": "common",
-                "legalities": {"brawl": "legal"},
-                "games": ["arena"],
-                "prices": {},
-            },
+            _arena_printing("Sol Ring", "uncommon"),
+            _arena_printing("Cultivate", "common"),
         ]
         bulk_path = self._bulk_with(tmp_path, bulk)
 
@@ -566,13 +514,7 @@ class TestArenaIllegalOrMissing:
 
     def test_illegal_card_entry_marked_not_legal(self, tmp_path):
         bulk = [
-            {
-                "name": "Sol Ring",
-                "rarity": "uncommon",
-                "legalities": {"commander": "legal", "brawl": "not_legal"},
-                "games": ["arena"],
-                "prices": {},
-            },
+            _arena_printing("Sol Ring", "uncommon"),
         ]
         bulk_path = self._bulk_with(tmp_path, bulk)
 
@@ -589,13 +531,7 @@ class TestArenaIllegalOrMissing:
         from mtg_utils.price_check import render_text_report
 
         bulk = [
-            {
-                "name": "Sol Ring",
-                "rarity": "uncommon",
-                "legalities": {"brawl": "not_legal"},
-                "games": ["arena"],
-                "prices": {},
-            },
+            _arena_printing("Sol Ring", "uncommon"),
         ]
         bulk_path = self._bulk_with(tmp_path, bulk)
 
@@ -610,29 +546,18 @@ class TestArenaIllegalOrMissing:
         assert "illegal or not on Arena" in text
 
 
-class TestCompetitiveBrawlBanOverrides:
-    """``competitive_brawl`` shares the ``brawl`` legality key but not its ban
-    list (format_config ``ignores_legality_key_bans`` + ``banned_cards``).
-    ``price-check`` must cost a brawl-banned staple as a normal craft, not
-    report it under ``illegal_or_missing`` — and must still reject the
-    format's own by-name bans."""
+class TestCompetitiveBrawlBanList:
+    """``competitive_brawl`` reads its own ``competitivebrawl`` key, whose ban list
+    differs from ordinary Brawl's. ``price-check`` must cost a brawl-banned staple
+    as a normal craft, not report it under ``illegal_or_missing`` — and must still
+    reject the format's own bans."""
 
     def _bulk(self, tmp_path):
+        # Both are banned under the ``brawl`` key and printed on Arena; only Oko
+        # is banned under ``competitivebrawl``.
         cards = [
-            {
-                "name": "Force of Will",
-                "rarity": "mythic",
-                "legalities": {"brawl": "banned"},
-                "games": ["arena"],
-                "prices": {},
-            },
-            {
-                "name": "Oko, Thief of Crowns",
-                "rarity": "mythic",
-                "legalities": {"brawl": "banned"},
-                "games": ["arena"],
-                "prices": {},
-            },
+            _arena_printing("Tainted Pact", "mythic"),
+            _arena_printing("Oko, Thief of Crowns", "mythic"),
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
@@ -642,7 +567,7 @@ class TestCompetitiveBrawlBanOverrides:
         deck = {
             "format": "competitive_brawl",
             "commanders": [],
-            "cards": [{"name": "Force of Will", "quantity": 1}],
+            "cards": [{"name": "Tainted Pact", "quantity": 1}],
             "owned_cards": [],
         }
         result = check_prices(deck, bulk_path=self._bulk(tmp_path))
@@ -654,11 +579,11 @@ class TestCompetitiveBrawlBanOverrides:
         deck = {
             "format": "historic_brawl",
             "commanders": [],
-            "cards": [{"name": "Force of Will", "quantity": 1}],
+            "cards": [{"name": "Tainted Pact", "quantity": 1}],
             "owned_cards": [],
         }
         result = check_prices(deck, bulk_path=self._bulk(tmp_path))
-        assert [e["name"] for e in result["illegal_or_missing"]] == ["Force of Will"]
+        assert [e["name"] for e in result["illegal_or_missing"]] == ["Tainted Pact"]
 
     def test_format_own_ban_list_still_enforced(self, tmp_path):
         deck = {
@@ -724,3 +649,279 @@ class TestCLI:
         assert "of US$100.00 budget" in result.output
         data = json_from_cli_output(result)
         assert data["over_budget"] is False
+
+
+def test_cli_auto_discovers_the_bulk_and_stays_offline(
+    sample_bulk_data, tmp_path, monkeypatch
+):
+    # ADR-0046: the shared --bulk-data option defaults to the auto-discovered bulk,
+    # so a bare `price-check deck.json` prices from disk, never one Scryfall request
+    # per name.
+    from mtg_utils import card_pool, price_check, scryfall_lookup
+
+    monkeypatch.setattr(card_pool, "default_bulk_path", lambda: sample_bulk_data)
+    monkeypatch.setattr(
+        scryfall_lookup, "fetch_card", lambda name: pytest.fail(f"fetched {name}")
+    )
+    names = tmp_path / "names.json"
+    names.write_text(json.dumps(["Sol Ring"]))
+    result = CliRunner().invoke(
+        price_check.main, [str(names), "--output", str(tmp_path / "out.json")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "WARNING" not in result.output
+    assert json.loads((tmp_path / "out.json").read_text())["cards"]
+
+
+def test_cli_arena_format_without_a_bulk_is_an_error(tmp_path, monkeypatch):
+    # Wildcard costing has no per-card fallback: a USD report would read as
+    # wildcards to an agent following SKILL.md's "price-check --format <fmt>".
+    from mtg_utils import card_pool, price_check
+
+    monkeypatch.setattr(card_pool, "default_bulk_path", lambda: None)
+    names = tmp_path / "names.json"
+    names.write_text(json.dumps(["Sol Ring"]))
+    result = CliRunner().invoke(price_check.main, [str(names), "--format", "brawl"])
+    assert result.exit_code != 0
+    assert "Arena wildcard pricing" in result.output
+    assert "download-mtgjson" in result.output
+    # The deck JSON's own format counts too (check_prices reads it when no flag).
+    deck = tmp_path / "deck.json"
+    deck.write_text(
+        json.dumps({"format": "historic_brawl", "commanders": [], "cards": []})
+    )
+    result = CliRunner().invoke(price_check.main, [str(deck)])
+    assert result.exit_code != 0
+    assert "historic_brawl needs the local bulk" in result.output
+
+
+def test_cli_without_any_bulk_warns_and_prices_from_scryfall(tmp_path, monkeypatch):
+    from mtg_utils import card_pool, price_check, scryfall_lookup
+
+    monkeypatch.setattr(card_pool, "default_bulk_path", lambda: None)
+    monkeypatch.setattr(
+        scryfall_lookup,
+        "fetch_card",
+        lambda name: {"name": name, "prices": {"usd": "1.00"}},
+    )
+    names = tmp_path / "names.json"
+    names.write_text(json.dumps(["Sol Ring"]))
+    result = CliRunner().invoke(
+        price_check.main, [str(names), "--output", str(tmp_path / "out.json")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no card-data bulk found" in result.output
+
+
+def test_cube_json_prices_the_commander_pool_too(sample_bulk_data):
+    # cube-wizard's "Cube budget check" runs price-check on the cube JSON; the
+    # commander / PDH cube's commanders sit in ``commander_pool``, not ``cards``.
+    cube = {
+        "cards": [{"name": "Sol Ring", "quantity": 1}],
+        "commander_pool": [{"name": "Thrasios, Triton Hero", "quantity": 1}],
+    }
+    result = check_prices(cube, bulk_path=sample_bulk_data)
+    assert {c["name"] for c in result["cards"]} == {"Sol Ring", "Thrasios, Triton Hero"}
+
+
+def _arena_printing(name: str, rarity: str) -> dict:
+    """The real card *name* (its record from the snapshot) as one Arena printing at
+    *rarity* — rarity and availability are per-printing facts the snapshot omits."""
+    return {**test_card(name), "rarity": rarity, "games": ["arena"], "prices": {}}
+
+
+# ── Basic lands: owned in any medium; a SPECIAL printing is owned in paper only if
+# the collection holds that exact printing ──
+
+_M21 = test_printing("Forest", "m21", "274", prices={"usd": "0.10", "usd_foil": "0.75"})
+_ZNR_FULL_ART = test_printing(
+    "Forest",
+    "znr",
+    "278",
+    full_art=True,
+    frame_effects=["fullart"],
+    prices={"usd": "0.90", "usd_foil": "3.00"},
+)
+# A special printing with no listed price.
+_UNPRICED_SHOWCASE = test_printing(
+    "Forest", "m21", "313", frame_effects=["showcase"], prices={}
+)
+_LTR = test_printing(
+    "Forest", "ltr", "270", promo_types=["universesbeyond"], prices={"usd": "0.10"}
+)
+# The collection holds thirty plain Forests of another printing.
+_OTHER = printing_row("dmu", "277", quantity=30)
+
+
+def _paper(tmp_path, entry, owned):
+    """Copies of ``entry`` a paper check says to buy, with bulk printing records."""
+    bulk_path = tmp_path / "bulk.json"
+    bulk_path.write_text(json.dumps([_M21, _ZNR_FULL_ART, _LTR, _UNPRICED_SHOWCASE]))
+    deck = {"cards": [entry], "owned_cards": owned}
+    return check_prices(deck, bulk_path=bulk_path)["cards"][0]["copies_needed"]
+
+
+def _paper_row(tmp_path, entry):
+    bulk_path = tmp_path / "bulk.json"
+    bulk_path.write_text(json.dumps([_M21, _ZNR_FULL_ART, _LTR, _UNPRICED_SHOWCASE]))
+    return check_prices({"cards": [entry], "owned_cards": []}, bulk_path=bulk_path)
+
+
+def _forests(*rows):
+    return [{"name": "Forest", "quantity": 30, "printings": list(rows)}]
+
+
+def _pin(set_code, number, **extra):
+    return {
+        "name": "Forest",
+        "quantity": 2,
+        "set": set_code,
+        "collector_number": number,
+        **extra,
+    }
+
+
+class TestBasicLandOwnership:
+    def test_unlisted_basics_are_owned_in_paper(self, tmp_path):
+        assert _paper(tmp_path, {"name": "Forest", "quantity": 20}, []) == 0
+
+    def test_plain_printing_pins_stay_owned_in_paper(self, tmp_path):
+        # "Forest (M21) 274" from an export, and a Universes Beyond basic: neither is
+        # special, so the collection lacking that exact printing doesn't matter.
+        assert _paper(tmp_path, _pin("M21", "274"), _forests(_OTHER)) == 0
+        assert _paper(tmp_path, _pin("LTR", "270"), _forests(_OTHER)) == 0
+
+    def test_a_special_pin_is_short_unless_that_printing_is_held(self, tmp_path):
+        full_art = _pin("ZNR", "278")
+        assert _paper(tmp_path, full_art, []) == 2  # no collection rows at all
+        name_only = [{"name": "Forest", "quantity": 20}]
+        assert _paper(tmp_path, full_art, name_only) == 2  # no printing detail
+        assert _paper(tmp_path, full_art, _forests(_OTHER)) == 2  # another printing
+        held = printing_row("znr", "278", quantity=2)
+        assert _paper(tmp_path, full_art, _forests(_OTHER, held)) == 0
+
+    def test_a_foil_pin_is_covered_only_by_foil_copies(self, tmp_path):
+        foil = _pin("M21", "274", finish="foil")
+        assert _paper(tmp_path, foil, []) == 2
+        nonfoil_held = printing_row("m21", "274", quantity=2)
+        assert _paper(tmp_path, foil, _forests(nonfoil_held)) == 2
+        foil_held = printing_row("m21", "274", foil_quantity=2)
+        assert _paper(tmp_path, foil, _forests(foil_held)) == 0
+
+    def test_a_special_request_is_priced_at_that_printing(self, tmp_path):
+        # Twenty unowned full-art ZNR Forests cost the ZNR price, not the cheapest
+        # Forest's; a foil request costs the foil price.
+        full_art = {**_pin("ZNR", "278"), "quantity": 20}
+        assert _paper_row(tmp_path, full_art)["total_cost"] == 18.0
+        foil = {**_pin("M21", "274", finish="foil"), "quantity": 20}
+        assert _paper_row(tmp_path, foil)["total_cost"] == 15.0
+
+    def test_an_unpriced_special_printing_falls_back_and_says_so(self, tmp_path):
+        result = _paper_row(tmp_path, _pin("M21", "313"))
+        row = result["cards"][0]
+        assert row["copies_needed"] == 2
+        assert row["price_usd"] == 0.10  # the cheapest printing's
+        assert "no listed price" in row["price_note"]
+
+    def test_any_forest_style_is_free_on_arena(self, tmp_path):
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(json.dumps([_arena_printing("Forest", "common")]))
+        for entry in (
+            {"name": "Forest", "quantity": 2},
+            _pin("ZNR", "278", finish="foil"),
+        ):
+            deck = {"format": "historic_brawl", "cards": [entry], "owned_cards": []}
+            result = check_prices(deck, bulk_path=bulk_path)
+            assert result["cards"][0]["wildcards_needed"] == 0
+
+    def test_snow_covered_basics_are_ordinary_cards(self, tmp_path):
+        snow = {"name": "Snow-Covered Forest", "quantity": 2}
+        # A price is a per-printing fact the snapshot omits; without one, paper
+        # pricing would fall back to Scryfall's API.
+        records = {
+            "Snow-Covered Forest": {
+                **test_card("Snow-Covered Forest"),
+                "prices": {"usd": "0.25"},
+            }
+        }
+        with patch("mtg_utils.price_check.lookup_single") as mock_lookup:
+            mock_lookup.side_effect = lambda name, **_kw: records.get(name)
+            paper = check_prices({"cards": [snow], "owned_cards": []})
+        assert paper["cards"][0]["copies_needed"] == 2
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(
+            json.dumps([_arena_printing("Snow-Covered Forest", "common")])
+        )
+        arena = check_prices(
+            {"format": "historic_brawl", "cards": [snow], "owned_cards": []},
+            bulk_path=bulk_path,
+        )
+        assert arena["cards"][0]["wildcards_needed"] == 2
+
+
+class TestMediumDecidesCostMode:
+    """The medium, not the format's Arena flag, picks wildcards vs USD (ADR-0052):
+    Standard and Pioneer run on both media and default to paper, so an Arena build
+    says so with ``--medium digital`` or a deck ``medium``."""
+
+    def test_standard_defaults_to_paper_usd(self, sample_bulk_data):
+        result = check_prices(
+            ["Viscera Seer"], bulk_path=sample_bulk_data, format="standard"
+        )
+        assert "total_cost" in result
+        assert "wildcard_cost" not in result
+
+    def test_medium_override_prices_standard_in_wildcards(self, sample_bulk_data):
+        result = check_prices(
+            ["Viscera Seer"],
+            bulk_path=sample_bulk_data,
+            format="standard",
+            medium="digital",
+        )
+        assert "wildcard_cost" in result
+        assert "total_cost" not in result
+
+    def test_deck_medium_prices_standard_in_wildcards(self, sample_bulk_data):
+        deck = {
+            "format": "standard",
+            "medium": "digital",
+            "cards": [{"name": "Viscera Seer", "quantity": 1}],
+        }
+        result = check_prices(deck, bulk_path=sample_bulk_data)
+        assert "wildcard_cost" in result
+
+    def test_override_a_format_cannot_honour_falls_back(self, sample_bulk_data):
+        # Commander is paper-only: a digital override is ignored, not raised.
+        result = check_prices(
+            ["Sol Ring"],
+            bulk_path=sample_bulk_data,
+            format="commander",
+            medium="digital",
+        )
+        assert "total_cost" in result
+
+    def test_cli_medium_flag(self, sample_bulk_data, tmp_path):
+        deck_path = tmp_path / "deck.json"
+        deck_path.write_text(
+            json.dumps(
+                {
+                    "format": "standard",
+                    "cards": [{"name": "Viscera Seer", "quantity": 1}],
+                }
+            )
+        )
+        out = tmp_path / "out.json"
+        args = [
+            str(deck_path),
+            "--bulk-data",
+            str(sample_bulk_data),
+            "--output",
+            str(out),
+        ]
+        runner = CliRunner()
+        paper = runner.invoke(main, args)
+        assert paper.exit_code == 0, paper.output
+        assert "total_cost" in json.loads(out.read_text())
+        digital = runner.invoke(main, [*args, "--medium", "digital"])
+        assert digital.exit_code == 0, digital.output
+        assert "wildcard_cost" in json.loads(out.read_text())

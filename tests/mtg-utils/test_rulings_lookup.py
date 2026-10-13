@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,10 +16,11 @@ from mtg_utils.rulings_lookup import (
     main,
 )
 
+# A fictional card: its ids and rulings are invented machinery (ADR-0056).
 _FAKE_CARD = {
-    "id": "card-solring",
-    "name": "Sol Ring",
-    "oracle_id": "oid-solring",
+    "id": "card-test-relic",
+    "name": "Test Relic",
+    "oracle_id": "oid-test-relic",
     "legalities": {},
 }
 _FAKE_RULINGS = [
@@ -50,15 +52,15 @@ class TestLookupRulings:
         session = _mock_session()
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
             result = lookup_rulings(
-                "Sol Ring",
+                "Test Relic",
                 session=session,
                 refresh=True,
             )
-        assert result["name"] == "Sol Ring"
-        assert result["oracle_id"] == "oid-solring"
+        assert result["name"] == "Test Relic"
+        assert result["oracle_id"] == "oid-test-relic"
         assert len(result["rulings"]) == 2
         session.get.assert_called_once_with(
-            "https://api.scryfall.com/cards/card-solring/rulings",
+            "https://api.scryfall.com/cards/card-test-relic/rulings",
             timeout=15,
         )
 
@@ -66,13 +68,13 @@ class TestLookupRulings:
         card = {
             "id": "card-uuid",
             "oracle_id": "oracle-uuid",
-            "name": "Karn, the Great Creator",
+            "name": "Test Walker",
         }
         session = _mock_session()
 
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=card):
             lookup_rulings(
-                "Karn, the Great Creator",
+                "Test Walker",
                 session=session,
                 refresh=True,
             )
@@ -86,19 +88,19 @@ class TestLookupRulings:
     def test_cached_result_reused(self, tmp_path):
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
             s1 = _mock_session()
-            lookup_rulings("Sol Ring", session=s1, refresh=True)
+            lookup_rulings("Test Relic", session=s1, refresh=True)
             # Second call should NOT hit the network (we pass a session
             # that would blow up if .get were called).
             s2 = MagicMock()
             s2.get.side_effect = AssertionError("cache should serve this call")
-            result = lookup_rulings("Sol Ring", session=s2, refresh=False)
+            result = lookup_rulings("Test Relic", session=s2, refresh=False)
         assert len(result["rulings"]) == 2
 
     def test_refresh_flag_bypasses_cache(self, tmp_path):
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
-            lookup_rulings("Sol Ring", session=_mock_session(), refresh=True)
+            lookup_rulings("Test Relic", session=_mock_session(), refresh=True)
             s = _mock_session()
-            lookup_rulings("Sol Ring", session=s, refresh=True)
+            lookup_rulings("Test Relic", session=s, refresh=True)
         # Two calls to Scryfall: one to seed the cache, one because
         # --refresh was set.
         assert s.get.call_count == 1
@@ -124,13 +126,13 @@ class TestLookupRulings:
                 return_value=_mock_session(),
             ),
         ):
-            results = lookup_rulings_batch(["Sol Ring", "Sol Ring"])
+            results = lookup_rulings_batch(["Test Relic", "Test Relic"])
         assert len(results) == 2
 
     def test_local_hit_never_calls_http(self, tmp_path):
         """Task #89: a rulings-index hit must serve locally — zero network."""
         rulings_index = {
-            "oid-solring": (
+            "oid-test-relic": (
                 {"date": "2020-01-01", "text": "Taps for 2."},
                 {"date": "2022-06-01", "text": "Still legal."},
             )
@@ -139,11 +141,11 @@ class TestLookupRulings:
         session.get.side_effect = AssertionError("local hit must not call HTTP")
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
             result = lookup_rulings(
-                "Sol Ring",
+                "Test Relic",
                 rulings_index=rulings_index,
                 session=session,
             )
-        assert result["oracle_id"] == "oid-solring"
+        assert result["oracle_id"] == "oid-test-relic"
         assert result["source"] == "mtgjson-bulk"
         assert result["rulings"] == [
             {"published_at": "2020-01-01", "comment": "Taps for 2."},
@@ -158,7 +160,7 @@ class TestLookupRulings:
         session = _mock_session()
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
             result = lookup_rulings(
-                "Sol Ring",
+                "Test Relic",
                 rulings_index=rulings_index,
                 session=session,
                 refresh=True,
@@ -166,7 +168,7 @@ class TestLookupRulings:
         assert result["source"] == "scryfall-api"
         assert len(result["rulings"]) == 2
         session.get.assert_called_once_with(
-            "https://api.scryfall.com/cards/card-solring/rulings",
+            "https://api.scryfall.com/cards/card-test-relic/rulings",
             timeout=15,
         )
 
@@ -175,10 +177,10 @@ class TestLookupRulings:
         ``bulk_path=None``) preserves the pre-#89 API-only behavior."""
         session = _mock_session()
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
-            result = lookup_rulings("Sol Ring", session=session, refresh=True)
+            result = lookup_rulings("Test Relic", session=session, refresh=True)
         assert result["source"] == "scryfall-api"
         session.get.assert_called_once_with(
-            "https://api.scryfall.com/cards/card-solring/rulings",
+            "https://api.scryfall.com/cards/card-test-relic/rulings",
             timeout=15,
         )
 
@@ -187,11 +189,11 @@ class TestLookupRulings:
         underlying rulings must be byte-identical in shape — the CLI
         text report and JSON sidecar don't special-case the source."""
         rulings_index = {
-            "oid-solring": ({"date": "2020-01-01", "text": "Taps for 2."},)
+            "oid-test-relic": ({"date": "2020-01-01", "text": "Taps for 2."},)
         }
         with patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD):
             local = lookup_rulings(
-                "Sol Ring",
+                "Test Relic",
                 rulings_index=rulings_index,
                 session=MagicMock(),
             )
@@ -202,7 +204,7 @@ class TestLookupRulings:
                 "data": [{"published_at": "2020-01-01", "comment": "Taps for 2."}]
             }
             api_session.get.return_value = resp
-            api = lookup_rulings("Sol Ring", session=api_session, refresh=True)
+            api = lookup_rulings("Test Relic", session=api_session, refresh=True)
 
         assert local["rulings"] == api["rulings"]
         assert set(local.keys()) == set(api.keys())
@@ -216,7 +218,7 @@ class TestLookupRulings:
         bulk_path.write_text("{}", encoding="utf-8")
 
         cards = {
-            "Sol Ring": {**_FAKE_CARD, "name": "Sol Ring"},
+            "Test Relic": {**_FAKE_CARD, "name": "Test Relic"},
             "Local Card": {
                 "id": "card-local",
                 "oracle_id": "oid-local-hit",
@@ -236,7 +238,10 @@ class TestLookupRulings:
                 "mtg_utils.rulings_lookup.lookup_single",
                 side_effect=_fake_lookup_single,
             ),
-            patch("mtg_utils.scryfall_lookup._load_bulk_index", lambda _p: {}),
+            patch(
+                "mtg_utils.card_pool.CardPool.load",
+                lambda _p: SimpleNamespace(by_name={}),
+            ),
             patch(
                 "mtg_utils.rulings_lookup.load_rulings_index",
                 return_value=rulings_index,
@@ -247,12 +252,12 @@ class TestLookupRulings:
             ),
         ):
             results = lookup_rulings_batch(
-                ["Sol Ring", "Local Card"],
+                ["Test Relic", "Local Card"],
                 bulk_path=bulk_path,
             )
 
         by_name = {r["name"]: r for r in results}
-        assert by_name["Sol Ring"]["source"] == "scryfall-api"
+        assert by_name["Test Relic"]["source"] == "scryfall-api"
         assert by_name["Local Card"]["source"] == "mtgjson-bulk"
         assert by_name["Local Card"]["rulings"] == [
             {"published_at": "2015-01-01", "comment": "Local ruling."}
@@ -271,17 +276,17 @@ class TestLookupRulings:
         def _fake_load(_path):
             nonlocal load_count
             load_count += 1
-            return {"sol ring": _FAKE_CARD}
+            return SimpleNamespace(by_name={"Test Relic": _FAKE_CARD})
 
         with (
-            patch("mtg_utils.scryfall_lookup._load_bulk_index", _fake_load),
+            patch("mtg_utils.card_pool.CardPool.load", _fake_load),
             patch(
                 "mtg_utils.rulings_lookup._new_session",
                 return_value=_mock_session(),
             ),
         ):
             results = lookup_rulings_batch(
-                ["Sol Ring"] * 10,
+                ["Test Relic"] * 10,
                 bulk_path=bulk_path,
             )
 
@@ -310,14 +315,14 @@ class TestCLI:
             ),
         ):
             runner = CliRunner()
-            result = runner.invoke(main, ["--card", "Sol Ring"])
+            result = runner.invoke(main, ["--card", "Test Relic"])
         assert result.exit_code == 0, result.output
-        assert "Sol Ring" in result.output
+        assert "Test Relic" in result.output
         assert "Full JSON:" in result.output
 
     def test_cli_batch_file(self, tmp_path):
         names_path = tmp_path / "names.json"
-        names_path.write_text(json.dumps(["Sol Ring", "Sol Ring"]))
+        names_path.write_text(json.dumps(["Test Relic", "Test Relic"]))
 
         with (
             patch("mtg_utils.rulings_lookup.lookup_single", return_value=_FAKE_CARD),
@@ -337,7 +342,7 @@ class TestCLI:
             json.dumps(
                 {
                     "commanders": [{"name": "Atraxa, Praetors' Voice", "quantity": 1}],
-                    "cards": [{"name": "Sol Ring", "quantity": 1}],
+                    "cards": [{"name": "Test Relic", "quantity": 1}],
                 }
             )
         )
@@ -362,14 +367,14 @@ class TestCLI:
     def test_cli_nonexistent_bulk_data_fails_clean(self, tmp_path):
         """task #93: a nonexistent ``--bulk-data`` path used to raise a raw
         ``FileNotFoundError`` out of ``lookup_rulings_batch``'s eager
-        ``scryfall_lookup._load_bulk_index`` call (task #89 repro). Click's
+        ``CardPool.load`` call (task #89 repro). Click's
         ``exists=True`` now rejects it before that call ever runs — same
         pattern every other bulk-data CLI in the repo already uses
         (``card_search``, ``price_check``, ``combo_search``, ...)."""
         missing = tmp_path / "does-not-exist.json"
         runner = CliRunner()
         result = runner.invoke(
-            main, ["--card", "Sol Ring", "--bulk-data", str(missing)]
+            main, ["--card", "Test Relic", "--bulk-data", str(missing)]
         )
         assert result.exit_code != 0
         assert isinstance(result.exception, SystemExit) or result.exception is None

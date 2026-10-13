@@ -1,13 +1,9 @@
-"""Tests for the deck-forge card index (build_by_name).
-
-It folds lookups (NFKD) via the shared name-index core, so search's proper-case names
-and any case/diacritic spelling resolve to the same record — the original Jyoti
-add-validation bug (proper-case search output vs a lowercased index) is moot under
-folding. The stored record keeps its real proper-case name for display.
-"""
+"""Tests for the hub's production wiring (resume_or_new). The card index it serves
+is the ``CardPool``'s (ADR-0046), tested in tests/mtg-utils/test_card_pool.py."""
 
 from mtg_utils._deck_forge.persistence import BuildStore
-from mtg_utils._deck_forge.production import build_by_name, resume_or_new
+from mtg_utils._deck_forge.production import resume_or_new
+from mtg_utils.testkit import test_card
 
 
 def test_resume_or_new_resumes_latest(tmp_path):
@@ -34,36 +30,60 @@ def test_resume_or_new_starts_fresh_when_empty(tmp_path):
     assert session.to_deck_dict()["cards"] == []
 
 
-def test_folds_lookups_and_keeps_proper_case_record():
-    # Folding (not proper-case keying) is what keeps a searchable card addable now:
-    # the proper-case name AND a lowercased spelling both resolve, and the stored
-    # record keeps its real name for display.
-    cards = [
-        {"name": "Jyoti, Moag Ancient", "layout": "normal", "prices": {"usd": "5"}}
-    ]
-    idx = build_by_name(cards)
-    assert idx.get("Jyoti, Moag Ancient")["name"] == "Jyoti, Moag Ancient"
-    assert idx.get("jyoti, moag ancient")["name"] == "Jyoti, Moag Ancient"
+def test_combos_are_memoized_per_deck_content(monkeypatch):
+    """A Tune re-run on an unchanged deck (a rejected add) must not be a second live
+    Commander Spellbook call."""
+    from mtg_utils import combo_search
+    from mtg_utils._deck_forge import production
+
+    calls: list = []
+    monkeypatch.setattr(
+        combo_search, "combo_search", lambda hd: calls.append(hd) or {"combos": []}
+    )
+    monkeypatch.setattr(production, "_COMBO_MEMO", {})
+    deck = {"format": "commander", "commanders": [], "cards": [{"name": "Opt"}]}
+    by_name = {"Opt": test_card("Opt")}
+    assert production._combos(deck, by_name) == {"combos": []}
+    assert production._combos(dict(deck), by_name) == {"combos": []}
+    assert len(calls) == 1
+    other = {**deck, "cards": [{"name": "Opt"}, {"name": "Opt"}]}
+    production._combos(other, by_name)
+    assert len(calls) == 2
 
 
-def test_tokens_and_art_series_skipped():
-    cards = [
-        {"name": "Real Card", "layout": "normal", "prices": {}},
-        {"name": "Soldier", "layout": "token", "prices": {}},
-        {"name": "Showcase", "layout": "art_series", "prices": {}},
-        {"name": "Memo", "layout": "normal", "set_type": "memorabilia", "prices": {}},
-    ]
-    idx = build_by_name(cards)
-    assert "Real Card" in idx
-    assert "Soldier" not in idx
-    assert "Showcase" not in idx
-    assert "Memo" not in idx
+def test_warm_at_launch_installs_the_reporter_and_chains_index_then_discovery(
+    monkeypatch, tmp_path
+):
+    from mtg_utils import theme_presets
+    from mtg_utils._analysis import signals_index
+    from mtg_utils._deck_forge import discovery, production
+    from mtg_utils._deck_forge.state import DeckSession, ForgeState
 
+    order: list = []
+    monkeypatch.setattr(
+        theme_presets, "seed_signal_key_index", lambda p: order.append(("seed", p))
+    )
+    monkeypatch.setattr(
+        discovery, "warm", lambda _st, slot, fmt=None: order.append(("warm", slot, fmt))
+    )
+    bulk = tmp_path / "bulk.json"
+    bulk.write_text("[]", encoding="utf-8")
+    state = ForgeState(
+        by_name={},
+        search_fn=lambda **_: [],
+        session=DeckSession("commander"),
+        bulk_available=True,
+        bulk_path=bulk,
+    )
 
-def test_dedupes_to_cheapest_printing():
-    cards = [
-        {"name": "Sol Ring", "layout": "normal", "prices": {"usd": "3.00"}},
-        {"name": "Sol Ring", "layout": "normal", "prices": {"usd": "1.00"}},
-        {"name": "Sol Ring", "layout": "normal", "prices": {"usd": "9.00"}},
-    ]
-    assert build_by_name(cards)["Sol Ring"]["prices"]["usd"] == "1.00"
+    def reporter(*_args: object) -> None:
+        return None
+
+    try:
+        thread = production.warm_at_launch(state, reporter)
+        assert thread is not None
+        thread.join(timeout=5)
+    finally:
+        signals_index.set_progress_hook(None)
+    assert state.report_busy is reporter
+    assert order == [("seed", bulk), ("warm", "paper", "commander")]

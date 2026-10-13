@@ -6,16 +6,16 @@
     collection,
     activeTab,
     isDigital,
+    hasCommander,
+    sideboardSize,
+    deckSizeDefault,
+    poolBounded,
   } from "../lib/store.js";
   import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
   import { hoverPreview } from "../lib/hover.js";
-  import { displayName } from "../lib/cards.js";
-  import {
-    wildcardLabel,
-    wildcardTotals,
-    WC_TIERS,
-    FORMAT_TARGET,
-  } from "../lib/mana.js";
+  import { displayName, heldCopies, canHoldAnother } from "../lib/cards.js";
+  import { wildcardLabel, wildcardTotals, WC_TIERS } from "../lib/mana.js";
   import { facetOk, nameOk } from "../lib/filter.js";
   import ManaCost from "./ManaCost.svelte";
   import FilterWidget from "./FilterWidget.svelte";
@@ -37,42 +37,28 @@
     zoneError = "";
     const r = await api.remove(name, zone, 1);
     if (r.ok) applySnapshot(r.data);
+    else zoneError = r.data.error || "couldn't remove";
   }
 
   async function addOne(name, zone) {
-    zoneError = "";
-    const r = await api.add(name, zone, 1);
-    if (r.ok) applySnapshot(r.data);
+    zoneError = await tryAdd(name, zone);
   }
 
+  // One-step zone move (main deck ⇄ sideboard, promote to commander, reveal as
+  // companion). The backend runs every rule BEFORE the session changes (CR 103.2b /
+  // 702.139a for the companion zone, a command zone the format has) and 400s with
+  // a cited message, so a refused move leaves the deck untouched — no restore dance.
+  async function moveOne(name, from, to) {
+    zoneError = "";
+    const r = await api.move(name, from, to, 1);
+    if (r.ok) applySnapshot(r.data);
+    else zoneError = r.data.error || `couldn't move to ${to}`;
+  }
   // Promote a card already in the deck from the mainboard into the command zone
   // (#1, ADR-0017) — the inverse of adding-as-commander. An imported list with no
   // marked commander lands as a pile; ★ here moves a legendary into the command zone.
-  // Move = remove one from cards, then add one to commanders (no single move endpoint).
-  async function promote(name) {
-    zoneError = "";
-    const r1 = await api.remove(name, "cards", 1);
-    if (!r1.ok) return;
-    const r2 = await api.add(name, "commanders", 1);
-    applySnapshot((r2.ok ? r2 : r1).data);
-  }
-
-  // Move a maindeck card into the companion zone (same remove-then-add pattern as
-  // promote). The backend validates the zone rules (CR 103.2b / 702.139a) and 400s
-  // with a cited message; on failure the card is put back and the message surfaced.
-  async function setCompanion(name) {
-    zoneError = "";
-    const r1 = await api.remove(name, "cards", 1);
-    if (!r1.ok) return;
-    const r2 = await api.add(name, "companion", 1);
-    if (r2.ok) {
-      applySnapshot(r2.data);
-      return;
-    }
-    zoneError = r2.data.error || "couldn't set companion";
-    const r3 = await api.add(name, "cards", 1); // restore the removed copy
-    applySnapshot((r3.ok ? r3 : r1).data);
-  }
+  const promote = (name) => moveOne(name, "cards", "commanders");
+  const setCompanion = (name) => moveOne(name, "cards", "companion");
 
   // Cheap client-side gate for the "Set as companion" affordance — every companion's
   // oracle text opens a line with the Companion keyword; the backend stays the judge.
@@ -124,15 +110,6 @@
       });
   }
 
-  // Singleton: only basics and "any number of cards named X" cards (Relentless Rats,
-  // Shadowborn Apostle, Dragon's Approach…) may have more than one copy.
-  function canHaveMultiple(c) {
-    if (/\bBasic Land\b/.test(c.type_line || "")) return true;
-    return /a deck can have any number of cards named/i.test(
-      c.oracle_text || "",
-    );
-  }
-
   // Cheapest USD listing for a card, or null (no-listing ≠ free — never shown as $0).
   function priceOf(c) {
     const p = c.prices?.usd ?? c.prices?.usd_foil ?? c.prices?.usd_etched;
@@ -170,22 +147,72 @@
 
   // Effective deck-size target (Header/StatusBar read the same) — for the companion
   // zone's "doesn't count toward your N" caption.
-  $: target = $deck.deck_size ?? FORMAT_TARGET[$deck.format] ?? 100;
-  // The companion zone (D) renders right after the Command Zone, only when occupied.
+  $: target = $deck.deck_size ?? $deckSizeDefault;
+  // The zones, by family: the Command Zone only where the format has one; the
+  // companion zone (D) right after it, only when occupied; the sideboard where the
+  // format has one (rendered even when empty, so its ⇄ affordance is discoverable —
+  // for a sealed / draft build it is the unused pool, derived and uncapped); the
+  // opened pool last, collapsed by default.
+  let poolOpen = false;
   $: groups = [
-    { key: "commanders", label: "Command Zone", cards: $deck.commanders },
+    ...($hasCommander
+      ? [{ key: "commanders", label: "Command Zone", cards: $deck.commanders }]
+      : []),
     ...(($deck.companion || []).length
       ? [{ key: "companion", label: "Companion", cards: $deck.companion }]
       : []),
     { key: "cards", label: "Deck", cards: $deck.cards },
+    ...($sideboardSize > 0
+      ? [
+          {
+            key: "sideboard",
+            label: $poolBounded ? "Sideboard — unused pool" : "Sideboard",
+            cards: $deck.sideboard || [],
+            cap: Number.isFinite($sideboardSize) ? $sideboardSize : null,
+          },
+        ]
+      : []),
+    ...($poolBounded
+      ? [
+          {
+            key: "pool",
+            label: "Pool",
+            cards: byColorThenCmc($deck.pool || []),
+          },
+        ]
+      : []),
   ];
+  // Copies in a group (a 4-of is four cards, a singleton group reads as before).
+  const copies = (cards) =>
+    cards.reduce((sum, c) => sum + (c.quantity || 1), 0);
+  $: held = heldCopies($deck);
+  // Whether one more copy may be added: the served row's own copy limit (the pool's
+  // count for a sealed / draft build, whose derived sideboard is not "held").
+  function canAddAnother(c) {
+    const count = $poolBounded ? c.quantity || 1 : held.get(c.name) || 0;
+    return canHoldAnother(c, count);
+  }
+  // The pool reads colour then mana value (a booster's order says nothing).
+  function colorKey(c) {
+    return (c.color_identity || []).join("") || "~";
+  }
+  function byColorThenCmc(cards) {
+    return cards
+      .slice()
+      .sort(
+        (a, b) =>
+          colorKey(a).localeCompare(colorKey(b)) ||
+          (a.cmc || 0) - (b.cmc || 0) ||
+          a.name.localeCompare(b.name),
+      );
+  }
   // Whether any filter is set (so we only show "N of M" and the clear hint when filtering).
   $: filtering = !!(fName || fType || fCmc || fPrice || fRarity || fOwned);
   // Filter each group client-side with the shared predicate. The facet values are read
   // into the inline object HERE so Svelte tracks them as dependencies of this reactive.
   $: filteredGroups = groups.map((g) => ({
     ...g,
-    total: g.cards.length,
+    total: copies(g.cards),
     cards: g.cards.filter(
       (c) =>
         nameOk(c, fName) &&
@@ -202,7 +229,10 @@
         ),
     ),
   }));
-  $: empty = !$deck.commanders.length && !$deck.cards.length;
+  $: empty =
+    !$deck.commanders.length &&
+    !$deck.cards.length &&
+    !($deck.sideboard || []).length;
   // The owned readout shows only when a Collection is loaded for the ACTIVE slot
   // (strictly single-slot, ADR-0018) — otherwise there's nothing to compare against.
   $: ownedReadout =
@@ -230,17 +260,23 @@
   {#if empty}
     <div class="cold">
       <span class="glyph">🜂</span>
-      <p>The forge is cold. Search for a commander and add it to begin,</p>
+      <p>
+        The forge is cold. {$hasCommander
+          ? "Search for a commander and add it to begin,"
+          : "Search for cards and add them to begin,"}
+      </p>
       <p class="or">or bring a list you already have:</p>
       <div class="cold-actions">
         <button class="import-btn" on:click={() => importOpen.set(true)}
           >⬇ Import a deck</button
         >
-        <button
-          class="import-btn ghost"
-          on:click={() => activeTab.set("commanders")}
-          >✦ Discover from your collection</button
-        >
+        {#if $hasCommander}
+          <button
+            class="import-btn ghost"
+            on:click={() => activeTab.set("commanders")}
+            >✦ Discover from your collection</button
+          >
+        {/if}
       </div>
     </div>
   {:else}
@@ -257,12 +293,22 @@
       />
     </div>
     {#each filteredGroups as g (g.key)}
-      {#if g.cards.length}
+      {#if g.cards.length || (g.key === "sideboard" && !filtering)}
         <div class="group">
           <div class="group-head">
+            {#if g.key === "pool"}
+              <button
+                class="fold"
+                title={poolOpen ? "Collapse the pool" : "Show the pool"}
+                on:click={() => (poolOpen = !poolOpen)}
+                >{poolOpen ? "▾" : "▸"}</button
+              >
+            {/if}
             {g.label}
-            <span
-              >· {filtering ? `${g.cards.length} of ${g.total}` : g.total}</span
+            <span class:over={g.cap && g.total > g.cap}
+              >· {filtering
+                ? `${copies(g.cards)} of ${g.total}`
+                : g.total}{g.cap ? `/${g.cap}` : ""}</span
             >
             {#if $isDigital}
               <span
@@ -284,7 +330,19 @@
               Revealed from outside the game — doesn't count toward your {target}
             </div>
           {/if}
-          {#each g.cards as c (c.name)}
+          {#if g.key === "sideboard" && !g.cards.length}
+            <div class="zone-note">
+              {$poolBounded
+                ? "Empty — every opened card is in the deck"
+                : "Empty — use ⇄ on a deck card, or SB on a Find result"}
+            </div>
+          {/if}
+          {#if g.key === "pool" && !poolOpen}
+            <div class="zone-note">
+              Your opened cards — the deck and sideboard are drawn from them
+            </div>
+          {/if}
+          {#each g.key === "pool" && !poolOpen ? [] : g.cards as c (c.name)}
             <div class="row" use:hoverPreview={c}>
               <div class="thumb">
                 {#if c.images?.small}
@@ -341,32 +399,56 @@
                     >{c.set ? c.set.toUpperCase() : "◆"}</button
                   >
                 {/if}
-                {#if g.key === "cards" && c.can_be_commander}
+                {#if g.key === "cards" && $hasCommander && c.can_be_commander}
                   <button
                     class="rm star"
                     title="Promote to commander"
                     on:click={() => promote(c.name)}>★</button
                   >
                 {/if}
-                {#if g.key === "cards" && looksCompanion(c)}
+                {#if g.key === "cards" && !$poolBounded && looksCompanion(c)}
                   <button
                     class="rm star"
                     title="Set as companion — revealed from outside the game"
                     on:click={() => setCompanion(c.name)}>◈</button
                   >
                 {/if}
-                {#if g.key === "cards" && canHaveMultiple(c)}
+                {#if g.key === "cards" && $sideboardSize > 0}
+                  <button
+                    class="rm star"
+                    title={$poolBounded
+                      ? "Cut one to the unused pool"
+                      : "Move one to the sideboard"}
+                    on:click={() => moveOne(c.name, "cards", "sideboard")}
+                    >⇄</button
+                  >
+                {/if}
+                {#if g.key === "sideboard" || g.key === "pool"}
+                  <button
+                    class="rm star"
+                    title="Play one — move it to the main deck"
+                    on:click={() =>
+                      g.key === "pool"
+                        ? addOne(c.name, "cards")
+                        : moveOne(c.name, "sideboard", "cards")}>⇄</button
+                  >
+                {/if}
+                {#if (g.key === "cards" || (g.key === "sideboard" && !$poolBounded)) && canAddAnother(c)}
                   <button
                     class="rm add"
                     title="Add another"
                     on:click={() => addOne(c.name, g.key)}>+</button
                   >
                 {/if}
-                <button
-                  class="rm"
-                  title="Remove one"
-                  on:click={() => remove(c.name, g.key)}>−</button
-                >
+                {#if !(g.key === "sideboard" && $poolBounded)}
+                  <button
+                    class="rm"
+                    title={g.key === "pool"
+                      ? "Remove one from the pool"
+                      : "Remove one"}
+                    on:click={() => remove(c.name, g.key)}>−</button
+                  >
+                {/if}
               </div>
             </div>
             {#if pickerKey === keyOf(c, g.key)}
@@ -491,6 +573,17 @@
   }
   .group-head span {
     color: var(--muted);
+  }
+  .group-head .over {
+    color: var(--fail);
+  }
+  .fold {
+    background: transparent;
+    border: none;
+    color: var(--brass);
+    font-size: 0.9rem;
+    padding: 0 0.2rem 0 0;
+    cursor: pointer;
   }
   .group-head .subtotal {
     float: right;

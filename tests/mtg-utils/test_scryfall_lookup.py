@@ -4,16 +4,19 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
+import pytest
 from click.testing import CliRunner
 
+from mtg_utils.card_pool import CardPool
 from mtg_utils.scryfall_lookup import (
-    _load_bulk_index,
     build_digest,
-    build_rarity_index,
+    display_fields,
     lookup_cards,
     lookup_single,
     main,
 )
+from mtg_utils.testkit import test_card
 
 
 class TestLookupSingle:
@@ -56,20 +59,24 @@ class TestLookupSingle:
         # card_faces. Projecting P/T without card_faces therefore left every MDFC
         # blind to size anyway, and killed playtest._card_pips's card_faces
         # fallback (its docstring exists to stop MDFC pools under-reporting screw).
-        result = lookup_single("Malakir Rebirth", bulk_path=sample_bulk_data)
+        result = lookup_single("Blackbloom Rogue", bulk_path=sample_bulk_data)
         assert result is not None
-        assert result["power"] is None, "top-level P/T is absent on an MDFC"
+        assert "power" not in result, "top-level P/T is absent on an MDFC"
         faces = result["card_faces"]
         assert faces[0]["power"] == "2"
         assert faces[0]["toughness"] == "3"
-        assert faces[0]["mana_cost"] == "{B}"
+        assert faces[0]["mana_cost"] == "{2}{B}"
 
-    def test_noncreature_has_null_power_and_toughness(self, sample_bulk_data):
-        # Present-but-None, not absent: consumers should be able to read the key
-        # unconditionally rather than probing for it.
+    def test_noncreature_has_no_power_or_toughness_keys(self, sample_bulk_data):
+        # ONE record shape (ADR-0046): the bulk's own record, keys absent when the
+        # card has no such field — the same shape the hub joins, never a None-filled
+        # projection. Only the terminal projection (display_fields) None-fills.
         result = lookup_single("Rhystic Study", bulk_path=sample_bulk_data)
-        assert result["power"] is None
-        assert result["toughness"] is None
+        assert "power" not in result
+        assert "toughness" not in result
+        shown = display_fields(result)
+        assert shown["power"] is None
+        assert shown["toughness"] is None
 
     def test_finds_split_card_by_full_name(self, sample_bulk_data):
         result = lookup_single("Fire // Ice", bulk_path=sample_bulk_data)
@@ -243,50 +250,39 @@ class TestLookupBatch:
 
 
 class TestLookupBatchDeckJSON:
-    def test_accepts_deck_json(self, sample_bulk_data, tmp_path):
+    def test_refuses_a_deck_json_and_names_deck_hydrate(
+        self, sample_bulk_data, tmp_path
+    ):
+        # ADR-0046: a deck hydrates itself through its sidecar; the batch tool serves
+        # name lists (candidate verification) only.
         deck_json = {
             "commanders": [{"name": "Korvold, Fae-Cursed King", "quantity": 1}],
-            "cards": [
-                {"name": "Viscera Seer", "quantity": 1},
-                {"name": "Sol Ring", "quantity": 1},
-            ],
-        }
-        batch_path = tmp_path / "deck.json"
-        batch_path.write_text(json.dumps(deck_json))
-
-        results, _, _ = lookup_cards(
-            batch_path, bulk_path=sample_bulk_data, cache_dir=tmp_path / "cache"
-        )
-        result_names = {r["name"] for r in results if r}
-        assert "Korvold, Fae-Cursed King" in result_names
-        assert "Viscera Seer" in result_names
-        assert "Sol Ring" in result_names
-
-    def test_deduplicates_names(self, sample_bulk_data, tmp_path):
-        deck_json = {
-            "commanders": [{"name": "Sol Ring", "quantity": 1}],
             "cards": [{"name": "Sol Ring", "quantity": 1}],
         }
         batch_path = tmp_path / "deck.json"
         batch_path.write_text(json.dumps(deck_json))
 
-        results, _, _ = lookup_cards(
-            batch_path, bulk_path=sample_bulk_data, cache_dir=tmp_path / "cache"
-        )
-        assert len(results) == 1
+        with pytest.raises(click.ClickException, match="deck-hydrate"):
+            lookup_cards(
+                batch_path, bulk_path=sample_bulk_data, cache_dir=tmp_path / "cache"
+            )
 
-    def test_handles_empty_commanders(self, sample_bulk_data, tmp_path):
-        deck_json = {
-            "commanders": [],
+    def test_accepts_a_cube_json(self, sample_bulk_data, tmp_path):
+        # cube-wizard hydrates its cube JSON here (ADR-0046 scoped cube-wizard out
+        # of the deck seam); only a parsed DECK is turned away.
+        cube = {
+            "name": "Test Cube",
             "cards": [{"name": "Sol Ring", "quantity": 1}],
+            # a commander / PDH cube's commanders live in their own pool
+            "commander_pool": [{"name": "Thrasios, Triton Hero", "quantity": 1}],
         }
-        batch_path = tmp_path / "deck.json"
-        batch_path.write_text(json.dumps(deck_json))
-
-        results, _, _ = lookup_cards(
+        batch_path = tmp_path / "cube.json"
+        batch_path.write_text(json.dumps(cube))
+        results, _cache, names = lookup_cards(
             batch_path, bulk_path=sample_bulk_data, cache_dir=tmp_path / "cache"
         )
-        assert len(results) == 1
+        assert names == ["Sol Ring", "Thrasios, Triton Hero"]
+        assert results[0] is not None
         assert results[0]["name"] == "Sol Ring"
 
     def test_still_accepts_name_list(self, sample_bulk_data, tmp_path):
@@ -304,188 +300,41 @@ class TestRarityField:
         result = lookup_single("Sol Ring", bulk_path=sample_bulk_data)
         assert result["id"] == "ddd-sol-ring"
 
-    def test_lookup_includes_rarity(self, sample_bulk_data):
-        result = lookup_single("Sol Ring", bulk_path=sample_bulk_data)
-        assert "rarity" in result
-
-
-class TestBuildRarityIndex:
-    def test_finds_lowest_rarity(self, tmp_path):
-        cards = [
-            {
-                "name": "Dual Card",
-                "rarity": "rare",
-                "legalities": {"commander": "legal"},
-            },
-            {
-                "name": "Dual Card",
-                "rarity": "uncommon",
-                "legalities": {"commander": "legal"},
-            },
-        ]
+    def test_lookup_keeps_rarity(self, tmp_path):
         bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "commander")
-        assert index["dual card"]["rarity"] == "uncommon"
-        assert index["dual card"]["exempt_from_4cap"] is False
-
-    def test_filters_by_legality(self, tmp_path):
-        cards = [
-            {
-                "name": "Arena Card",
-                "rarity": "common",
-                "legalities": {"brawl": "legal", "commander": "not_legal"},
-            },
-            {
-                "name": "Arena Card",
-                "rarity": "rare",
-                "legalities": {"brawl": "legal", "commander": "not_legal"},
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        # Legal in brawl — should find common
-        index = build_rarity_index(bulk_path, "brawl")
-        assert index["arena card"]["rarity"] == "common"
-        # Not legal in commander — should be absent
-        index = build_rarity_index(bulk_path, "commander")
-        assert "arena card" not in index
-
-    def test_treats_special_as_rare(self, tmp_path):
-        cards = [
-            {
-                "name": "Special Card",
-                "rarity": "special",
-                "legalities": {"commander": "legal"},
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "commander")
-        assert index["special card"]["rarity"] == "rare"
-
-    def test_indexes_front_face_of_split_cards(self, tmp_path):
-        cards = [
-            {
-                "name": "Fire // Ice",
-                "rarity": "uncommon",
-                "legalities": {"commander": "legal"},
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "commander")
-        assert index["fire // ice"]["rarity"] == "uncommon"
-        assert index["fire"]["rarity"] == "uncommon"
-
-    def test_exempt_from_4cap_for_any_number_cards(self, tmp_path):
-        """Cards with 'A deck can have any number of cards named X' oracle
-        text are flagged ``exempt_from_4cap=True`` so price-check can
-        suppress the Arena 4-cap substitution for them."""
-        cards = [
-            {
-                "name": "Hare Apparent",
-                "rarity": "common",
-                "legalities": {"commander": "legal"},
-                "oracle_text": (
-                    "When this creature enters, create a number of 1/1 white Rabbit creature tokens equal to the number of other creatures you control named Hare Apparent.\nA deck can have any number of cards named Hare Apparent."
-                ),
-            },
-            {
-                "name": "Regular Rare",
-                "rarity": "rare",
-                "legalities": {"commander": "legal"},
-                "oracle_text": "Draw a card.",
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "commander")
-        assert index["hare apparent"]["exempt_from_4cap"] is True
-        assert index["regular rare"]["exempt_from_4cap"] is False
-
-    def test_exempt_from_4cap_for_up_to_n_cards(self, tmp_path):
-        """Cards with 'A deck can have up to N cards named X' oracle text
-        are also flagged exempt — a deck can legitimately want 7 Seven
-        Dwarves, so owning 4 is not infinite supply."""
-        cards = [
-            {
-                "name": "Seven Dwarves",
-                "rarity": "rare",
-                "legalities": {"commander": "legal"},
-                "oracle_text": (
-                    "This creature gets +1/+1 for each other creature named Seven Dwarves you control.\nA deck can have up to seven cards named Seven Dwarves."
-                ),
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "commander")
-        assert index["seven dwarves"]["exempt_from_4cap"] is True
-
-    def test_skips_draft_set_reprints_for_arena(self, tmp_path):
-        """J21/JMP/AJMP reprints have draft-format rarities that don't match
-        Arena wildcard cost.  A J21 common reprint should be excluded so the
-        real printing's uncommon rarity wins."""
-        cards = [
-            {
-                "name": "Lightning Bolt",
-                "rarity": "common",
-                "set": "j21",
-                "reprint": True,
-                "games": ["arena"],
-                "legalities": {"brawl": "legal"},
-            },
-            {
-                "name": "Lightning Bolt",
-                "rarity": "uncommon",
-                "set": "sta",
-                "reprint": True,
-                "games": ["arena", "paper", "mtgo"],
-                "legalities": {"brawl": "legal"},
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        index = build_rarity_index(bulk_path, "brawl", arena_only=True)
-        assert index["lightning bolt"]["rarity"] == "uncommon"
+        bulk_path.write_text(
+            json.dumps([{**test_card("Sol Ring"), "rarity": "uncommon", "prices": {}}])
+        )
+        result = lookup_single("Sol Ring", bulk_path=bulk_path)
+        assert result["rarity"] == "uncommon"
+        assert "rarity" in display_fields(result)
 
 
 class TestBulkIndexCheapestPrinting:
     def test_prefers_cheapest_printing(self, tmp_path):
         cards = [
             {
-                "name": "Steam Vents",
-                "legalities": {"commander": "legal"},
+                **test_card("Steam Vents"),
                 "prices": {"usd": "1300.00", "usd_foil": None},
             },
             {
-                "name": "Steam Vents",
-                "legalities": {"commander": "legal"},
+                **test_card("Steam Vents"),
                 "prices": {"usd": "13.00", "usd_foil": "20.00"},
             },
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert float(index["steam vents"]["prices"]["usd"]) == 13.00
 
     def test_prefers_priced_over_null(self, tmp_path):
         cards = [
-            {
-                "name": "Sol Ring",
-                "legalities": {"commander": "legal"},
-                "prices": {"usd": None, "usd_foil": None},
-            },
-            {
-                "name": "Sol Ring",
-                "legalities": {"commander": "legal"},
-                "prices": {"usd": "1.50", "usd_foil": "5.00"},
-            },
+            {**test_card("Sol Ring"), "prices": {"usd": None, "usd_foil": None}},
+            {**test_card("Sol Ring"), "prices": {"usd": "1.50", "usd_foil": "5.00"}},
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert float(index["sol ring"]["prices"]["usd"]) == 1.50
 
     def test_skips_tokens(self, tmp_path):
@@ -504,42 +353,31 @@ class TestBulkIndexCheapestPrinting:
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert "soldier" not in index
         assert "real card" in index
 
     def test_standalone_wins_front_face_key_over_split(self, tmp_path):
         """Looking up 'Bind' should return the standalone card, not 'Bind // Liberate'."""
         cards = [
-            {
-                "name": "Bind // Liberate",
-                "legalities": {"commander": "legal"},
-                "prices": {"usd": "0.50"},
-            },
-            {
-                "name": "Bind",
-                "legalities": {"commander": "legal"},
-                "prices": {"usd": "1.00"},
-            },
+            {**test_card("Bind // Liberate"), "prices": {"usd": "0.50"}},
+            # the real standalone Bind, a near miss on the split card's front face
+            {**test_card("Bind"), "prices": {"usd": "1.00"}},
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert index["bind"]["name"] == "Bind"
         assert index["bind // liberate"]["name"] == "Bind // Liberate"
 
     def test_split_front_face_alias_when_no_standalone(self, tmp_path):
         """Looking up 'Fire' should return 'Fire // Ice' when no standalone 'Fire' exists."""
         cards = [
-            {
-                "name": "Fire // Ice",
-                "legalities": {"commander": "legal"},
-                "prices": {"usd": "0.25"},
-            },
+            {**test_card("Fire // Ice"), "prices": {"usd": "0.25"}},
         ]
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(json.dumps(cards))
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert index["fire"]["name"] == "Fire // Ice"
         assert index["fire // ice"]["name"] == "Fire // Ice"
 
@@ -602,7 +440,7 @@ class TestCLI:
         # produced_mana field survives the projection (regression: was being
         # stripped, which broke land-color detection in downstream tools).
         cmd_tower = next(c for c in cached if c["name"] == "Command Tower")
-        assert cmd_tower["produced_mana"] == ["W", "U", "B", "R", "G"]
+        assert cmd_tower["produced_mana"] == ["B", "G", "R", "U", "W"]
         sol_ring = next(c for c in cached if c["name"] == "Sol Ring")
         assert sol_ring["produced_mana"] == ["C"]
 
@@ -681,13 +519,9 @@ class TestCLI:
 class TestBuildDigest:
     def test_classifies_types(self):
         results = [
-            {"name": "Forest", "type_line": "Basic Land — Forest", "cmc": 0},
-            {
-                "name": "Llanowar Elves",
-                "type_line": "Creature — Elf Druid",
-                "cmc": 1,
-            },
-            {"name": "Counterspell", "type_line": "Instant", "cmc": 2},
+            test_card("Forest"),
+            test_card("Llanowar Elves"),
+            test_card("Counterspell"),
         ]
         digest = build_digest(results, ["Forest", "Llanowar Elves", "Counterspell"])
         assert digest["categories"]["lands"] == 1
@@ -697,7 +531,7 @@ class TestBuildDigest:
 
     def test_missing_cards_populate_missing_list(self):
         results = [
-            {"name": "Forest", "type_line": "Basic Land — Forest", "cmc": 0},
+            test_card("Forest"),
             None,
         ]
         digest = build_digest(results, ["Forest", "Bogus"])
@@ -706,7 +540,7 @@ class TestBuildDigest:
 
     def test_avg_cmc_excludes_lands(self):
         results = [
-            {"name": "Forest", "type_line": "Basic Land — Forest", "cmc": 0},
+            test_card("Forest"),
             {"name": "Creature", "type_line": "Creature", "cmc": 4},
             {"name": "Instant", "type_line": "Instant", "cmc": 2},
         ]
@@ -722,67 +556,3 @@ class TestBuildDigest:
         digest = build_digest(results, ["A", "B", "C"])
         assert digest["curve"]["1"] == 2
         assert digest["curve"]["7+"] == 1
-
-
-class TestRarityIndexFormatBanOverrides:
-    """Competitive Brawl reads the ``brawl`` legality key but legalizes every
-    card that key marks ``banned`` (Force of Will, Mana Drain, ...) while
-    enforcing its own ten-card list by name. The rarity index must honor the
-    same overrides ``check_format_legality`` does, or ``price-check`` reports
-    owned, legal staples as "illegal or not on Arena"."""
-
-    def _bulk(self, tmp_path):
-        cards = [
-            {
-                "name": "Force of Will",
-                "rarity": "mythic",
-                "games": ["arena"],
-                "legalities": {"brawl": "banned"},
-            },
-            {
-                "name": "Oko, Thief of Crowns",
-                "rarity": "mythic",
-                "games": ["arena"],
-                "legalities": {"brawl": "banned"},
-            },
-            {
-                "name": "Counterspell",
-                "rarity": "uncommon",
-                "games": ["arena"],
-                "legalities": {"brawl": "legal"},
-            },
-            {
-                "name": "Black Lotus",
-                "rarity": "mythic",
-                "games": ["paper"],
-                "legalities": {"brawl": "not_legal"},
-            },
-        ]
-        bulk_path = tmp_path / "bulk.json"
-        bulk_path.write_text(json.dumps(cards))
-        return bulk_path
-
-    def test_default_still_excludes_key_banned_cards(self, tmp_path):
-        index = build_rarity_index(self._bulk(tmp_path), "brawl", arena_only=True)
-        assert "force of will" not in index
-        assert "counterspell" in index
-
-    def test_ignore_key_bans_admits_banned_cards(self, tmp_path):
-        index = build_rarity_index(
-            self._bulk(tmp_path), "brawl", arena_only=True, ignore_key_bans=True
-        )
-        assert index["force of will"]["rarity"] == "mythic"
-        assert index["counterspell"]["rarity"] == "uncommon"
-        # not_legal still means "not in the pool at all".
-        assert "black lotus" not in index
-
-    def test_banned_cards_by_name_are_excluded(self, tmp_path):
-        index = build_rarity_index(
-            self._bulk(tmp_path),
-            "brawl",
-            arena_only=True,
-            ignore_key_bans=True,
-            banned_cards=frozenset({"Oko, Thief of Crowns"}),
-        )
-        assert "force of will" in index
-        assert "oko, thief of crowns" not in index

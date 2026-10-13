@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from mtg_utils._deck_forge.app import build_app
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.testkit import test_card
 
 CMD = {
     "name": "Goblin Boss",
@@ -13,38 +14,12 @@ CMD = {
     "oracle_text": "{T}: Create a 1/1 red Goblin creature token.",
     "prices": {"usd": "5.00"},
 }
-RABBLE = {
-    "name": "Goblin Rabblemaster",
-    "type_line": "Creature — Goblin Warrior",
-    "cmc": 3.0,
-    "color_identity": ["R"],
-    "oracle_text": "Other Goblin creatures you control attack each combat if able.\nAt the beginning of combat on your turn, create a 1/1 red Goblin creature token with haste.\nWhenever this creature attacks, it gets +1/+0 until end of turn for each other attacking Goblin.",
-    "prices": {"usd": "2.00"},
-}
-FILLER = {
-    "name": "Hill Giant",
-    "type_line": "Creature — Giant",
-    "cmc": 4.0,
-    "color_identity": ["R"],
-    "oracle_text": "",
-    "prices": {"usd": "0.10"},
-}
-MOUNTAIN = {
-    "name": "Mountain",
-    "type_line": "Basic Land — Mountain",
-    "cmc": 0.0,
-    "color_identity": [],
-    "oracle_text": "({T}: Add {R}.)",
-}
-BOLT = {
-    "name": "Lightning Bolt",
-    "type_line": "Instant",
-    "cmc": 1.0,
-    "color_identity": ["R"],
-    "oracle_text": "Lightning Bolt deals 3 damage to any target.",
-    "prices": {"usd": "1.00"},
-}
-INDEX = {c["name"]: c for c in (CMD, RABBLE, FILLER, MOUNTAIN, BOLT)}
+RABBLE = {**test_card("Goblin Rabblemaster"), "prices": {"usd": "2.00"}}
+FILLER = {**test_card("Hill Giant"), "prices": {"usd": "0.10"}}
+MOUNTAIN = test_card("Mountain")
+BOLT = {**test_card("Lightning Bolt"), "prices": {"usd": "1.00"}}
+SHOCK = {**test_card("Shock"), "prices": {"usd": "0.50"}}
+INDEX = {c["name"]: c for c in (CMD, RABBLE, FILLER, MOUNTAIN, BOLT, SHOCK)}
 
 
 def _client(*, search_results=None, bulk=True):
@@ -84,6 +59,21 @@ def test_tune_proposes_swaps_with_budget():
         assert s["cut"]["name"]
         assert s["add"]["name"] == "Lightning Bolt"
     assert data["spent"] <= 50.0
+
+
+def test_tune_exclude_resources_the_same_slot_from_the_next_candidate():
+    """The builder's Reject: an excluded add is never proposed, and the slot it held
+    goes to the next-ranked candidate for the same issue."""
+    client = _client(search_results=[BOLT, SHOCK])
+    first = client.post("/api/tune", json={"max_swaps": 1, "budget": 50.0}).json()
+    (picked,) = [s["add"]["name"] for s in first["swaps"]]
+    other = {"Lightning Bolt": "Shock", "Shock": "Lightning Bolt"}[picked]
+    again = client.post(
+        "/api/tune", json={"max_swaps": 1, "budget": 50.0, "exclude": [picked]}
+    ).json()
+    assert [s["add"]["name"] for s in again["swaps"]] == [other]
+    assert again["excluded"] == [picked]
+    assert again["swaps"][0]["cut"] == first["swaps"][0]["cut"]  # the same slot
 
 
 def test_tune_owned_only_default_no_spend():

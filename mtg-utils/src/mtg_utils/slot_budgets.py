@@ -1,50 +1,51 @@
 """CLI: deck-forge role-density budgets for a deck (D).
 
-A thin wrapper over ``_deck_forge.budgets.slot_budgets`` so deck-wizard's analysis step
-gets a deterministic role table — lands / ramp / card_draw / interaction / board_wipe:
-current count vs the Command-Zone template band — instead of eyeballing it.
+A thin wrapper over ``_analysis.budgets.slot_budgets`` so deck-wizard's analysis step
+gets a deterministic role table — the deck's FAMILY's template rows (the Command
+Zone bands for a Commander deck; interaction / card draw / creatures for 60-card;
+the creature, removal and curve rows for limited): current count vs the band —
+instead of eyeballing it.
 
-    slot-budgets <deck.json> <hydrated.json> [--deck-size N] [--shape SHAPE] [--json]
+    slot-budgets <deck.json> [--bulk-data PATH] [--shape SHAPE] [--json]
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 
-from mtg_utils._deck_forge.budgets import slot_budgets
-from mtg_utils.hydrated_deck import HydratedDeck
+from mtg_utils._analysis.budgets import banded_slot_budgets, template_for
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
 from mtg_utils.mana_audit import mana_audit
 
 
 @click.command()
-@click.argument("deck_json", type=click.Path(exists=True))
-@click.argument("hydrated_json", type=click.Path(exists=True))
-@click.option("--deck-size", default=100, show_default=True, help="60 or 100.")
+@click.argument("deck_json", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option("--shape", default=None, help="aggro | midrange | control | combo.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def main(
-    deck_json: str,
-    hydrated_json: str,
+    deck_json: Path,
+    bulk_data: Path | None,
     *,
-    deck_size: int,
     shape: str | None,
     as_json: bool,
 ) -> None:
-    """Print role-density budgets for DECK_JSON + HYDRATED_JSON."""
-    hd = HydratedDeck.from_paths(deck_json, hydrated_json)
-    # ADR-0041 (Fix 2): pass mana_audit's OWN already-derived land band
-    # directly so the "lands" row matches the deck-specific band mana-audit
-    # reports exactly, instead of re-deriving it from a different ramp tally.
-    land_band_info = mana_audit(hd).get("land_band")
-    budgets = slot_budgets(
-        hd.expanded(),
+    """Print role-density budgets for DECK_JSON (its own deck size)."""
+    hd = acquire_for_cli(deck_json, bulk_data)
+    deck_size = hd.format.deck_size
+    # ADR-0041: the "lands" row is mana-audit's own band, never a re-derivation.
+    # The rows are the family's template over the main deck (a sideboard fills no
+    # slot).
+    budgets = banded_slot_budgets(
+        hd.expanded(zones=("cards",)),
+        mana_audit(hd)["land_band"],
         deck_size=deck_size,
         shape=shape,
-        land_band=(
-            (land_band_info["floor"], land_band_info["top"]) if land_band_info else None
-        ),
+        template=template_for(hd.format.family),
+        deck_mana=hd.deck_mana,
     )
     if as_json:
         click.echo(json.dumps(budgets, indent=2))
@@ -56,6 +57,6 @@ def main(
             flag = f"{b['deviation']} (under)"
         else:
             flag = f"+{b['deviation']} (over)"
-        label = role.replace("_", " ")
+        label = b.get("label") or role.replace("_", " ")
         band = f"{b['min']}-{b['max']}"
-        click.echo(f"{label:14} {b['current']:>3}   band {band}   {flag}")
+        click.echo(f"{label:28} {b['current']:>3}   band {band}   {flag}")

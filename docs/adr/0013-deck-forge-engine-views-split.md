@@ -17,7 +17,8 @@ reaching into `app.py` privates.
   `deck_view`.
 - **`app.py`** — the transport adapter: route closures that parse the payload, call
   engine/views, apply side effects (mutation, `_autosave`, `hub.publish`, the
-  `bulk_available`/zone `Response` guards), and return.
+  `bulk_available` guard), and return; every deck-rule breach (an unknown zone,
+  format, medium or size included) arrives as an engine-raised `DeckRuleError`.
 
 **Why free functions, not a `DeckEngine` class.** `ForgeState.session` is mutable and
 every mutation route edits it in place. A class caching a `HydratedDeck` at construction
@@ -38,3 +39,22 @@ one fewer file (it recouples the frontend contract to deck-math), and don't rein
 a stateful `DeckEngine` class over the mutable session. The candidate pipeline
 (`search_fn → rank_candidates → cap → serialize`) deliberately stays route-side for now;
 extracting it is a separate, smaller deepening.
+
+**Current state (2026-09-12).** Finished. The seven rule bodies that had stayed in
+route closures — the balance / trim land-plan application, the import route's companion
+demotion (CR 103.2b / 702.139a) and the companion-add zone rules, the printings picker's
+owned-annotation and sort, set-printing's printing-id and finish validation, the tune
+route's `TuneParams` composition (transport only since ADR-0052: `tune` asks the
+Format what the medium means), the export route's printing
+resolution, and the combos route's card-view enrichment — are engine functions
+(`balance_lands` / `trim_lands`, `import_deck` + `settle_companion_zone`,
+`check_companion_add`, `printings_for`, `choose_printing`, `tune_params`,
+`export_deck_dict`) and one views function (`enrich_combos`), each tested directly. A
+rule breach raises `engine.DeckRuleError`, which `app.py` maps to a 400 in one handler.
+The engine no longer serializes: `signal_dict` is `views.signal_view`, and
+`discover_commanders` returns domain rows that `views.commander_view` projects — the
+engine imports views only in `snapshot`, its composition root. The route-side candidate
+pipeline this ADR parked became `engine.find_candidates` (ADR-0021), and the hub's
+exporter twin (`exporters.py`) is gone: `export_deck.export_as` is the one printing-aware
+exporter the CLI and `/api/export` share.
+

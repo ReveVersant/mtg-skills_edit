@@ -7,15 +7,18 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from mtg_utils.card_classify import color_identity_subset, is_commander
+from mtg_utils.card_classify import color_identity_subset
 from mtg_utils.card_search import (
     _extract_price,
     _matches_filters,
+    filter_records,
     format_results,
     main,
+    pool_search_fn,
     search_cards,
     unreleased_oracle_ids,
 )
+from mtg_utils.formats import FORMATS
 from mtg_utils.testkit import test_card
 
 
@@ -1110,16 +1113,19 @@ class TestUnreleasedCommanderEligibility:
         "oracle_text": "Whenever Thorin enters, create a Treasure token.",
     }
 
-    def test_is_commander_gates_on_legality_by_default(self):
+    def test_eligibility_gates_on_legality_by_default(self):
         card = _rec("Thorin", "oid-pre", _FUTURE, _ALL_ILLEGAL, **self.LEGEND)
-        assert is_commander(card, "commander")["eligible"] is False
+        assert FORMATS["commander"].commander_eligibility(card)["eligible"] is False
 
-    def test_ignore_legality_admits_the_pre_release_legend(self):
+    def test_unreleased_set_admits_the_pre_release_legend(self):
         card = _rec("Thorin", "oid-pre", _FUTURE, _ALL_ILLEGAL, **self.LEGEND)
-        assert is_commander(card, "commander", ignore_legality=True)["eligible"] is True
+        out = FORMATS["commander"].commander_eligibility(
+            card, unreleased=frozenset({"oid-pre"})
+        )
+        assert out["eligible"] is True
 
-    def test_ignore_legality_still_requires_a_legendary_type_line(self):
-        # The bypass drops the legality gate ONLY — type-line rules still apply.
+    def test_unreleased_still_requires_a_legendary_type_line(self):
+        # The widening drops the legality gate ONLY — type-line rules still apply.
         card = _rec(
             "Sol Ring",
             "oid-pre",
@@ -1128,9 +1134,10 @@ class TestUnreleasedCommanderEligibility:
             type_line="Artifact",
             oracle_text="{T}: Add {C}{C}.",
         )
-        assert (
-            is_commander(card, "commander", ignore_legality=True)["eligible"] is False
+        out = FORMATS["commander"].commander_eligibility(
+            card, unreleased=frozenset({"oid-pre"})
         )
+        assert out["eligible"] is False
 
     def _bulk(self, tmp_path):
         cards = [
@@ -1161,3 +1168,115 @@ class TestUnreleasedCommanderEligibility:
     def test_commanders_only_alone_still_excludes_it(self, tmp_path):
         found = search_cards(self._bulk(tmp_path), limit=100, is_commander_filter=True)
         assert found == []
+
+
+class TestSetFilter:
+    """``--set`` narrows to one set's printings, before the cheapest-printing dedup."""
+
+    def _bulk(self, tmp_path):
+        cards = [
+            {**_make_card(name="Reprint", price_usd="0.50"), "set": "hob"},
+            {**_make_card(name="Reprint", price_usd="0.10"), "set": "m21"},
+            {**_make_card(name="Only Here", price_usd="1.00"), "set": "hob"},
+            {**_make_card(name="Elsewhere", price_usd="1.00"), "set": "m21"},
+        ]
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(json.dumps(cards))
+        return bulk_path
+
+    def test_set_code_keeps_only_that_sets_printings(self, tmp_path):
+        results = search_cards(self._bulk(tmp_path), set_code="HOB", sort="name-asc")
+        assert [c["name"] for c in results] == ["Only Here", "Reprint"]
+        # The reprint's other set never leaks in through the cheapest-printing dedup.
+        assert next(c for c in results if c["name"] == "Reprint")["set"] == "hob"
+
+    def test_a_pool_bounded_format_is_never_arena_gated(self, tmp_path):
+        # A paper Sealed of a pre-Arena set must not be silently restricted to Arena
+        # printings the way an Arena constructed format is.
+        cards = [{**_make_card(name="Paper Only", games=["paper"]), "set": "mh3"}]
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(json.dumps(cards))
+        assert [c["name"] for c in search_cards(bulk_path, format="sealed")] == [
+            "Paper Only"
+        ]
+        assert search_cards(bulk_path, format="historic") == []
+
+    def test_cli_set_option(self, tmp_path):
+        res = CliRunner().invoke(
+            main,
+            ["--bulk-data", str(self._bulk(tmp_path)), "--set", "hob", "--json"],
+        )
+        assert res.exit_code == 0, res.output
+        assert {c["name"] for c in json.loads(res.output)} == {"Only Here", "Reprint"}
+
+
+class TestFilterRecords:
+    """``filter_records`` is the one filter implementation: over an explicit record
+    list it matches ``search_cards`` on the same records — the seam a pool-bounded
+    build searches its opened pool through."""
+
+    def test_matches_search_cards_on_the_same_records(self, tmp_path):
+        cards = [
+            _make_card(name="Cheap Bolt", oracle_text="deals 3 damage", cmc=1.0),
+            _make_card(name="Big Guy", type_line="Creature — Giant", cmc=6.0),
+            _make_card(name="Green Guy", type_line="Creature", color_identity=["G"]),
+        ]
+        bulk_path = tmp_path / "bulk.json"
+        bulk_path.write_text(json.dumps(cards))
+        kwargs = {"card_type": "Creature", "sort": "name-asc", "limit": 10}
+        via_bulk = search_cards(bulk_path, **kwargs)
+        via_records = filter_records(cards, fmt=FORMATS["commander"], **kwargs)
+        assert [c["name"] for c in via_bulk] == [c["name"] for c in via_records]
+        # A pool-bounded Format reads every record as legal.
+        assert (
+            len(filter_records(cards, fmt=FORMATS["sealed"], color_identity="R")) == 2
+        )
+        # The bulk-level keywords of search_cards' contract mean nothing over a pool:
+        # pool_search_fn strips them for a caller forwarding that contract, and
+        # filter_records itself refuses them.
+        pool_search = pool_search_fn(cards, FORMATS["sealed"])
+        assert pool_search(
+            format="sealed", include_unreleased=False, color_identity="R"
+        )
+        with pytest.raises(TypeError):
+            filter_records(cards, fmt=FORMATS["sealed"], format="sealed")
+
+
+class TestPartnerOfFilter:
+    """``partner_of`` (``card_classify.valid_partner_search``) keeps the cards that
+    can be a card's second commander (CR 702.124) — a predicate, not an oracle
+    regex."""
+
+    def _pool(self):
+        return [
+            test_card("Thrasios, Triton Hero"),
+            test_card("Ellie, Vengeful Hunter"),
+            test_card("Joel, Resolute Survivor"),
+            test_card("Regna, the Redeemer"),
+            test_card("Llanowar Elves"),
+        ]
+
+    def test_plain_partner_finds_plain_partners_only(self):
+        names = {
+            c["name"]
+            for c in filter_records(
+                self._pool(),
+                fmt=FORMATS["commander"],
+                color_identity="WUBRG",
+                partner_of=[["plain", ""]],
+            )
+        }
+        # Survivors don't pair with plain partner (CR 702.124f).
+        assert names == {"Thrasios, Triton Hero"}
+
+    def test_survivors_find_survivors(self):
+        names = {
+            c["name"]
+            for c in filter_records(
+                self._pool(),
+                fmt=FORMATS["commander"],
+                color_identity="WUBRG",
+                partner_of=[["group", "Survivors"]],
+            )
+        }
+        assert names == {"Ellie, Vengeful Hunter", "Joel, Resolute Survivor"}

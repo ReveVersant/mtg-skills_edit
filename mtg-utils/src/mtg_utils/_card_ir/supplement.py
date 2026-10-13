@@ -14,9 +14,8 @@ FIELD-correction arms the crosswalk's parallel machinery reuses on the compat
 Card (:mod:`dropped_clauses` — the bucket-(c) synthesis stage — and
 :mod:`field_corrections` — the bucket-(b) completion seam), plus the shared
 anchors/parsers ``tree_synthesis`` and ``bridge_ledger`` import (the
-exile-removal exclusions, ``_EACH_PLAYER_P`` / ``_TAP_OPP_CONTROL_P``,
-``_BASE_POWER_REF`` / ``_anchored``). Each kept arm's own docstring still
-names the phase gap it bridges.
+exile-removal exclusions, ``_EACH_PLAYER_P`` / ``_TAP_OPP_CONTROL_P``). Each kept
+arm's own docstring still names the phase gap it bridges.
 """
 
 from __future__ import annotations
@@ -2155,7 +2154,7 @@ def _has_structural_scaling_pump(card: Card) -> bool:
     """True when a real `pump` Effect already carries a scaling count (a named scale
     op, or a count/multiply/toughness op with a subject or a for-each raw) — i.e. the
     structural scaling_pump arm already fires, so no synth is needed (the byte-mirror's
-    206-card overlap). Mirrors _deck_forge.lanes._is_scaling_count."""
+    206-card overlap). Mirrors _analysis.lanes._is_scaling_count."""
     for ab in card.all_abilities():
         for e in ab.effects:
             if e.category != "pump" or e.amount is None:

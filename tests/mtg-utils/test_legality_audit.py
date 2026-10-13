@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from click.testing import CliRunner
 from conftest import json_from_cli_output
 
-from mtg_utils.format_config import (
-    COMPETITIVE_BRAWL_BANNED,
-    FORMAT_CONFIGS,
-    get_format_config,
-)
+from mtg_utils.formats import FORMATS
 from mtg_utils.hydrated_deck import HydratedDeck
 from mtg_utils.legality_audit import (
     check_color_identity,
@@ -21,6 +18,7 @@ from mtg_utils.legality_audit import (
     legality_audit,
     main,
 )
+from mtg_utils.testkit import test_card
 
 
 def _hd(deck, hydrated):
@@ -30,35 +28,22 @@ def _hd(deck, hydrated):
 # ---------- Card fixtures ----------
 
 
-def card(
-    name: str,
-    *,
-    type_line: str = "Instant",
-    color_identity: list[str] | None = None,
-    brawl: str = "legal",
-    commander: str = "legal",
-    standardbrawl: str = "legal",
-    oracle_text: str = "",
-) -> dict:
+def _real(name: str, **per_printing) -> dict:
+    """The real card *name* from the testkit snapshot (ADR-0056) — its real
+    type line, color identity, oracle text and legalities — with only
+    per-printing facts overlaid."""
+    return {**test_card(name), **per_printing}
+
+
+def card(name: str, *, brawl: str = "legal") -> dict:
+    """A fictional machinery record: only a name and a ``brawl`` legality."""
     return {
         "name": name,
-        "type_line": type_line,
-        "color_identity": color_identity or [],
-        "oracle_text": oracle_text,
-        "legalities": {
-            "brawl": brawl,
-            "commander": commander,
-            "standardbrawl": standardbrawl,
-        },
+        "type_line": "Instant",
+        "color_identity": [],
+        "oracle_text": "",
+        "legalities": {"brawl": brawl, "commander": "legal", "standardbrawl": "legal"},
     }
-
-
-def basic(name: str, color: str) -> dict:
-    return card(
-        name,
-        type_line=f"Basic Land — {name}",
-        color_identity=[color] if color != "C" else [],
-    )
 
 
 def deck(
@@ -68,11 +53,22 @@ def deck(
     deck_size: int | None = None,
 ) -> dict:
     commanders = commanders or ["Jinnie Fay, Jetmir's Second"]
-    cards = cards or []
+    cards = list(cards or [])
     total = len(commanders) + sum(q for _, q in cards)
+    # An honest deck: pad to the format's size with Wastes, which stay UN-hydrated —
+    # every check walks hydrated records (or skips a name it can't resolve) and the
+    # colorless-basic rule ignores Wastes, so the padding is invisible to the checks
+    # while ``Format.for_deck`` (which rejects a Commander-family deck declaring an
+    # impossible size) sees a real 100-card deck.
+    fmt = FORMATS.get(format)
+    if deck_size is None:
+        deck_size = fmt.deck_size if fmt is not None else total
+    if deck_size > total:
+        cards.append(("Wastes", deck_size - total))
+        total = deck_size
     return {
         "format": format,
-        "deck_size": deck_size if deck_size is not None else total,
+        "deck_size": deck_size,
         "commanders": [{"name": n, "quantity": 1} for n in commanders],
         "cards": [{"name": n, "quantity": q} for n, q in cards],
         "total_cards": total,
@@ -80,11 +76,17 @@ def deck(
 
 
 def jinnie() -> dict:
-    return card(
-        "Jinnie Fay, Jetmir's Second",
-        type_line="Legendary Creature — Elf Druid",
-        color_identity=["G", "R", "W"],
-    )
+    return _real("Jinnie Fay, Jetmir's Second")
+
+
+def bulk_for_cli(records: list[dict]) -> list[dict]:
+    """*records* as a CLI test's ``--bulk-data`` file, plus the Wastes that
+    :func:`deck` pads with: the in-memory checks skip the un-hydrated padding, but a
+    CLI acquires every name the deck lists, and a name the file lacks would fall
+    back to Scryfall's API (tests make no network calls)."""
+    if any(r.get("name") == "Wastes" for r in records):
+        return records
+    return [*records, _real("Wastes")]
 
 
 # ---------- Format legality checks ----------
@@ -92,40 +94,36 @@ def jinnie() -> dict:
 
 class TestFormatLegality:
     def test_all_legal(self):
-        hydrated = [jinnie(), card("Swords to Plowshares", color_identity=["W"])]
-        violations = check_format_legality(hydrated, "brawl")
+        hydrated = [jinnie(), _real("Swords to Plowshares")]
+        violations = check_format_legality(hydrated, FORMATS["historic_brawl"])
         assert violations == []
 
     def test_banned_card(self):
-        hydrated = [jinnie(), card("Sol Ring", brawl="not_legal")]
-        violations = check_format_legality(hydrated, "brawl")
+        hydrated = [jinnie(), _real("Sol Ring")]  # not on Arena: brawl not_legal
+        violations = check_format_legality(hydrated, FORMATS["historic_brawl"])
         assert len(violations) == 1
         assert violations[0]["name"] == "Sol Ring"
         assert violations[0]["legality"] == "not_legal"
 
     def test_banned_commander(self):
         # A commander banned in-format should be reported like any other card.
-        bad_cmd = card(
-            "Golos, Tireless Pilgrim",
-            type_line="Legendary Creature — Scout",
-            brawl="banned",
-        )
-        violations = check_format_legality([bad_cmd], "brawl")
+        bad_cmd = _real("Iona, Shield of Emeria")  # banned under the brawl key
+        violations = check_format_legality([bad_cmd], FORMATS["historic_brawl"])
         assert len(violations) == 1
-        assert violations[0]["name"] == "Golos, Tireless Pilgrim"
+        assert violations[0]["name"] == "Iona, Shield of Emeria"
         assert violations[0]["legality"] == "banned"
 
     def test_restricted_counts_as_legal(self):
         # Codebase convention: "restricted" passes the legality filter.
         hydrated = [card("Some Card", brawl="restricted")]
-        violations = check_format_legality(hydrated, "brawl")
+        violations = check_format_legality(hydrated, FORMATS["historic_brawl"])
         assert violations == []
 
     def test_commander_format_uses_commander_key(self):
         # Sol Ring is legal in Commander, not legal in Brawl.
-        hydrated = [card("Sol Ring", brawl="not_legal", commander="legal")]
-        assert check_format_legality(hydrated, "commander") == []
-        assert len(check_format_legality(hydrated, "brawl")) == 1
+        hydrated = [_real("Sol Ring")]
+        assert check_format_legality(hydrated, FORMATS["commander"]) == []
+        assert len(check_format_legality(hydrated, FORMATS["historic_brawl"])) == 1
 
 
 # ---------- Color identity checks ----------
@@ -135,9 +133,9 @@ class TestColorIdentity:
     def test_all_in_identity(self):
         hydrated = [
             jinnie(),
-            card("Lightning Bolt", color_identity=["R"]),
-            card("Swords to Plowshares", color_identity=["W"]),
-            card("Llanowar Elves", color_identity=["G"]),
+            _real("Lightning Bolt"),
+            _real("Swords to Plowshares"),
+            _real("Llanowar Elves"),
         ]
         d = deck(
             cards=[
@@ -146,16 +144,16 @@ class TestColorIdentity:
                 ("Llanowar Elves", 1),
             ]
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert violations == []
 
     def test_off_identity_card(self):
         hydrated = [
             jinnie(),
-            card("Counterspell", color_identity=["U"]),
+            _real("Counterspell"),
         ]
         d = deck(cards=[("Counterspell", 1)])
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert len(violations) == 1
         assert violations[0]["name"] == "Counterspell"
         assert violations[0]["card_identity"] == ["U"]
@@ -164,41 +162,27 @@ class TestColorIdentity:
     def test_multi_color_off_identity_reports_full_identity(self):
         hydrated = [
             jinnie(),
-            card("Thornwood Falls", type_line="Land", color_identity=["G", "U"]),
+            _real("Thornwood Falls"),
         ]
         d = deck(cards=[("Thornwood Falls", 1)])
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert len(violations) == 1
         assert sorted(violations[0]["card_identity"]) == ["G", "U"]
 
     def test_partner_commanders_combined_identity(self):
-        cmd1 = card(
-            "Akiri, Line-Slinger",
-            type_line="Legendary Creature — Kor Soldier",
-            color_identity=["R", "W"],
-            oracle_text="Partner",
-        )
-        cmd2 = card(
-            "Silas Renn, Seeker Adept",
-            type_line="Legendary Creature — Human Artificer",
-            color_identity=["U", "B"],
-            oracle_text="Partner",
-        )
-        hydrated = [cmd1, cmd2, card("Dimir Charm", color_identity=["U", "B"])]
+        cmd1 = _real("Akiri, Line-Slinger")
+        cmd2 = _real("Silas Renn, Seeker Adept")
+        hydrated = [cmd1, cmd2, _real("Dimir Charm")]
         d = deck(
             commanders=["Akiri, Line-Slinger", "Silas Renn, Seeker Adept"],
             cards=[("Dimir Charm", 1)],
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert violations == []
 
     def test_wastes_in_colorless_commander(self):
-        cmd = card(
-            "Kozilek, the Great Distortion",
-            type_line="Legendary Creature — Eldrazi",
-            color_identity=[],
-        )
-        wastes = card("Wastes", type_line="Basic Land — Wastes", color_identity=[])
+        cmd = _real("Kozilek, the Great Distortion")
+        wastes = _real("Wastes")
         hydrated = [cmd, wastes]
         d = deck(
             format="commander",
@@ -206,37 +190,29 @@ class TestColorIdentity:
             cards=[("Wastes", 5)],
         )
         # Commander format: colorless_any_basic=False. Wastes has empty CI so no exemption needed.
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert violations == []
 
     def test_colorless_brawl_one_basic_type_allowed(self):
-        cmd = card(
-            "Karn, Living Legacy",
-            type_line="Legendary Planeswalker — Karn",
-            color_identity=[],
-        )
-        hydrated = [cmd, basic("Plains", "W")]
+        cmd = _real("Karn, Living Legacy")
+        hydrated = [cmd, _real("Plains")]
         d = deck(
             format="historic_brawl",
             commanders=["Karn, Living Legacy"],
             cards=[("Plains", 30)],
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": True})
+        violations = check_color_identity(d, hydrated, FORMATS["historic_brawl"])
         assert violations == []
 
     def test_colorless_brawl_mixed_basics_all_flagged(self):
-        cmd = card(
-            "Karn, Living Legacy",
-            type_line="Legendary Planeswalker — Karn",
-            color_identity=[],
-        )
-        hydrated = [cmd, basic("Plains", "W"), basic("Forest", "G")]
+        cmd = _real("Karn, Living Legacy")
+        hydrated = [cmd, _real("Plains"), _real("Forest")]
         d = deck(
             format="historic_brawl",
             commanders=["Karn, Living Legacy"],
             cards=[("Plains", 15), ("Forest", 15)],
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": True})
+        violations = check_color_identity(d, hydrated, FORMATS["historic_brawl"])
         assert len(violations) == 2
         reasons = {v["reason"] for v in violations}
         assert reasons == {"colorless_deck_must_pick_one_basic_type"}
@@ -244,39 +220,31 @@ class TestColorIdentity:
         assert names == ["Forest", "Plains"]
 
     def test_colorless_commander_rejects_plains(self):
-        cmd = card(
-            "Kozilek, the Great Distortion",
-            type_line="Legendary Creature — Eldrazi",
-            color_identity=[],
-        )
-        hydrated = [cmd, basic("Plains", "W")]
+        cmd = _real("Kozilek, the Great Distortion")
+        hydrated = [cmd, _real("Plains")]
         d = deck(
             format="commander",
             commanders=["Kozilek, the Great Distortion"],
             cards=[("Plains", 5)],
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": False})
+        violations = check_color_identity(d, hydrated, FORMATS["commander"])
         assert len(violations) == 1
         assert violations[0]["name"] == "Plains"
 
     def test_colorless_brawl_single_basic_plus_wastes(self):
         # Wastes (empty CI) is always allowed alongside the chosen exempt basic.
-        cmd = card(
-            "Karn, Living Legacy",
-            type_line="Legendary Planeswalker — Karn",
-            color_identity=[],
-        )
+        cmd = _real("Karn, Living Legacy")
         hydrated = [
             cmd,
-            basic("Plains", "W"),
-            card("Wastes", type_line="Basic Land — Wastes", color_identity=[]),
+            _real("Plains"),
+            _real("Wastes"),
         ]
         d = deck(
             format="historic_brawl",
             commanders=["Karn, Living Legacy"],
             cards=[("Plains", 20), ("Wastes", 10)],
         )
-        violations = check_color_identity(d, hydrated, {"colorless_any_basic": True})
+        violations = check_color_identity(d, hydrated, FORMATS["historic_brawl"])
         assert violations == []
 
 
@@ -310,21 +278,9 @@ class TestCommanderZone:
             ],
         }
         hydrated = [
-            {
-                "name": "Lightning Bolt",
-                "color_identity": ["R"],
-                "legalities": {"commander": "legal"},
-            },
-            {
-                "name": "Swords to Plowshares",
-                "color_identity": ["W"],
-                "legalities": {"commander": "legal"},
-            },
-            {
-                "name": "Sol Ring",
-                "color_identity": [],
-                "legalities": {"commander": "legal"},
-            },
+            _real("Lightning Bolt"),
+            _real("Swords to Plowshares"),
+            _real("Sol Ring"),
         ]
 
         result = legality_audit(_hd(deck, hydrated))
@@ -344,17 +300,8 @@ class TestCommanderZone:
             "cards": [{"name": "Lightning Bolt", "quantity": 1}],
         }
         hydrated = [
-            {
-                "name": "Krenko, Mob Boss",
-                "color_identity": ["R"],
-                "legalities": {"commander": "legal"},
-                "type_line": "Legendary Creature — Goblin Warrior",
-            },
-            {
-                "name": "Lightning Bolt",
-                "color_identity": ["R"],
-                "legalities": {"commander": "legal"},
-            },
+            _real("Krenko, Mob Boss"),
+            _real("Lightning Bolt"),
         ]
 
         result = legality_audit(_hd(deck, hydrated))
@@ -368,13 +315,7 @@ class TestCommanderZone:
             "commanders": [],
             "cards": [{"name": "Lightning Bolt", "quantity": 4}],
         }
-        hydrated = [
-            {
-                "name": "Lightning Bolt",
-                "color_identity": ["R"],
-                "legalities": {"modern": "legal"},
-            }
-        ]
+        hydrated = [_real("Lightning Bolt")]
         result = legality_audit(_hd(deck, hydrated))
         assert result["counts"].get("commander_zone", 0) == 0
 
@@ -396,16 +337,8 @@ class TestCommanderZone:
             ],
         }
         hydrated = [
-            {
-                "name": "Lightning Bolt",
-                "color_identity": ["R"],
-                "legalities": {"commander": "legal"},
-            },
-            {
-                "name": "Sol Ring",
-                "color_identity": [],
-                "legalities": {"commander": "legal"},
-            },
+            _real("Lightning Bolt"),
+            _real("Sol Ring"),
         ]
 
         result = legality_audit(_hd(deck, hydrated))
@@ -435,17 +368,8 @@ class TestCommanderZone:
             "cards": [{"name": "Lightning Bolt", "quantity": 1}],
         }
         hydrated = [
-            {
-                "name": "Thrasios, Triton Hero",
-                "color_identity": ["G", "U"],
-                "legalities": {"commander": "legal"},
-                "type_line": "Legendary Creature — Merfolk Wizard",
-            },
-            {
-                "name": "Lightning Bolt",
-                "color_identity": ["R"],
-                "legalities": {"commander": "legal"},
-            },
+            _real("Thrasios, Triton Hero"),
+            _real("Lightning Bolt"),
         ]
 
         result = legality_audit(_hd(deck, hydrated))
@@ -470,17 +394,8 @@ class TestCommanderZone:
             "cards": [{"name": "Sol Ring", "quantity": 1}],
         }
         hydrated = [
-            {
-                "name": "Kozilek, Butcher of Truth",
-                "color_identity": [],
-                "legalities": {"commander": "legal"},
-                "type_line": "Legendary Creature — Eldrazi",
-            },
-            {
-                "name": "Sol Ring",
-                "color_identity": [],
-                "legalities": {"commander": "legal"},
-            },
+            _real("Kozilek, Butcher of Truth"),
+            _real("Sol Ring"),
         ]
         result = legality_audit(_hd(deck, hydrated))
         assert result["counts"]["commander_zone"] == 0
@@ -488,8 +403,8 @@ class TestCommanderZone:
 
 # ---------- Copy limit checks ----------
 
-_SINGLETON_CONFIG = {"max_copies": 1, "legality_key": "commander"}
-_CONSTRUCTED_CONFIG = {"max_copies": 4, "legality_key": "pioneer"}
+_SINGLETON_CONFIG = FORMATS["commander"]
+_CONSTRUCTED_CONFIG = FORMATS["pioneer"]
 
 
 class TestCopyLimits:
@@ -497,7 +412,7 @@ class TestCopyLimits:
         return {c["name"]: c for c in hydrated}
 
     def test_normal_singleton_violation(self):
-        hydrated = [card("Lightning Bolt")]
+        hydrated = [_real("Lightning Bolt")]
         d = deck(cards=[("Lightning Bolt", 2)])
         v = check_copy_limits(d, self._hyd_index(hydrated), _SINGLETON_CONFIG)
         assert len(v) == 1
@@ -507,43 +422,22 @@ class TestCopyLimits:
         assert v[0]["reason"] == "copy_limit"
 
     def test_basic_land_allowed(self):
-        hydrated = [basic("Forest", "G")]
+        hydrated = [_real("Forest")]
         d = deck(cards=[("Forest", 40)])
         assert check_copy_limits(d, self._hyd_index(hydrated), _SINGLETON_CONFIG) == []
 
     def test_any_number_exemption(self):
-        hare = card(
-            "Hare Apparent",
-            type_line="Creature — Rabbit",
-            color_identity=["W"],
-            oracle_text=(
-                "A deck can have any number of cards named Hare Apparent.\n"
-                "When Hare Apparent enters, create a 1/1 white Rabbit creature token."
-            ),
-        )
+        hare = _real("Hare Apparent")
         d = deck(cards=[("Hare Apparent", 40)])
         assert check_copy_limits(d, self._hyd_index([hare]), _SINGLETON_CONFIG) == []
 
     def test_up_to_n_at_cap(self):
-        dwarves = card(
-            "Seven Dwarves",
-            type_line="Creature — Dwarf",
-            color_identity=["R"],
-            oracle_text=(
-                "A deck can have up to seven cards named Seven Dwarves.\n"
-                "Seven Dwarves gets +1/+1 for each other Dwarf named Seven Dwarves you control."
-            ),
-        )
+        dwarves = _real("Seven Dwarves")
         d = deck(cards=[("Seven Dwarves", 7)])
         assert check_copy_limits(d, self._hyd_index([dwarves]), _SINGLETON_CONFIG) == []
 
     def test_up_to_n_over_cap(self):
-        dwarves = card(
-            "Seven Dwarves",
-            type_line="Creature — Dwarf",
-            color_identity=["R"],
-            oracle_text="A deck can have up to seven cards named Seven Dwarves.",
-        )
+        dwarves = _real("Seven Dwarves")
         d = deck(cards=[("Seven Dwarves", 8)])
         v = check_copy_limits(d, self._hyd_index([dwarves]), _SINGLETON_CONFIG)
         assert len(v) == 1
@@ -553,17 +447,25 @@ class TestCopyLimits:
         assert v[0]["reason"] == "exceeds_named_card_cap"
 
     def test_nazgul_nine(self):
-        nazgul = card(
-            "Nazgûl",
-            type_line="Creature — Wraith",
-            color_identity=["B"],
-            oracle_text="A deck can have up to nine cards named Nazgûl.",
-        )
+        nazgul = _real("Nazgûl")
         d = deck(cards=[("Nazgûl", 9)])
         assert check_copy_limits(d, self._hyd_index([nazgul]), _SINGLETON_CONFIG) == []
 
+    def test_card_copy_limit_is_the_one_ladder(self):
+        from mtg_utils.legality_audit import card_copy_limit
+
+        plains = _real("Plains")
+        rats = _real("Relentless Rats")
+        bolt = _real("Lightning Bolt")
+        lotus = _real("Black Lotus")  # vintage: restricted
+        assert card_copy_limit(plains, FORMATS["modern"]) is None
+        assert card_copy_limit(rats, FORMATS["modern"]) is None
+        assert card_copy_limit(bolt, FORMATS["modern"]) == 4
+        assert card_copy_limit(bolt, FORMATS["commander"]) == 1
+        assert card_copy_limit(lotus, FORMATS["vintage"]) == 1
+
     def test_constructed_4_of_allowed(self):
-        hydrated = [card("Lightning Bolt")]
+        hydrated = [_real("Lightning Bolt")]
         d = deck(cards=[("Lightning Bolt", 4)])
         d["format"] = "pioneer"
         assert (
@@ -571,7 +473,7 @@ class TestCopyLimits:
         )
 
     def test_constructed_5_of_violation(self):
-        hydrated = [card("Lightning Bolt")]
+        hydrated = [_real("Lightning Bolt")]
         d = deck(cards=[("Lightning Bolt", 5)])
         d["format"] = "pioneer"
         v = check_copy_limits(d, self._hyd_index(hydrated), _CONSTRUCTED_CONFIG)
@@ -579,7 +481,7 @@ class TestCopyLimits:
         assert v[0]["limit"] == 4
 
     def test_constructed_main_plus_sideboard_combined(self):
-        hydrated = [card("Lightning Bolt")]
+        hydrated = [_real("Lightning Bolt")]
         d = {
             "format": "pioneer",
             "cards": [{"name": "Lightning Bolt", "quantity": 3}],
@@ -591,9 +493,7 @@ class TestCopyLimits:
         assert v[0]["limit"] == 4
 
     def test_vintage_restricted_capped_at_1(self):
-        restricted_card = card("Ancestral Recall")
-        restricted_card["legalities"]["vintage"] = "restricted"
-        hydrated = [restricted_card]
+        hydrated = [_real("Ancestral Recall")]  # vintage: restricted
         d = {
             "format": "vintage",
             "cards": [{"name": "Ancestral Recall", "quantity": 2}],
@@ -601,7 +501,7 @@ class TestCopyLimits:
         v = check_copy_limits(
             d,
             self._hyd_index(hydrated),
-            {"max_copies": 4, "legality_key": "vintage"},
+            FORMATS["vintage"],
         )
         assert len(v) == 1
         assert v[0]["limit"] == 1
@@ -615,8 +515,8 @@ class TestLegalityAudit:
     def test_clean_deck_passes(self):
         hydrated = [
             jinnie(),
-            card("Swords to Plowshares", color_identity=["W"]),
-            basic("Forest", "G"),
+            _real("Swords to Plowshares"),
+            _real("Forest"),
         ]
         d = deck(cards=[("Swords to Plowshares", 1), ("Forest", 30)])
         result = legality_audit(_hd(d, hydrated))
@@ -629,9 +529,9 @@ class TestLegalityAudit:
     def test_multi_violation_deck_fails(self):
         hydrated = [
             jinnie(),
-            card("Sol Ring", brawl="not_legal"),  # banned
-            card("Counterspell", color_identity=["U"]),  # off-identity
-            card("Lightning Bolt", color_identity=["R"]),
+            _real("Sol Ring"),  # not_legal (not on Arena)
+            _real("Counterspell"),  # off-identity
+            _real("Lightning Bolt"),
         ]
         d = deck(
             cards=[
@@ -665,28 +565,32 @@ class TestCLI:
         deck_path = tmp_path / "deck.json"
         hydrated_path = tmp_path / "hydrated.json"
         deck_path.write_text(json.dumps(deck_data))
-        hydrated_path.write_text(json.dumps(hydrated_data))
+        hydrated_path.write_text(json.dumps(bulk_for_cli(hydrated_data)))
         return deck_path, hydrated_path
 
     def test_cli_pass(self, tmp_path: Path):
-        hydrated = [jinnie(), card("Swords to Plowshares", color_identity=["W"])]
+        hydrated = [jinnie(), _real("Swords to Plowshares")]
         d = deck(cards=[("Swords to Plowshares", 1)])
         deck_path, hydrated_path = self._write(tmp_path, d, hydrated)
 
         runner = CliRunner()
-        result = runner.invoke(main, [str(deck_path), str(hydrated_path)])
+        result = runner.invoke(
+            main, [str(deck_path), "--bulk-data", str(hydrated_path)]
+        )
         assert result.exit_code == 0
         assert "PASS" in result.output
         data = json_from_cli_output(result)
         assert data["overall_status"] == "PASS"
 
     def test_cli_fail(self, tmp_path: Path):
-        hydrated = [jinnie(), card("Sol Ring", brawl="not_legal")]
+        hydrated = [jinnie(), _real("Sol Ring")]
         d = deck(cards=[("Sol Ring", 1)])
         deck_path, hydrated_path = self._write(tmp_path, d, hydrated)
 
         runner = CliRunner()
-        result = runner.invoke(main, [str(deck_path), str(hydrated_path)])
+        result = runner.invoke(
+            main, [str(deck_path), "--bulk-data", str(hydrated_path)]
+        )
         assert result.exit_code == 0  # data producer convention
         assert "FAIL" in result.output
         assert "Sol Ring" in result.output
@@ -703,7 +607,13 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            [str(deck_path), str(hydrated_path), "--output", str(custom_output)],
+            [
+                str(deck_path),
+                "--bulk-data",
+                str(hydrated_path),
+                "--output",
+                str(custom_output),
+            ],
         )
         assert result.exit_code == 0
         assert custom_output.exists()
@@ -740,7 +650,7 @@ class TestCiteRules:
         deck_path = tmp_path / "deck.json"
         hydrated_path = tmp_path / "hydrated.json"
         deck_path.write_text(json.dumps(deck_data))
-        hydrated_path.write_text(json.dumps(hydrated_data))
+        hydrated_path.write_text(json.dumps(bulk_for_cli(hydrated_data)))
         return deck_path, hydrated_path
 
     def _write_rules(self, tmp_path):
@@ -752,7 +662,7 @@ class TestCiteRules:
         # Historic Brawl singleton — two copies of Sol Ring triggers a
         # copy_limit violation whose reason should cite 100.2a / 903.5b.
         rules_path = self._write_rules(tmp_path)
-        hydrated = [jinnie(), card("Sol Ring")]
+        hydrated = [jinnie(), _real("Sol Ring")]
         d = deck(cards=[("Sol Ring", 2)])
         deck_path, hydrated_path = self._write(tmp_path, d, hydrated)
 
@@ -761,6 +671,7 @@ class TestCiteRules:
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--cite-rules",
                 "--rules-file",
@@ -785,6 +696,7 @@ class TestCiteRules:
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--cite-rules",
                 "--rules-file",
@@ -803,13 +715,15 @@ class TestCiteRules:
         <skill>`` rebased cwd and the default search missed the CR."""
         rules_path = self._write_rules(tmp_path)
         assert rules_path.parent == tmp_path
-        hydrated = [jinnie(), card("Sol Ring")]
+        hydrated = [jinnie(), _real("Sol Ring")]
         d = deck(cards=[("Sol Ring", 2)])
         deck_path, hydrated_path = self._write(tmp_path, d, hydrated)
 
         runner = CliRunner()
         # No --cite-rules (default-on), no --rules-file (input-dir search).
-        result = runner.invoke(main, [str(deck_path), str(hydrated_path)])
+        result = runner.invoke(
+            main, [str(deck_path), "--bulk-data", str(hydrated_path)]
+        )
         assert result.exit_code == 0, result.output
         data = json_from_cli_output(result)
         citations = data.get("rule_citations") or {}
@@ -820,13 +734,13 @@ class TestCiteRules:
         """--no-cite-rules skips citation attachment even with a
         reachable CR."""
         self._write_rules(tmp_path)
-        hydrated = [jinnie(), card("Sol Ring")]
+        hydrated = [jinnie(), _real("Sol Ring")]
         d = deck(cards=[("Sol Ring", 2)])
         deck_path, hydrated_path = self._write(tmp_path, d, hydrated)
 
         runner = CliRunner()
         result = runner.invoke(
-            main, [str(deck_path), str(hydrated_path), "--no-cite-rules"]
+            main, [str(deck_path), "--bulk-data", str(hydrated_path), "--no-cite-rules"]
         )
         assert result.exit_code == 0, result.output
         data = json_from_cli_output(result)
@@ -850,7 +764,9 @@ class TestCiteRules:
         monkeypatch.chdir(tmp_path)
 
         runner = CliRunner()
-        result = runner.invoke(main, [str(deck_path), str(hydrated_path)])
+        result = runner.invoke(
+            main, [str(deck_path), "--bulk-data", str(hydrated_path)]
+        )
         assert result.exit_code == 0, result.output
         assert "WARN: rule_citations not attached" in result.output
 
@@ -858,13 +774,9 @@ class TestCiteRules:
 # ---------- Companion checks ----------
 
 
-def _companion_card(name: str, *, cmc: float = 4.0) -> dict:
-    """A hydrated companion record: the Companion keyword + a real Ikoria name."""
-    return {
-        **card(name, type_line="Legendary Creature — Beast"),
-        "keywords": ["Companion"],
-        "cmc": cmc,
-    }
+def _companion_card(name: str) -> dict:
+    """A real Ikoria companion from the testkit snapshot."""
+    return test_card(name)
 
 
 class TestCompanion:
@@ -879,9 +791,9 @@ class TestCompanion:
 
     def test_condition_violation_keruga_with_a_two_drop(self):
         # Keruga: every nonland card must be mana value 3+; Sol Ring is a 1-drop.
-        keruga = _companion_card("Keruga, the Macrosage", cmc=5.0)
-        commander = {**jinnie(), "cmc": 4.0}
-        sol_ring = {**card("Sol Ring", type_line="Artifact"), "cmc": 1.0}
+        keruga = _companion_card("Keruga, the Macrosage")
+        commander = jinnie()  # MV 3: satisfies Keruga
+        sol_ring = _real("Sol Ring")
         d = deck(cards=[("Sol Ring", 1)])
         d["companion"] = [{"name": "Keruga, the Macrosage", "quantity": 1}]
         result = legality_audit(_hd(d, [commander, sol_ring, keruga]))
@@ -893,16 +805,16 @@ class TestCompanion:
         assert result["overall_status"] == "FAIL"
 
     def test_satisfied_condition_passes(self):
-        keruga = _companion_card("Keruga, the Macrosage", cmc=5.0)
-        commander = {**jinnie(), "cmc": 4.0}
-        giant = {**card("Hill Giant", type_line="Creature — Giant"), "cmc": 4.0}
+        keruga = _companion_card("Keruga, the Macrosage")
+        commander = jinnie()  # MV 3: satisfies Keruga
+        giant = _real("Hill Giant")
         d = deck(cards=[("Hill Giant", 1)])
         d["companion"] = [{"name": "Keruga, the Macrosage", "quantity": 1}]
         result = legality_audit(_hd(d, [commander, giant, keruga]))
         assert result["violations"]["companion"] == []
 
     def test_non_companion_card_in_the_zone(self):
-        sol_ring = {**card("Sol Ring", type_line="Artifact"), "cmc": 1.0}
+        sol_ring = _real("Sol Ring")
         d = deck()
         d["companion"] = [{"name": "Sol Ring", "quantity": 1}]
         result = legality_audit(_hd(d, [jinnie(), sol_ring]))
@@ -910,9 +822,9 @@ class TestCompanion:
         assert [x["reason"] for x in v] == ["companion_not_companion"]
 
     def test_multiple_companions_flagged(self):
-        keruga = _companion_card("Keruga, the Macrosage", cmc=5.0)
-        yorion = _companion_card("Yorion, Sky Nomad", cmc=4.0)
-        commander = {**jinnie(), "cmc": 4.0}
+        keruga = _companion_card("Keruga, the Macrosage")
+        yorion = _companion_card("Yorion, Sky Nomad")
+        commander = jinnie()  # MV 3: satisfies Keruga
         d = deck()
         d["companion"] = [
             {"name": "Keruga, the Macrosage", "quantity": 1},
@@ -929,19 +841,10 @@ class TestCompanion:
         assert result["violations"]["companion"] == []
 
     def _std_deck(self, n_cards: int) -> dict:
-        plains = {
-            "name": "Plains",
-            "type_line": "Basic Land — Plains",
-            "cmc": 0.0,
-            "color_identity": [],
-            "legalities": {"standard": "legal"},
-        }
-        yorion = {
-            **_companion_card("Yorion, Sky Nomad", cmc=4.0),
-            "legalities": {"standard": "legal"},
-        }
+        plains = _real("Plains")
+        yorion = _companion_card("Yorion, Sky Nomad")
         d = {
-            "format": "standard",
+            "format": "pioneer",  # Yorion is Pioneer-legal (rotated out of Standard)
             "commanders": [],
             "cards": [{"name": "Plains", "quantity": n_cards}],
             "sideboard": [],
@@ -959,6 +862,28 @@ class TestCompanion:
     def test_yorion_satisfied_at_80_in_constructed(self):
         assert self._std_deck(80)["violations"]["companion"] == []
 
+    def test_a_builds_own_size_never_raises_the_floor(self):
+        # A Pioneer build targeting 80 (Yorion) is audited against the 60-card CR
+        # floor: 80 cards satisfy Yorion (60 + 20), and 60 cards are not below
+        # the minimum.
+        plains = _real("Plains")
+        yorion = _companion_card("Yorion, Sky Nomad")
+        d = {
+            "format": "pioneer",
+            "deck_size": 80,
+            "commanders": [],
+            "cards": [{"name": "Plains", "quantity": 80}],
+            "sideboard": [],
+            "companion": [{"name": "Yorion, Sky Nomad", "quantity": 1}],
+        }
+        result = legality_audit(_hd(d, [plains, yorion]))
+        assert result["violations"]["companion"] == []
+        d["cards"] = [{"name": "Plains", "quantity": 60}]
+        d["companion"] = []
+        assert legality_audit(_hd(d, [plains, yorion]))["violations"][
+            "deck_minimum"
+        ] == ([])
+
     def test_companion_never_pads_the_deck_minimum(self):
         # 100 counted cards vs a 101 minimum: the companion is outside the deck
         # (CR 702.139a-b), so it must NOT bring the total to 101.
@@ -969,7 +894,7 @@ class TestCompanion:
             "cards": [{"name": "Forest", "quantity": 99}],
             "companion": [{"name": "Yorion, Sky Nomad", "quantity": 1}],
         }
-        violations = check_deck_minimum(d, {"deck_size": 101})
+        violations = check_deck_minimum(d, replace(FORMATS["commander"], deck_size=101))
         assert violations
         assert violations[0]["total_cards"] == 100
 
@@ -980,7 +905,7 @@ class TestCompanion:
             "sideboard": [{"name": "Duress", "quantity": 15}],
             "companion": [{"name": "Yorion, Sky Nomad", "quantity": 1}],
         }
-        assert check_sideboard_size(d, {"sideboard_size": 15}) == []
+        assert check_sideboard_size(d, FORMATS["standard"]) == []
 
 
 class TestCompanionCiteRules:
@@ -1021,9 +946,9 @@ class TestCompanionCiteRules:
     def test_companion_reasons_are_cited(self, tmp_path: Path):
         rules_path = tmp_path / "comprehensive-rules-20240202.txt"
         rules_path.write_text(self._CR_FIXTURE, encoding="utf-8")
-        keruga = _companion_card("Keruga, the Macrosage", cmc=5.0)
-        commander = {**jinnie(), "cmc": 4.0}
-        sol_ring = {**card("Sol Ring", type_line="Artifact"), "cmc": 1.0}
+        keruga = _companion_card("Keruga, the Macrosage")
+        commander = jinnie()  # MV 3: satisfies Keruga
+        sol_ring = _real("Sol Ring")
         # One deck triggering all three reasons: two occupants (103.2b), one of
         # them not a companion (702.139a), and Keruga's condition broken by the
         # 1-drop (702.139b).
@@ -1035,13 +960,16 @@ class TestCompanionCiteRules:
         deck_path = tmp_path / "deck.json"
         hydrated_path = tmp_path / "hydrated.json"
         deck_path.write_text(json.dumps(d))
-        hydrated_path.write_text(json.dumps([commander, sol_ring, keruga]))
+        hydrated_path.write_text(
+            json.dumps(bulk_for_cli([commander, sol_ring, keruga]))
+        )
 
         runner = CliRunner()
         result = runner.invoke(
             main,
             [
                 str(deck_path),
+                "--bulk-data",
                 str(hydrated_path),
                 "--cite-rules",
                 "--rules-file",
@@ -1059,70 +987,136 @@ class TestCompanionCiteRules:
 
 
 class TestCompetitiveBrawl:
-    """Competitive Brawl shares the `brawl` legality key but not its ban list:
-    it legalizes everything that key marks `banned` and enforces its own ten
-    cards by name. `not_legal` still fails — that means absent from Arena."""
+    """Competitive Brawl reads its own `competitivebrawl` legality key, whose ban
+    list is not ordinary Brawl's: most cards the `brawl` key bans are legal here,
+    and it bans ten of its own. `not_legal` means absent from Arena."""
 
-    def test_key_banned_card_is_legal(self):
+    def test_brawl_banned_card_is_legal(self):
         # Mana Drain is banned in ordinary Historic Brawl, legal here.
-        hydrated = [card("Mana Drain", color_identity=["U"], brawl="banned")]
-        violations = check_format_legality(
-            hydrated,
-            "brawl",
-            ignore_key_bans=True,
-            banned_cards=COMPETITIVE_BRAWL_BANNED,
-        )
+        hydrated = [_real("Mana Drain")]
+        violations = check_format_legality(hydrated, FORMATS["competitive_brawl"])
         assert violations == []
 
-    def test_not_legal_card_still_fails(self):
+    def test_not_legal_card_fails(self):
         # not_legal means the card isn't on Arena at all — still a violation.
-        hydrated = [card("Sol Ring", brawl="not_legal")]
-        violations = check_format_legality(
-            hydrated,
-            "brawl",
-            ignore_key_bans=True,
-            banned_cards=COMPETITIVE_BRAWL_BANNED,
-        )
+        hydrated = [_real("Sol Ring")]
+        violations = check_format_legality(hydrated, FORMATS["competitive_brawl"])
         assert len(violations) == 1
         assert violations[0]["legality"] == "not_legal"
 
-    def test_format_ban_list_is_enforced_by_name(self):
-        # Oko is `legal` under the brawl key but banned in Competitive Brawl.
-        hydrated = [card("Oko, Thief of Crowns", color_identity=["G"])]
-        violations = check_format_legality(
-            hydrated,
-            "brawl",
-            ignore_key_bans=True,
-            banned_cards=COMPETITIVE_BRAWL_BANNED,
-        )
+    def test_card_banned_under_the_competitive_brawl_key_fails(self):
+        # Oko is `banned` under the `competitivebrawl` key (one of its ten).
+        hydrated = [_real("Oko, Thief of Crowns")]
+        violations = check_format_legality(hydrated, FORMATS["competitive_brawl"])
         assert len(violations) == 1
         assert violations[0]["name"] == "Oko, Thief of Crowns"
         assert violations[0]["legality"] == "banned"
 
-    def test_config_wires_the_overrides(self):
-        cfg = get_format_config({"format": "competitive_brawl"})
-        assert cfg["ignores_legality_key_bans"] is True
-        assert cfg["banned_cards"] is COMPETITIVE_BRAWL_BANNED
-        assert cfg["legality_key"] == "brawl"
-        assert cfg["deck_size"] == 100
-        assert cfg["life_total"] == 25
-        # Unlike ordinary Brawl, there is no free mulligan.
-        assert cfg["free_mulligan"] is False
-        assert FORMAT_CONFIGS["brawl"]["free_mulligan"] is True
-
-    def test_end_to_end_audit_passes_with_a_key_banned_card(self):
-        cmd = card(
-            "Thranduil, the Elvenking",
-            type_line="Legendary Creature — Elf Noble",
-            color_identity=["B", "G", "U"],
-        )
-        drain = card("Mana Drain", color_identity=["U"], brawl="banned")
+    def test_end_to_end_audit_passes_with_a_brawl_banned_card(self):
+        cmd = _real("Thranduil, the Elvenking")
+        drain = _real("Mana Drain")
         deck = {
             "format": "competitive_brawl",
-            "deck_size": 2,
             "commanders": [{"name": "Thranduil, the Elvenking", "quantity": 1}],
             "cards": [{"name": "Mana Drain", "quantity": 1}],
             "total_cards": 2,
         }
         result = legality_audit(_hd(deck, [cmd, drain]))
         assert result["violations"]["format_legality"] == []
+
+
+# ---------- Pool containment (limited) ----------
+
+
+class TestPoolContainment:
+    """A sealed / draft deck is drawn from its opened pool (CR 100.2b): every copy in
+    the main deck and sideboard must be in the pool, basics excepted; there is no
+    copy limit and no sideboard cap."""
+
+    COMMON = test_card("Stone by Sunlight")
+    RARE = test_card("The One Ring")
+    PLAINS = test_card("Plains")
+
+    def _audit(self, *, cards, sideboard=(), pool=()):
+        d = {
+            "format": "sealed",
+            "commanders": [],
+            "cards": [{"name": n, "quantity": q} for n, q in cards],
+            "sideboard": [{"name": n, "quantity": q} for n, q in sideboard],
+            "pool": [{"name": n, "quantity": q} for n, q in pool],
+        }
+        return legality_audit(_hd(d, [self.COMMON, self.RARE, self.PLAINS]))
+
+    def test_off_pool_card_is_a_violation(self):
+        result = self._audit(
+            cards=[("The One Ring", 1), ("Plains", 39)],
+            pool=[("Stone by Sunlight", 3)],
+        )
+        v = result["violations"]["pool_containment"]
+        assert v == [
+            {
+                "name": "The One Ring",
+                "quantity": 1,
+                "in_pool": 0,
+                "reason": "not_in_pool",
+            }
+        ]
+        assert result["overall_status"] == "FAIL"
+
+    def test_duplicates_the_product_included_are_legal(self):
+        result = self._audit(
+            cards=[("Stone by Sunlight", 3), ("Plains", 37)],
+            pool=[("Stone by Sunlight", 3)],
+        )
+        assert result["violations"]["pool_containment"] == []
+        assert result["violations"]["copy_limits"] == []  # no copy limit
+
+    def test_a_fourth_copy_the_pool_lacks_is_a_violation(self):
+        result = self._audit(
+            cards=[("Stone by Sunlight", 4), ("Plains", 36)],
+            pool=[("Stone by Sunlight", 3)],
+        )
+        assert result["violations"]["pool_containment"][0]["in_pool"] == 3
+
+    def test_basics_are_unlimited_and_outside_the_pool(self):
+        result = self._audit(cards=[("Plains", 40)], pool=[("The One Ring", 1)])
+        assert result["violations"]["pool_containment"] == []
+
+    def test_a_basic_with_no_record_is_still_exempt_by_name(self):
+        from mtg_utils.legality_audit import check_pool_containment
+
+        d = {"cards": [{"name": "Snow-Covered Forest", "quantity": 17}], "pool": []}
+        assert check_pool_containment(d, {}, FORMATS["sealed"]) == []
+        d = {"cards": [{"name": "Not A Basic", "quantity": 1}], "pool": []}
+        assert check_pool_containment(d, {}, FORMATS["sealed"])[0]["name"] == (
+            "Not A Basic"
+        )
+
+    def test_the_sideboard_is_the_unused_pool_with_no_cap(self):
+        result = self._audit(
+            cards=[("Plains", 40)],
+            sideboard=[("Stone by Sunlight", 43)],
+            pool=[("Stone by Sunlight", 43)],
+        )
+        assert result["violations"]["sideboard_size"] == []
+        assert result["violations"]["pool_containment"] == []
+
+    def test_below_the_40_card_minimum_cites_100_2b(self):
+        result = self._audit(cards=[("Plains", 39)], pool=[])
+        assert result["violations"]["deck_minimum"][0]["minimum"] == 40
+        from mtg_utils.legality_audit import _REASON_TO_CR_RULES
+
+        assert "100.2b" in _REASON_TO_CR_RULES["below_minimum"]
+        assert _REASON_TO_CR_RULES["not_in_pool"] == ("100.2b",)
+
+    def test_a_constructed_deck_has_no_containment_check(self):
+        d = {
+            "format": "modern",
+            "commanders": [],
+            "cards": [{"name": "Plains", "quantity": 60}],
+            "sideboard": [],
+        }
+        assert (
+            legality_audit(_hd(d, [self.PLAINS]))["violations"]["pool_containment"]
+            == []
+        )

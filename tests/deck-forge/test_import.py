@@ -6,17 +6,9 @@ from fastapi.testclient import TestClient
 
 from mtg_utils._deck_forge.app import build_app
 from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils.testkit import test_card
 
-SOL_RING = {
-    "name": "Sol Ring",
-    "type_line": "Artifact",
-    "cmc": 1.0,
-    "mana_cost": "{1}",
-    "color_identity": [],
-    "oracle_text": "{T}: Add {C}{C}.",
-    "prices": {"usd": "1.50"},
-    "legalities": {"commander": "legal"},
-}
+SOL_RING = {**test_card("Sol Ring"), "prices": {"usd": "1.50"}}
 
 PLAIN = "1 Sol Ring\n1 Llanowar Elves\n1 Arcane Signet\n"
 WITH_COMMANDER = (
@@ -73,7 +65,14 @@ def test_import_rejects_an_empty_list():
     )
 
 
-def test_import_rejects_an_unsupported_format():
+def test_import_rejects_an_unknown_format():
     client, _ = _client()
-    r = client.post("/api/builds/import", json={"text": PLAIN, "format": "modern"})
+    r = client.post("/api/builds/import", json={"text": PLAIN, "format": "bogus"})
     assert r.status_code == 400
+
+
+def test_import_accepts_a_constructed_format():
+    client, _ = _client(by_name={"Sol Ring": SOL_RING})
+    r = client.post("/api/builds/import", json={"text": PLAIN, "format": "modern"})
+    assert r.status_code == 200
+    assert r.json()["deck"]["format"] == "modern"

@@ -1,7 +1,7 @@
 """P/T-dependent classifiers must work on *hydrated* cards, not just raw bulk records.
 
-``scryfall_lookup.CARD_FIELDS`` is a strict whitelist, and ``power``/``toughness``
-were missing from it. Because ``card_classify.card_pt_int`` defaults a missing field
+``scryfall_lookup.CARD_FIELDS`` was a strict whitelist (retired by ADR-0046 for the
+bulk's own record shape), and ``power``/``toughness`` were missing from it. Because ``card_classify.card_pt_int`` defaults a missing field
 to ``0``, every gate of the form ``card_pt_int(card) >= N`` silently evaluated False
 for anything that went through ``scryfall-lookup --batch`` — which is the only input
 the tuner, deck-rank and the goldfish accept.
@@ -11,10 +11,13 @@ Those gates were therefore dead in production while passing their own unit tests
 asserting the classifiers against records that have actually been through hydration.
 """
 
-from mtg_utils._deck_forge.text_reads import _VOLTRON_TOKEN_MAKE_RE  # noqa: F401
+import json
+
+from mtg_utils._analysis.text_reads import _VOLTRON_TOKEN_MAKE_RE  # noqa: F401
 from mtg_utils._tuner.metrics import _is_wincon_card
 from mtg_utils.card_classify import card_pt_int
 from mtg_utils.scryfall_lookup import lookup_single
+from mtg_utils.testkit import test_card
 
 
 def _hydrate(name, bulk):
@@ -54,8 +57,16 @@ class TestWinconGateOnHydratedInput:
         assert card_pt_int(korvold) == 4
         assert _is_wincon_card(korvold) is False
 
-    def test_big_creature_without_evasion_is_not_a_wincon(self, sample_bulk_data):
-        ground = dict(_hydrate("Ancient Wyrm", sample_bulk_data))
-        ground["oracle_text"] = "Vanilla beater."
-        ground["keywords"] = []
+    def test_big_creature_without_evasion_is_not_a_wincon(self, tmp_path):
+        # A real near miss: Craw Wurm is a 6/4 with no rules text — past the
+        # power floor, but nothing evasive. Only per-printing facts are overlaid.
+        bulk = tmp_path / "bulk.json"
+        wurm_printing = {
+            **test_card("Craw Wurm"),
+            "id": "rrr-craw-wurm",
+            "prices": {"usd": "0.10", "usd_foil": None},
+        }
+        bulk.write_text(json.dumps([wurm_printing]), encoding="utf-8")
+        ground = _hydrate("Craw Wurm", bulk)
+        assert card_pt_int(ground) == 6
         assert _is_wincon_card(ground) is False

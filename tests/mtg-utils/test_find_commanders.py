@@ -6,12 +6,11 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from mtg_utils.card_classify import partner_abilities
+from mtg_utils.card_pool import CardPool
 from mtg_utils.find_commanders import (
     _build_owned_index,
-    _has_background_clause,
-    _is_partner,
-    _load_bulk_index,
-    _partner_with_target,
+    _partner_fields,
     find_commanders,
     main,
 )
@@ -19,6 +18,7 @@ from mtg_utils.find_commanders import (
 # find_commanders delegates name folding to the canonical normalizer; the index it
 # builds is keyed by it, so the tests assert against the same function.
 from mtg_utils.names import normalize_card_name as _normalize_name
+from mtg_utils.testkit import test_card
 
 
 def _card(
@@ -37,7 +37,7 @@ def _card(
     card_faces=None,
 ):
     # NOTE on legalities keys: Scryfall's format-name -> legality-key mapping
-    # is counterintuitive. Our FORMAT_CONFIGS map:
+    # is counterintuitive. Our FORMATS table maps:
     #   "commander"      -> legality key "commander"
     #   "brawl"          -> legality key "standardbrawl"  (Standard Brawl)
     #   "historic_brawl" -> legality key "brawl"          (Historic / Arena Brawl)
@@ -63,74 +63,28 @@ def _card(
     return card
 
 
+def _real(name, **per_printing):
+    """The real card *name* from the testkit snapshot (ADR-0056), with only the
+    per-printing facts a fixture varies overlaid. ``edhrec_rank`` rides as an
+    overlay too: the snapshot doesn't carry it."""
+    return {**test_card(name), **per_printing}
+
+
 @pytest.fixture
 def bulk_index():
     cards = [
-        _card(
-            "Korvold, Fae-Cursed King",
-            color_identity=["B", "G", "R"],
-            cmc=5.0,
-            edhrec_rank=2387,
-        ),
-        _card(
-            "Atraxa, Praetors' Voice",
-            color_identity=["B", "G", "U", "W"],
-            cmc=4.0,
-            edhrec_rank=200,
-        ),
-        _card(
-            "Faceless One",
-            type_line="Legendary Creature — Shapeshifter Adventurer",
-            color_identity=[],
-            cmc=2.0,
-            oracle_text="Choose a Background\nWhen Faceless One dies, draw a card.",
-        ),
-        _card(
-            "Hardy Outlander",
-            type_line="Legendary Enchantment — Background",
-            color_identity=["G"],
-            cmc=1.0,
-            oracle_text="Commander creatures you own have ward {2}.",
-        ),
-        _card(
-            "Teferi, Temporal Pilgrim",
-            type_line="Legendary Planeswalker — Teferi",
-            color_identity=["U", "W"],
-            cmc=5.0,
-            oracle_text="+1: Draw a card.",
-            legalities={
-                "commander": "not_legal",
-                "brawl": "legal",
-                "standardbrawl": "not_legal",
-            },
-        ),
-        _card(
-            "Lightning Bolt",
-            type_line="Instant",
-            color_identity=["R"],
-            cmc=1.0,
-            oracle_text="Lightning Bolt deals 3 damage to any target.",
-        ),
-        _card(
-            "Sol Ring",
-            type_line="Artifact",
-            color_identity=[],
-            cmc=1.0,
-            oracle_text="{T}: Add {C}{C}.",
-        ),
-        _card(
-            "Thrasios, Triton Hero",
-            color_identity=["G", "U"],
-            cmc=2.0,
-            oracle_text="{4}: Scry 1, then reveal the top card of your library.\nPartner",
-            edhrec_rank=850,
-        ),
-        _card(
-            "Pir, Imaginative Rascal",
-            color_identity=["G", "U"],
-            cmc=2.0,
-            oracle_text="If one or more counters would be placed on a permanent you control, that many plus one of those counters are placed on it instead.\nPartner with Toothy, Imaginary Friend",
-        ),
+        _real("Korvold, Fae-Cursed King", edhrec_rank=2387),
+        _real("Atraxa, Praetors' Voice", edhrec_rank=200),
+        # A legendary Background creature that itself says "Choose a Background".
+        _real("Faceless One"),
+        _real("Hardy Outlander"),
+        # A planeswalker with no "can be your commander" clause: Commander
+        # rejects it by type; Historic Brawl (legality key "brawl") takes it.
+        _real("Teferi, Temporal Pilgrim"),
+        _real("Lightning Bolt"),
+        _real("Sol Ring"),
+        _real("Thrasios, Triton Hero", edhrec_rank=850),
+        _real("Pir, Imaginative Rascal"),
     ]
     return {c["name"].lower(): c for c in cards}
 
@@ -273,47 +227,65 @@ class TestMinQuantity:
 
 
 class TestPartnerDetection:
-    def test_partner_keyword(self):
-        assert _is_partner("{4}: Scry 1.\nPartner")
+    """The partner flags read ``card_classify.partner_abilities`` (CR 702.124a)."""
 
-    def test_partner_with_named(self):
-        assert _is_partner("Some text.\nPartner with Toothy, Imaginary Friend")
+    @pytest.mark.parametrize(
+        ("name", "is_partner", "partner_with", "background"),
+        [
+            ("Thrasios, Triton Hero", True, None, False),  # partner (702.124h)
+            # partner with [name] (702.124j)
+            ("Pir, Imaginative Rascal", True, "Toothy, Imaginary Friend", False),
+            # partner—[text] (702.124i): Friends forever, Survivors, Father & son
+            ("Cecily, Haunted Mage", True, None, False),
+            ("Joel, Resolute Survivor", True, None, False),
+            ("Kratos, Stoic Father", True, None, False),
+            ("Rose Tyler", True, None, False),  # Doctor's companion (702.124m)
+            ("Amy Pond", True, "Rory Williams", False),  # + Doctor's companion
+            ("Faceless One", False, None, True),  # choose a Background (702.124k)
+            ("Korvold, Fae-Cursed King", False, None, False),
+        ],
+    )
+    def test_partner_fields(self, name, is_partner, partner_with, background):
+        fields = _partner_fields(partner_abilities(test_card(name)))
+        assert fields["is_partner"] is is_partner
+        assert fields["partner_with"] == partner_with
+        assert fields["has_background_clause"] is background
 
-    def test_friends_forever(self):
-        assert _is_partner("Friends forever\nDraw a card.")
+    def test_partner_kinds_name_the_group(self):
+        assert _partner_fields(partner_abilities(test_card("Joel, Resolute Survivor")))[
+            "partner_kinds"
+        ] == [{"kind": "group", "value": "Survivors"}]
+        assert _partner_fields(partner_abilities(test_card("Amy Pond")))[
+            "partner_kinds"
+        ] == [
+            {"kind": "doctors_companion", "value": ""},
+            {"kind": "with", "value": "Rory Williams"},
+        ]
 
-    def test_choose_a_background_is_not_partner_keyword(self):
-        # Choose a Background is reported via has_background_clause, not is_partner
-        assert not _is_partner("Choose a Background\nDraw a card.")
-
-    def test_partner_with_target_extraction(self):
-        target = _partner_with_target(
-            "Some text.\nPartner with Toothy, Imaginary Friend\nMore text."
+    def test_pairs_with_matches_the_same_ability(self):
+        """CR 702.124f: different partner abilities can't be combined — a Survivors
+        card pairs with Survivors only, a plain partner with partner, choose a
+        Background with a Background."""
+        names = (
+            "Thrasios, Triton Hero",
+            "Tymna the Weaver",
+            "Joel, Resolute Survivor",
+            "Ellie, Vengeful Hunter",
+            "Faceless One",
+            "Raised by Giants",
+            "Korvold, Fae-Cursed King",
         )
-        assert target == "Toothy, Imaginary Friend"
-
-    def test_partner_with_no_target_for_plain_partner(self):
-        assert _partner_with_target("{4}: Scry 1.\nPartner") is None
-
-    def test_partner_with_anchored_to_line_start(self):
-        # Hypothetical flavor/rules text mentioning "partner with" mid-line
-        # must NOT trigger the named-partner regex.
-        assert (
-            _partner_with_target(
-                "When this creature enters, choose a creature to partner with another player.",
-            )
-            is None
-        )
-
-    def test_partner_with_strips_reminder_text(self):
-        target = _partner_with_target(
-            "Partner with Toothy, Imaginary Friend (When this creature enters the battlefield, target player may put Toothy into their hand from their library.)",
-        )
-        assert target == "Toothy, Imaginary Friend"
-
-    def test_has_background_clause(self):
-        assert _has_background_clause("Choose a Background\nWhen this dies, draw.")
-        assert not _has_background_clause("Flying, vigilance.")
+        index = {n.lower(): test_card(n) for n in names}
+        parsed = {"commanders": [], "cards": [{"name": n} for n in names]}
+        got = {
+            c["name"]: c["pairs_with"]
+            for c in find_commanders(parsed, index, format="commander")
+        }
+        assert got["Thrasios, Triton Hero"] == ["Tymna the Weaver"]
+        assert got["Joel, Resolute Survivor"] == ["Ellie, Vengeful Hunter"]
+        assert got["Faceless One"] == ["Raised by Giants"]
+        assert got["Raised by Giants"] == ["Faceless One"]
+        assert got["Korvold, Fae-Cursed King"] == []
 
     def test_partner_flags_in_output(self, bulk_index, parsed_collection):
         result = find_commanders(parsed_collection, bulk_index, format="commander")
@@ -347,6 +319,8 @@ class TestOutputShape:
             "is_partner",
             "partner_with",
             "has_background_clause",
+            "partner_kinds",
+            "pairs_with",
             "owned_quantity",
         }
         assert expected_keys.issubset(korvold.keys())
@@ -529,108 +503,67 @@ class TestNameNormalization:
         assert _normalize_name("Sol Ring") == "sol ring"
 
     def test_mdfc_face_is_indexed(self, tmp_path: Path):
-        # A flip/meld card whose name has no " // " separator: the front-face
-        # name in card_faces[] must still be looked up successfully.
+        # A modal DFC: each face name in card_faces[] must still be looked up
+        # successfully, and resolve to the same record as the full name.
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(
             json.dumps(
                 [
-                    _card(
-                        "Bruna, the Fading Light // Brisela, Voice of Nightmares",
-                        card_faces=[
-                            {"name": "Bruna, the Fading Light"},
-                            {"name": "Brisela, Voice of Nightmares"},
-                        ],
-                    ),
+                    _real("Esika, God of the Tree // The Prismatic Bridge"),
                 ]
             )
         )
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         # Both faces and the full name should resolve to the same card object.
-        assert index[_normalize_name("Bruna, the Fading Light")] is not None
-        assert index[_normalize_name("Brisela, Voice of Nightmares")] is not None
+        assert index[_normalize_name("Esika, God of the Tree")] is not None
+        assert index[_normalize_name("The Prismatic Bridge")] is not None
         assert (
-            index[_normalize_name("Bruna, the Fading Light")]
-            is index[_normalize_name("Brisela, Voice of Nightmares")]
+            index[_normalize_name("Esika, God of the Tree")]
+            is index[_normalize_name("The Prismatic Bridge")]
         )
 
     def test_mdfc_lookup_via_face_name_in_collection(self, tmp_path: Path):
-        # End-to-end: user's collection lists only the front face of a meld
-        # card. find-commanders must still recognize it as a candidate.
+        # End-to-end: user's collection lists only the front face of a modal
+        # DFC. find-commanders must still recognize it as a candidate.
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(
             json.dumps(
                 [
-                    _card(
-                        "Bruna, the Fading Light // Brisela, Voice of Nightmares",
-                        type_line="Legendary Creature — Angel",
-                        color_identity=["W"],
-                        cmc=7.0,
-                        card_faces=[
-                            {"name": "Bruna, the Fading Light"},
-                            {"name": "Brisela, Voice of Nightmares"},
-                        ],
-                    ),
+                    _real("Esika, God of the Tree // The Prismatic Bridge"),
                 ]
             )
         )
-        bulk_index = _load_bulk_index(bulk_path)
+        bulk_index = CardPool.load(bulk_path).by_name
         parsed = {
             "commanders": [],
-            "cards": [{"name": "Bruna, the Fading Light", "quantity": 1}],
+            "cards": [{"name": "Esika, God of the Tree", "quantity": 1}],
         }
         result = find_commanders(parsed, bulk_index, format="commander")
         assert len(result) == 1
-        assert "Bruna" in result[0]["name"]
+        assert "Esika" in result[0]["name"]
 
     def test_diacritic_collection_lookup_end_to_end(self, tmp_path: Path):
-        # User has an ASCII-only "Lim-Dul's Vault" in their collection;
-        # bulk data has the canonical "Lim-Dûl's Vault". They must match.
+        # User has an ASCII-only "Lim-Dul the Necromancer" in their collection;
+        # bulk data has the canonical "Lim-Dûl the Necromancer". They must match.
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(
             json.dumps(
                 [
-                    _card(
-                        "Lim-Dûl's Vault",
-                        type_line="Legendary Creature — Human",
-                        color_identity=["B", "U"],
-                        cmc=2.0,
-                    ),
+                    _real("Lim-Dûl the Necromancer"),
                 ]
             )
         )
-        bulk_index = _load_bulk_index(bulk_path)
+        bulk_index = CardPool.load(bulk_path).by_name
         parsed = {
             "commanders": [],
-            "cards": [{"name": "Lim-Dul's Vault", "quantity": 1}],
+            "cards": [{"name": "Lim-Dul the Necromancer", "quantity": 1}],
         }
         result = find_commanders(parsed, bulk_index, format="commander")
         assert len(result) == 1
 
 
 class TestMdfcOracleText:
-    def test_mdfc_partner_with_detection(self):
-        # Hypothetical MDFC where the partner-with text lives on a face,
-        # not the top-level oracle_text. get_oracle_text() concatenates faces,
-        # so _is_partner / _partner_with_target should still detect it.
-        from mtg_utils.card_classify import get_oracle_text
-
-        card = {
-            "name": "Hypothetical MDFC // Partner Side",
-            "oracle_text": "",
-            "card_faces": [
-                {
-                    "name": "Hypothetical MDFC",
-                    "oracle_text": "Flying.\nPartner with Partner Side",
-                },
-                {"name": "Partner Side", "oracle_text": "Vigilance."},
-            ],
-        }
-        oracle = get_oracle_text(card)
-        assert _is_partner(oracle)
-        assert _partner_with_target(oracle) == "Partner Side"
-
-    def test_load_bulk_index_skips_tokens(self, tmp_path: Path):
+    def test_pool_index_skips_tokens(self, tmp_path: Path):
         bulk_path = tmp_path / "bulk.json"
         bulk_path.write_text(
             json.dumps(
@@ -641,7 +574,7 @@ class TestMdfcOracleText:
                 ]
             )
         )
-        index = _load_bulk_index(bulk_path)
+        index = CardPool.load(bulk_path).by_name
         assert "real card" in index
         assert "token card" not in index
         assert "memorabilia card" not in index

@@ -7,49 +7,81 @@ the same way.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from mtg_utils._deck_forge.budgets import slot_budgets
-from mtg_utils._deck_forge.signals import ranked_signals_and_payoffs
+from mtg_utils._analysis.budgets import banded_slot_budgets, template_for
+from mtg_utils._analysis.multipliers import commander_multipliers
+from mtg_utils._analysis.signals import ranked_signals_and_payoffs
 from mtg_utils._tuner import commander_fit, grant_coverage, metrics
 from mtg_utils._tuner import swaps as swaps_mod
-from mtg_utils._tuner.bracket import bracket_gate
+from mtg_utils._tuner.bracket import bracket_gate, suggestable_near_misses
+from mtg_utils._tuner.calibration import calibration_for
 from mtg_utils._tuner.classify import CardClass, classify_deck
+from mtg_utils._tuner.issues import Sourcing, top_issues
 from mtg_utils._tuner.shape import infer_shape
 from mtg_utils.card_classify import is_land
-from mtg_utils.deck_stats import deck_stats
+from mtg_utils.combo_search import combos_or_none
+from mtg_utils.formats import Format, medium_is_digital
 from mtg_utils.hydrated_deck import HydratedDeck
 from mtg_utils.mana_audit import mana_audit
+
+if TYPE_CHECKING:
+    from mtg_utils._arena_meta.meta import MetaContext
+
+
+#: The most missing meta-core cards offered as add issues at once.
+META_CORE_ISSUES = 5
 
 
 @dataclass(frozen=True)
 class TuneParams:
-    """A Tune request. ``budget=None`` is the owned-only zero-spend default; an explicit
-    number opens the buy pool. ``paper_only``/``medium`` come from the deck's Medium.
-    ``wildcard_budget`` (digital builds) is the per-rarity Arena wildcard allowance
-    ``{mythic, rare, uncommon, common}`` — when set it replaces the USD ``budget``: each
-    unowned add costs one wildcard of its rarity, gated per tier (they don't swap)."""
+    """A Tune request: the build's ``medium`` and a purse. Everything the medium
+    decides — the Game, the cost mode, the candidate pool — ``tune`` asks the Format
+    (ADR-0045); a caller never pre-derives it.
+
+    The purse carries both currencies and the medium picks one (``Format.cost_mode``):
+    paper spends ``budget`` USD (``None`` = the owned-only zero-spend default); digital
+    spends ``wildcard_budget``, the per-rarity Arena allowance ``{mythic, rare,
+    uncommon, common}`` — one wildcard of the add's rarity, gated per tier (they don't
+    swap), and ``None`` is the all-zero owned-only pass.
+
+    ``paper_only`` is an explicit override of the candidate pool; ``None`` (the
+    default) follows the medium: a paper build searches paper printings, a digital
+    build Arena's."""
 
     budget: float | None = None
     max_swaps: int = 0
     shape_override: str | None = None
     suggest_commander: bool = False
-    paper_only: bool = True
-    medium: str = "paper"
+    paper_only: bool | None = None
+    medium: str | None = None
     wildcard_budget: Mapping[str, int] | None = None
     # The bracket the builder is AIMING for (ADR-0030). When set, the scorecard carries
     # a bracket-constraint gate; when None, the bracket axis is skipped entirely.
     target_bracket: int | None = None
+    # Adds the builder has REJECTED: never proposed again, so the slot a rejected card
+    # would have filled goes to the next-ranked candidate for the same issue (the run
+    # is deterministic, so every other swap holds). Names, exactly as the bulk spells
+    # them.
+    exclude: frozenset[str] = frozenset()
+    # ADR-0059: the deck's meta archetype on Arena's ladder (``arena_meta``'s
+    # ``deck_context``, read from the cache by the caller). A digital build reads
+    # it: its cut ranking replaces EDHREC play rate, and the core cards the deck
+    # lacks become add issues. ``None`` tunes exactly as without it.
+    meta: MetaContext | None = None
 
 
 def _deck_identity(hd: HydratedDeck) -> str:
     """The deck's color identity — the commander's (the deck identity it enforces),
-    or the union across all cards when there is no commander."""
+    or the union across the main deck's cards when there is no commander (never the
+    sideboard's, and never an opened pool's)."""
     colors: set[str] = set()
     sources = hd.commanders or []
     records = [hd.by_name.get(e["name"]) for e in sources]
-    records = [r for r in records if r] or hd.records
+    records = [r for r in records if r] or hd.deck_records(zones=("cards",))
     for rec in records:
         colors.update(rec.get("color_identity") or [])
     return "".join(sorted(colors))
@@ -92,19 +124,6 @@ def _fill_gap(hd: HydratedDeck, deck_size: int, land_floor: int) -> tuple[int, i
     return fill_slots, land_gap
 
 
-# The exact-size CR citations for the singleton Commander family: CR 903.5a ("the
-# minimum deck size and the maximum deck size are both 100") governs Commander —
-# and Historic Brawl / Competitive Brawl mirror its 100-card rule — while CR 903.12d
-# fixes Brawl at exactly 60. Other formats have no CR maximum (CR 100.2a sets only
-# a minimum), so their over-size message cites the format's target size, not a rule.
-_SIZE_RULES: dict[str, str] = {
-    "commander": "CR 903.5a",
-    "historic_brawl": "CR 903.5a",
-    "competitive_brawl": "CR 903.5a",
-    "brawl": "CR 903.12d",
-}
-
-
 def _counted_total(deck: dict) -> int:
     """The deck's counted size — commanders + maindeck, the same zone walk
     ``_fill_gap`` and deck-forge's ``_overflow_warnings`` use."""
@@ -113,6 +132,21 @@ def _counted_total(deck: dict) -> int:
         for zone in ("commanders", "cards")
         for e in deck.get(zone) or []
     )
+
+
+def _game_changer_room(bracket: dict | None) -> int | None:
+    """How many more Game Changers the swap proposer may add before breaching the
+    target bracket's ceiling (ADR-0030: "the swap proposer respects the ceiling") —
+    the gate's own ceiling less the gate's own count, so the two can't disagree about
+    which cards count. NEGATIVE for a deck already over: cutting one Game Changer
+    from a deck two over must not buy room to add another. ``None`` when nothing
+    constrains it — no target bracket, a one-on-one game the brackets don't apply to,
+    or brackets 4-5 (the gate reports no ceilings)."""
+    gate = bracket or {}
+    ceiling = (gate.get("ceilings") or {}).get("game_changers")
+    if ceiling is None:
+        return None
+    return ceiling - (gate.get("counts") or {}).get("game_changers", 0)
 
 
 def _bucket_counts(classes: Sequence[CardClass]) -> dict[str, int]:
@@ -126,18 +160,6 @@ def _focus_public(focus_r: dict) -> dict:
     return {k: v for k, v in focus_r.items() if not k.startswith("_")}
 
 
-def _safe_combos(combos_fn: Callable[[dict], dict] | None, deck: dict) -> dict | None:
-    """Combos feed win-con detection but ride a network call (Commander Spellbook). On
-    any failure, degrade to heuristic-only win-cons rather than failing the whole Tune —
-    the deterministic diagnosis must never depend on an external service."""
-    if combos_fn is None:
-        return None
-    try:
-        return combos_fn(deck)
-    except Exception:  # noqa: BLE001 — any combos failure degrades, never breaks Tune
-        return None
-
-
 def tune(
     hd: HydratedDeck,
     *,
@@ -146,32 +168,67 @@ def tune(
     owned: Mapping[str, int] | None = None,
     combos_fn: Callable[[dict], dict] | None = None,
     resolve_object: Callable[[str], dict | None] | None = None,
+    pool: Mapping[str, int] | None = None,
 ) -> dict:
     """Diagnose the deck and (when ``max_swaps>0``) propose budgeted swaps.
 
+    Every band and floor is the deck's FAMILY's (``Format.family``): the template
+    (``budgets.template_for``) and the calibration (``calibration_for``), so a
+    60-card deck is measured against 60-card norms. The Commander-only axes —
+    commander fit, grant coverage, the bracket gate, commander suggestions — are
+    ``None`` / skipped outside the Commander family, never a silent no-op.
+
     A deck over its exact legal size (CR 903.5a / 903.12d) additionally gets
     ``size_cuts`` — legality-driven trim proposals, produced on every run
-    regardless of ``max_swaps``.
+    regardless of ``max_swaps``; a size-minimum family (constructed, limited)
+    reports a ``shortfall`` toward its target instead.
+
+    ``pool`` (limited): the opened pool's name→quantity, which bounds every add and
+    makes every pool card free.
 
     ``resolve_object`` (ADR-0025): the folded-object resolver, threaded into
     signal ranking so the tune scorecard sees the SAME commander lanes the
     engine's avenues show (the deck-forge route passes
     ``state.object_resolver``; the deck-tune CLI's ``None`` skips the fold)."""
     owned = dict(owned or {})
+    if pool is not None:
+        # A pool card is owned in the pool's quantity (or the caller's, if larger).
+        for name, qty in pool.items():
+            owned[name] = max(qty, owned.get(name, 0))
     deck = hd.deck
     commander_names = {e["name"] for e in deck.get("commanders") or []}
-    deck_size = int(deck.get("deck_size") or 100)
-    fmt = hd.format
+    deck_size = hd.format.deck_size
+    fmt = hd.format.name
+    template = template_for(hd.format.family)
+    cal = calibration_for(hd.format.family)
+    # The Game the deck plays (starting life, pod vs one opponent, whether commander
+    # damage wins), from the Format under the build's medium — ``Format.game`` resolves
+    # an override the format cannot honour, and every medium read below uses
+    # ``game.medium`` so a raw caller value can't misread it.
+    # Drives the closer read and the bracket gate's applicability.
+    game = hd.format.game(params.medium)
+    # What the medium decides, asked once: the candidate pool (a paper build buys
+    # paper printings; a digital one Arena's) and the currency the purse spends.
+    paper_only = (
+        params.paper_only
+        if params.paper_only is not None
+        else hd.format.paper_only(game.medium)
+    )
+    if Format.cost_mode(game.medium) == "wildcards":
+        budget, wildcard_budget = None, dict(params.wildcard_budget or {})
+    else:
+        budget, wildcard_budget = params.budget, None
     identity = _deck_identity(hd)
     # Exact-size legality (CR 903.5a / 903.12d): a deck PAST deck_size is never
-    # legal in the Commander family, so the overflow is diagnosed on every run.
+    # legal in the Commander family, so the overflow is diagnosed on every run. A
+    # size-minimum family (CR 100.2a) has no cap: it reports the shortfall to target.
     total = _counted_total(deck)
-    overflow = max(0, total - deck_size)
+    exact = not hd.format.size_is_minimum
+    overflow = max(0, total - deck_size) if exact else 0
+    shortfall = max(0, deck_size - total)
 
-    stats = deck_stats(hd)
-    avg_cmc = stats.get("avg_cmc", 0.0)
     mana = mana_audit(hd)
-    combos = _safe_combos(combos_fn, deck)
+    combos = combos_or_none(combos_fn, deck)
     combo_count = len((combos or {}).get("combos") or [])
     # Cards in a combo line are protected from the cut proposer (ADR-0029): the
     # deterministic core must not quietly cut a combo piece.
@@ -184,10 +241,27 @@ def tune(
     # ADR-0029: resolve signals through the Card IR (regex fallback when no
     # sidecar). One extraction pass yields both the ranked signals and the
     # task-#101 emerging-tribal payoff subjects.
+    # The counted deck (commanders + main deck): a sideboard never shapes the
+    # avenues or the classes.
     deck_signals, payoff_subjects = ranked_signals_and_payoffs(
-        hd.records, commander_names, resolve_object=resolve_object
+        hd.deck_records(), commander_names, resolve_object=resolve_object
     )
-    classes = classify_deck(hd, deck_signals, commander_names)
+    deck_mana = hd.deck_mana
+    # ADR-0059: the ladder is a digital deck's population, so only a digital build
+    # reads its meta archetype.
+    meta = params.meta if medium_is_digital(game.medium) else None
+    classes = classify_deck(
+        hd, deck_signals, commander_names, deck_mana=deck_mana, meta=meta
+    )
+    # The curve the deck actually plays: each nonland at its effective cost (a warp or
+    # evoke card at the cheaper cost), so shape and efficiency read the real speed.
+    nonland = [c for c in classes if c.bucket != "land"]
+    avg_cmc = sum(c.cmc * c.quantity for c in nonland) / max(
+        1, sum(c.quantity for c in nonland)
+    )
+    curve: Counter[int] = Counter()
+    for c in nonland:
+        curve[int(c.cmc)] += c.quantity
 
     shape_r = infer_shape(
         classes,
@@ -197,58 +271,94 @@ def tune(
     )
     shape = shape_r.shape
 
-    # ADR-0041 (Fix 2): pass mana_audit's OWN already-derived land band directly
-    # so slot_budgets never re-derives it from a DIFFERENT ramp tally — mana_audit
-    # counts commanders+cards while slot_budgets' own tally over hd.expanded()
-    # counts cards+sideboard (commanders excluded), a divergence that could
-    # disagree with the mana section's own verdict. A 60-card constructed deck
-    # has no `land_band` and keeps the flat template row unchanged.
-    land_band_info = mana.get("land_band")
-    budgets = slot_budgets(
-        hd.expanded(),
+    # ADR-0041: the lands row is mana_audit's own band — never a second derivation.
+    # The rows are the family's template over the MAIN deck (a sideboard fills no
+    # slot).
+    budgets = banded_slot_budgets(
+        hd.expanded(zones=("cards",)),
+        mana["land_band"],
         deck_size=deck_size,
         shape=shape,
-        land_band=(
-            (land_band_info["floor"], land_band_info["top"]) if land_band_info else None
-        ),
+        template=template,
+        deck_mana=deck_mana,
     )
     # ADR-0040 §1 (Grant-covered role, deck-forge CONTEXT.md): does a commander's
     # own ability GRANT structurally cover a short Spine role for every recipient
     # body (the Sliver Weftwinder shape)? The band NUMBER is untouched — this only
-    # annotates the short role's row so top_issues/swaps.py can downgrade its
-    # shortfall to advisory without suppressing it.
-    commander_records = [c.record for c in classes if c.bucket == "commander"]
-    for role, name in grant_coverage.covered_roles(commander_records).items():
-        band = budgets.get(role)
-        if band is not None and band["deviation"] < 0:
-            band["grant_covered"] = True
-            band["grant_covered_by"] = name
-    eff = metrics.efficiency(classes, shape=shape, avg_cmc=avg_cmc, deck_size=deck_size)
+    # annotates the short role's row; ``issues.Sourcing`` reads it and downgrades the
+    # shortfall to advisory (sourcing nothing for it) without suppressing it.
+    if cal.commander_axes:
+        commander_records = [c.record for c in classes if c.bucket == "commander"]
+        for role, name in grant_coverage.covered_roles(commander_records).items():
+            band = budgets.get(role)
+            if band is not None and band["deviation"] < 0:
+                band["grant_covered"] = True
+                band["grant_covered_by"] = name
+    # Whether a fringe play-rate may mark a card low-value (never one-on-one).
+    condemns = cal.playrate_condemns(multiplayer=game.multiplayer)
+    eff = metrics.efficiency(
+        classes, shape=shape, avg_cmc=avg_cmc, deck_size=deck_size, cal=cal
+    )
     foc = metrics.focus(
         classes,
         deck_size=deck_size,
         deck_signals=deck_signals,
-        medium=params.medium,
+        medium=game.medium,
         tribal_payoff_subjects=payoff_subjects,
+        cal=cal,
+        playrate_condemns=condemns,
     )
     tmpl = metrics.template_deviation(budgets)
-    wins = metrics.win_conditions(classes, shape=shape, combo_count=combo_count)
-    prot = metrics.protection(classes, shape=shape, deck_size=deck_size)
-    cfit = metrics.commander_fit(classes, foc)
-    issues = metrics.top_issues(
+    meta_missing = meta.missing_from(c.name for c in classes) if meta else []
+    wins = metrics.win_conditions(
+        classes,
+        shape=shape,
+        combo_count=combo_count,
+        deck_size=deck_size,
+        game=game,
+        cal=cal,
+    )
+    prot = metrics.protection(
+        classes, shape=shape, deck_size=deck_size, voltron=wins["voltron"], cal=cal
+    )
+    # Commander fit only means something with a commander to fit (None otherwise —
+    # the scorecard says so, the SPA renders nothing).
+    cfit = metrics.commander_fit(classes, foc) if cal.commander_axes else None
+    issues = top_issues(
         efficiency_r=eff,
         focus_r=foc,
         template_r=tmpl,
         wincons_r=wins,
         protection_r=prot,
         commander_r=cfit,
+        sourcing=Sourcing(foc, deck_signals, budgets),
+        near_misses=suggestable_near_misses(combos, params.target_bracket),
+        meta_missing=[c for c in meta_missing if not c["land"]][:META_CORE_ISSUES],
     )
 
-    # ADR-0030: a target-bracket constraint gate, only when a target was chosen.
+    # ADR-0030: a target-bracket constraint gate, only when a target was chosen —
+    # and only in the Commander family (WotC's brackets are a Commander construct).
     bracket = (
-        bracket_gate(hd.records, params.target_bracket, combos=combos)
-        if params.target_bracket is not None
+        bracket_gate(
+            hd.records,
+            params.target_bracket,
+            combos=combos,
+            multiplayer=game.multiplayer,
+        )
+        if params.target_bracket is not None and cal.commander_axes
         else None
+    )
+
+    # The cut checklist's near-untouchables: cards that copy the commander, double or
+    # copy an ability it has, or lend it activated abilities from another zone. The
+    # proposer never cuts one (the same protection combo pieces get).
+    multipliers = (
+        commander_multipliers(
+            [c.record for c in classes if c.bucket != "commander"],
+            [c.record for c in classes if c.bucket == "commander"],
+        )
+        if cal.commander_axes
+        else {}
     )
 
     scorecard = {
@@ -264,26 +374,49 @@ def tune(
         "wincons": wins,
         "protection": prot,
         "commander_fit": cfit,
-        "top_issues": issues,
+        "top_issues": [issue.to_json() for issue in issues],
         "counts": _bucket_counts(classes),
-        # Counted size vs the format's exact legal size (CR 903.5a / 903.12d);
-        # overflow > 0 means "N over legal size" and drives `size_cuts` below.
-        "size": {"total": total, "deck_size": deck_size, "overflow": overflow},
+        # Counted size vs the format's size: exact for the Commander family (CR
+        # 903.5a / 903.12d — overflow > 0 means "N over legal size" and drives
+        # `size_cuts` below), a target over a CR minimum otherwise (shortfall > 0
+        # means "N to go").
+        "size": {
+            "total": total,
+            "deck_size": deck_size,
+            "exact": exact,
+            "overflow": overflow,
+            "shortfall": shortfall,
+        },
         # ADR-0029 enrichment: surface the mechanical reads the spine no longer leaves
         # to the agent — full mana audit (not just the land count), the curve histogram,
         # and the combo list (not just a tally).
         "mana": mana,
-        "curve": stats.get("curve") or {},
+        "curve": dict(sorted(curve.items())),
         "combos": combos or {"combos": []},
         "bracket": bracket,
+        "commander_multipliers": multipliers,
+        "meta": (
+            {
+                **meta.to_json(),
+                "missing_core": meta_missing,
+                "low_share": sorted(c.name for c in classes if c.meta_rare),
+            }
+            if meta is not None
+            else None
+        ),
     }
 
     # Win-con floor protection (ADR-0029, sibling to combo-piece protection): at/below
     # the heuristic win-con floor, don't let the proposer cut a card the SAME scorecard
-    # counts as a finisher — that would drop it below the floor it just reported. Above
-    # the floor, marginal finishers stay trimmable.
-    wincon_protect = set(wins["cards"]) if wins["count"] <= wins["target"][0] else set()
-    protected = combo_pieces | wincon_protect
+    # counts as a finisher — that would drop it below the floor it just reported. A
+    # synthetic voltron closer (ADR-0024 amendment) is its equipment/aura pieces, so
+    # those are what it protects. Above the floor, marginal finishers stay trimmable.
+    wincon_protect = (
+        set(wins["cards"]) | set(wins["voltron_cards"])
+        if wins["count"] <= wins["target"][0]
+        else set()
+    )
+    protected = combo_pieces | wincon_protect | set(multipliers)
 
     # Over-legal-size cuts (legality-driven, so NOT gated on max_swaps — even a
     # max_swaps=0 scorecard run reports them): exactly `overflow` proposals (or
@@ -293,7 +426,9 @@ def tune(
     # deck_size is a legality fix, not a tuning choice.
     size_cut_list: list[dict] = []
     if overflow > 0:
-        rule = _SIZE_RULES.get(fmt)
+        # The exact-size CR citation (CR 903.5a for the 100-card family, CR 903.12d
+        # for Brawl) lives on the Format; other formats have no CR maximum.
+        rule = hd.format.size_rule
         legal = (
             f"the legal {deck_size} ({rule})" if rule else f"the {deck_size}-card size"
         )
@@ -305,7 +440,8 @@ def tune(
             stranded=set(foc["stranded_avenues"]),
             message=f"deck is {overflow} over {legal} — cut",
             protected=protected,
-            medium=params.medium,
+            medium=game.medium,
+            playrate_condemns=condemns,
             # Maindeck-only: cutting a sideboard card wouldn't shrink the total.
             eligible={r.get("name", "") for r in hd.expanded(zones=("cards",))},
         )
@@ -317,27 +453,34 @@ def tune(
     if params.max_swaps > 0 and hd.has_records:
         # ADR-0041: the floor (not the band's comfortable-max top), so a deck
         # already inside its band never reports a phantom land shortfall.
-        land_floor = int(mana.get("land_count_floor") or 0)
+        land_floor = int(mana["land_band"]["floor"])
         fill_slots, land_gap = _fill_gap(hd, deck_size, land_floor)
-        swaps_out = swaps_mod.propose_swaps(
-            classes,
-            issues,
+        swap_ctx = swaps_mod.SwapContext(
             budgets=budgets,
             focus_result=foc,
             deck_signals=deck_signals,
             search_fn=search_fn,
             identity=identity,
             fmt=fmt,
-            paper_only=params.paper_only,
+            paper_only=paper_only,
             owned=owned,
-            budget=params.budget,
+            budget=budget,
             max_swaps=params.max_swaps,
             top_heavy=eff["verdict"] == "top-heavy",
             fill_slots=fill_slots,
-            wildcard_budget=params.wildcard_budget,
+            wildcard_budget=wildcard_budget,
             protected=protected,
-            medium=params.medium,
+            medium=game.medium,
+            game_changer_room=_game_changer_room(bracket),
+            template=template,
+            max_copies=hd.format.max_copies,
+            available=pool,
+            playrate=cal.playrate_meaningful,
+            playrate_condemns=condemns,
+            exclude=params.exclude,
+            deck_mana=deck_mana,
         )
+        swaps_out = swaps_mod.propose_swaps(classes, issues, swap_ctx)
         # The fill pass deliberately skips lands; flag any mana-base shortfall so the
         # user runs the land tooling (balance-lands), not Tune, to finish it.
         if land_gap > 0:
@@ -350,14 +493,14 @@ def tune(
             )
 
     suggestions = None
-    if params.suggest_commander:
+    if params.suggest_commander and cal.commander_axes:
         suggestions = commander_fit.suggest_commanders(
             classes,
             deck_signals,
             viable_labels=[a["label"] for a in foc["viable_avenues"]],
             identity=identity,
             fmt=fmt,
-            paper_only=params.paper_only,
+            paper_only=paper_only,
             search_fn=search_fn,
             owned=set(owned),
         )
@@ -373,4 +516,6 @@ def tune(
         "wildcards_spent": swaps_out["wildcards_spent"],
         "swaps_note": swaps_out["note"],
         "commander_suggestions": suggestions,
+        # The adds this run was told never to propose (the builder's rejections).
+        "excluded": sorted(params.exclude),
     }

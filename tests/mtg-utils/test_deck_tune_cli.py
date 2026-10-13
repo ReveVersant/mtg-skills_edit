@@ -9,24 +9,10 @@ from click.testing import CliRunner
 
 from mtg_utils import combo_search
 from mtg_utils.deck_tune import main as deck_tune_main
+from mtg_utils.testkit import test_card
 
-KRENKO = {
-    "name": "Krenko, Mob Boss",
-    "type_line": "Legendary Creature — Goblin Warrior",
-    "cmc": 4.0,
-    "color_identity": ["R"],
-    "oracle_text": "{T}: Create X 1/1 red Goblin creature tokens.",
-    "legalities": {"commander": "legal"},
-}
-MOUNTAIN = {
-    "name": "Mountain",
-    "type_line": "Basic Land — Mountain",
-    "cmc": 0.0,
-    "color_identity": ["R"],
-    "oracle_text": "",
-    "produced_mana": ["R"],
-    "legalities": {"commander": "legal"},
-}
+KRENKO = test_card("Krenko, Mob Boss")
+MOUNTAIN = test_card("Mountain")
 HYDRATED = [KRENKO, MOUNTAIN]
 COMMANDER_DECK = {
     "format": "commander",
@@ -66,20 +52,36 @@ def _write(tmp_path, name, obj):
     return str(p)
 
 
-def _bulk(tmp_path):
-    p = tmp_path / "bulk.json"
-    p.write_text("[]", encoding="utf-8")
-    return str(p)
+def test_exclude_reaches_the_tuner(tmp_path, monkeypatch):
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", COMMANDER_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(
+        deck_tune_main,
+        [deck, "--bulk-data", hyd, "--exclude", "Sol Ring", "--exclude", "Skullclamp"],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["params"].exclude == frozenset({"Sol Ring", "Skullclamp"})
 
 
-def test_refuses_constructed_format(tmp_path):
+def test_accepts_constructed_format(tmp_path, monkeypatch):
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", CONSTRUCTED_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(deck_tune_main, [deck, "--bulk-data", hyd])
+    assert res.exit_code == 0, res.output
+    assert captured["hd"].format.name == "modern"
+
+
+def test_bracket_on_a_constructed_deck_is_noted_not_fatal(tmp_path, monkeypatch):
+    _spy_tune(monkeypatch)
     deck = _write(tmp_path, "deck.json", CONSTRUCTED_DECK)
     hyd = _write(tmp_path, "hyd.json", HYDRATED)
     res = CliRunner().invoke(
-        deck_tune_main, [deck, hyd, "--bulk-data", _bulk(tmp_path)]
+        deck_tune_main, [deck, "--bulk-data", hyd, "--bracket", "2"]
     )
-    assert res.exit_code != 0
-    assert "Commander-family" in res.output
+    assert res.exit_code == 0, res.output
+    assert "Commander brackets do not apply" in res.output
 
 
 def test_accepts_competitive_brawl_as_commander_family(tmp_path, monkeypatch):
@@ -88,12 +90,24 @@ def test_accepts_competitive_brawl_as_commander_family(tmp_path, monkeypatch):
     captured = _spy_tune(monkeypatch)
     deck = _write(tmp_path, "deck.json", COMPETITIVE_BRAWL_DECK)
     hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(deck_tune_main, [deck, "--bulk-data", hyd])
+    assert res.exit_code == 0, res.output
+    assert captured["params"].medium is None  # the Format resolves it, in tune()
+
+
+def test_medium_the_format_cannot_honour_is_noted_not_fatal(tmp_path, monkeypatch):
+    # ``Format.resolve_medium`` ignores an override the format cannot honour (the
+    # same rule deck-forge's session applies); the CLI says so on stderr and runs.
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", COMPETITIVE_BRAWL_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
     res = CliRunner().invoke(
-        deck_tune_main, [deck, hyd, "--bulk-data", _bulk(tmp_path)]
+        deck_tune_main,
+        [deck, "--bulk-data", hyd, "--medium", "paper"],
     )
     assert res.exit_code == 0, res.output
-    assert captured["params"].medium == "digital"
-    assert captured["params"].paper_only is False
+    assert captured["params"].medium == "paper"  # passed through; tune() resolves it
+    assert "competitive_brawl is not played in 'paper'" in res.output
 
 
 def test_diagnoses_a_commander_deck(tmp_path):
@@ -102,7 +116,7 @@ def test_diagnoses_a_commander_deck(tmp_path):
     out_path = tmp_path / "tune.json"
     res = CliRunner().invoke(
         deck_tune_main,
-        [deck, hyd, "--bulk-data", _bulk(tmp_path), "--output", str(out_path)],
+        [deck, "--bulk-data", hyd, "--output", str(out_path)],
     )
     assert res.exit_code == 0, res.output
     out = json.loads(out_path.read_text(encoding="utf-8"))
@@ -119,9 +133,8 @@ def test_bracket_flag_runs_the_gate(tmp_path):
         deck_tune_main,
         [
             deck,
-            hyd,
             "--bulk-data",
-            _bulk(tmp_path),
+            hyd,
             "--bracket",
             "2",
             "--output",
@@ -145,14 +158,17 @@ _STUB_RESULT = {
 
 
 def _spy_tune(monkeypatch):
-    """Replace deck_tune's `tune` with a spy that records the TuneParams it
-    was called with, so the CLI's medium/paper_only inference can be
-    inspected without needing a real bulk index."""
+    """Replace deck_tune's `tune` with a spy that records the deck and the
+    TuneParams it was called with. The CLI is transport only — it passes the raw
+    ``--medium`` / ``--paper-only`` flags and tune() asks the Format for the rest —
+    so the tests read the EFFECTIVE values the way tune() does (:func:`_medium` /
+    :func:`_paper_only`)."""
     import mtg_utils.deck_tune as deck_tune_mod
 
     captured: dict = {}
 
     def spy(_hd, *, params, **_kw):
+        captured["hd"] = _hd
         captured["params"] = params
         return _STUB_RESULT
 
@@ -160,35 +176,27 @@ def _spy_tune(monkeypatch):
     return captured
 
 
-def test_medium_defaults_paper_for_commander(tmp_path, monkeypatch):
-    # ADR-0040 §4 fix (Fix 3): the CLI never threaded `medium` at all before
-    # this fix — TuneParams always ran the "paper" default regardless of
-    # format. Commander is paper-only, so paper stays the inferred default.
-    captured = _spy_tune(monkeypatch)
-    deck = _write(tmp_path, "deck.json", COMMANDER_DECK)
-    hyd = _write(tmp_path, "hyd.json", HYDRATED)
-    res = CliRunner().invoke(
-        deck_tune_main, [deck, hyd, "--bulk-data", _bulk(tmp_path)]
-    )
-    assert res.exit_code == 0, res.output
-    assert captured["params"].medium == "paper"
-    assert captured["params"].paper_only is True
+# What a medium MEANS (the Game, the currency, the candidate pool) is tune()'s to
+# resolve through the Format — pinned in test_tuner_tune.py / test_formats.py. The CLI
+# is transport: these tests pin only what it hands over, and what it tells the user.
 
 
-def test_medium_defaults_digital_for_brawl(tmp_path, monkeypatch):
-    # Historic Brawl / Brawl default to digital (Arena), same as deck-forge's
-    # DeckSession — the ADR-0040 motivating benchmark was a Historic Brawl
-    # deck, so this is the path that must actually engage the fix.
-    captured = _spy_tune(monkeypatch)
-    deck = _write(tmp_path, "deck.json", BRAWL_DECK)
+def test_an_inferred_medium_is_announced(tmp_path, monkeypatch):
+    # A format played in two media says which one was inferred, so a paper table
+    # isn't silently tuned as Arena; a single-medium format says nothing.
+    _spy_tune(monkeypatch)
     hyd = _write(tmp_path, "hyd.json", HYDRATED)
-    res = CliRunner().invoke(
-        deck_tune_main, [deck, hyd, "--bulk-data", _bulk(tmp_path)]
+    brawl = CliRunner().invoke(
+        deck_tune_main, [_write(tmp_path, "b.json", BRAWL_DECK), "--bulk-data", hyd]
     )
-    assert res.exit_code == 0, res.output
-    assert captured["params"].medium == "digital"
-    # paper_only threads consistently with the inferred medium.
-    assert captured["params"].paper_only is False
+    assert brawl.exit_code == 0, brawl.output
+    assert "--medium not given" in brawl.output
+    assert "'digital'" in brawl.output
+    commander = CliRunner().invoke(
+        deck_tune_main, [_write(tmp_path, "c.json", COMMANDER_DECK), "--bulk-data", hyd]
+    )
+    assert commander.exit_code == 0, commander.output
+    assert "--medium not given" not in commander.output
 
 
 def test_medium_explicit_override_beats_the_inferred_default(tmp_path, monkeypatch):
@@ -197,11 +205,11 @@ def test_medium_explicit_override_beats_the_inferred_default(tmp_path, monkeypat
     hyd = _write(tmp_path, "hyd.json", HYDRATED)
     res = CliRunner().invoke(
         deck_tune_main,
-        [deck, hyd, "--bulk-data", _bulk(tmp_path), "--medium", "paper"],
+        [deck, "--bulk-data", hyd, "--medium", "paper"],
     )
     assert res.exit_code == 0, res.output
     assert captured["params"].medium == "paper"
-    assert captured["params"].paper_only is True
+    assert captured["params"].paper_only is None  # no flag → follows the medium
 
 
 def test_paper_only_explicit_flag_beats_medium_inference(tmp_path, monkeypatch):
@@ -212,8 +220,96 @@ def test_paper_only_explicit_flag_beats_medium_inference(tmp_path, monkeypatch):
     hyd = _write(tmp_path, "hyd.json", HYDRATED)
     res = CliRunner().invoke(
         deck_tune_main,
-        [deck, hyd, "--bulk-data", _bulk(tmp_path), "--paper-only"],
+        [deck, "--bulk-data", hyd, "--paper-only"],
     )
     assert res.exit_code == 0, res.output
-    assert captured["params"].medium == "digital"
     assert captured["params"].paper_only is True
+
+
+def test_cli_passes_flags_through_untouched(tmp_path, monkeypatch):
+    # Transport only: no flag → no override, so tune() follows the medium.
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", BRAWL_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(deck_tune_main, [deck, "--bulk-data", hyd])
+    assert res.exit_code == 0, res.output
+    assert captured["params"].medium is None
+    assert captured["params"].paper_only is None
+
+
+def test_wildcards_option_parses_a_per_rarity_budget(tmp_path, monkeypatch):
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", BRAWL_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(
+        deck_tune_main, [deck, "--bulk-data", hyd, "--wildcards", "rare=2,common=8"]
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["params"].wildcard_budget == {"rare": 2, "common": 8}
+
+
+def test_wildcards_option_rejects_an_unknown_rarity(tmp_path, monkeypatch):
+    _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", BRAWL_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(
+        deck_tune_main, [deck, "--bulk-data", hyd, "--wildcards", "epic=1"]
+    )
+    assert res.exit_code != 0
+    assert "epic=1" in res.output
+
+
+def test_usd_budget_on_a_digital_build_is_noted(tmp_path, monkeypatch):
+    # A digital build spends wildcards; --budget would silently do nothing.
+    _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", BRAWL_DECK)
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(
+        deck_tune_main, [deck, "--bulk-data", hyd, "--budget", "5"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "--wildcards" in res.output
+
+
+def test_a_sealed_deck_tunes_over_its_pool_never_the_bulk(tmp_path, monkeypatch):
+    # The CLI hands the tuner the opened pool's own search (ADR-0055).
+    import mtg_utils.deck_tune as deck_tune_mod
+
+    captured: dict = {}
+
+    def spy(_hd, *, search_fn, pool=None, **_kw):
+        captured["search_fn"] = search_fn
+        captured["pool"] = pool
+        return _STUB_RESULT
+
+    monkeypatch.setattr(deck_tune_mod, "tune", spy)
+    deck = _write(
+        tmp_path,
+        "deck.json",
+        {
+            "format": "sealed",
+            "commanders": [],
+            "cards": [{"name": "Mountain", "quantity": 17}],
+            "sideboard": [],
+            "pool": [{"name": "Krenko, Mob Boss", "quantity": 2}],
+        },
+    )
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(deck_tune_main, [deck, "--bulk-data", hyd])
+    assert res.exit_code == 0, res.output
+    assert captured["pool"] == {"Krenko, Mob Boss": 2}
+    found = captured["search_fn"](card_type="Creature", paper_only=True)
+    assert [c["name"] for c in found] == ["Krenko, Mob Boss"]
+
+
+def test_the_deck_jsons_own_medium_is_the_default(tmp_path, monkeypatch):
+    # One medium resolution with deck-forge's session and deck-rank
+    # (``resolve_deck_medium``): no flag, so the deck JSON's ``medium`` decides —
+    # nothing was inferred, so nothing is announced.
+    captured = _spy_tune(monkeypatch)
+    deck = _write(tmp_path, "deck.json", {**BRAWL_DECK, "medium": "paper"})
+    hyd = _write(tmp_path, "hyd.json", HYDRATED)
+    res = CliRunner().invoke(deck_tune_main, [deck, "--bulk-data", hyd])
+    assert res.exit_code == 0, res.output
+    assert captured["params"].medium == "paper"
+    assert "--medium not given" not in res.output

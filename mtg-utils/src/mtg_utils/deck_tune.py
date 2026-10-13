@@ -5,13 +5,13 @@ A thin adapter over ``_tuner.tune`` — the SAME skill-agnostic core deck-forge 
 ``search_fn`` and ``combo-search`` as ``combos_fn``, ensures the Card IR sidecar, and
 emits the scorecard + budgeted swaps as JSON.
 
-    deck-tune <deck.json> <hydrated.json> --bulk-data <path> \
-        [--budget N] [--max-swaps N] [--shape ...] [--bracket 1-5] [--paper-only]
+    deck-tune <deck.json> [--bulk-data <path>] \
+        [--budget N] [--max-swaps N] [--shape ...] [--bracket 1-5] [--paper-only] \
+        [--exclude <name>]... [--meta auto|off|<archetype>]
 
-Commander family only (commander / brawl / historic_brawl / competitive_brawl): the
-tuner is commander-shaped (the Command Zone template, the Burgess land target,
-commander fit), so it hard-refuses 60-card constructed — that stays on
-deck-wizard's agent-driven pipeline.
+Every format family: the template and every floor are the deck's family's
+(``Format.family``), and the Commander-only axes — commander fit, the bracket gate —
+are omitted from a 60-card or limited scorecard rather than reported empty.
 """
 
 from __future__ import annotations
@@ -23,13 +23,17 @@ from pathlib import Path
 import click
 
 from mtg_utils import card_search, combo_search
-from mtg_utils._deck_forge.state import _default_medium
 from mtg_utils._tuner.tune import TuneParams, tune
-from mtg_utils.format_config import COMMANDER_FORMATS
+from mtg_utils.deck_cli import (
+    acquire_for_cli,
+    bulk_data_option,
+    cli_meta_context,
+    meta_option,
+    resolve_bulk_path,
+    wildcards_option,
+)
+from mtg_utils.formats import resolve_deck_medium
 from mtg_utils.hydrated_deck import HydratedDeck
-
-# The tuner core (and so deck-tune) is built for the Commander family only.
-_COMMANDER_FAMILY = frozenset(COMMANDER_FORMATS)
 
 
 def _ensure_ir() -> None:
@@ -51,15 +55,8 @@ def _ensure_ir() -> None:
 
 
 @click.command()
-@click.argument("deck_json", type=click.Path(exists=True))
-@click.argument("hydrated_json", type=click.Path(exists=True))
-@click.option(
-    "--bulk-data",
-    "bulk_data",
-    required=True,
-    type=click.Path(exists=True),
-    help="Scryfall bulk JSON, for the swap proposer's card_search.",
-)
+@click.argument("deck_json", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option(
     "--budget", type=float, default=None, help="USD buy budget; omit = owned-only."
 )
@@ -83,9 +80,15 @@ def _ensure_ir() -> None:
     "medium",
     type=click.Choice(["paper", "digital"]),
     default=None,
-    help="Deck medium (ADR-0040 §4). Defaults by format, same as deck-forge's "
-    "DeckSession: the Arena Brawl formats → digital, everything else "
-    "→ paper. Drives whether a null EDHREC rank condemns a card.",
+    help="Deck medium. Defaults to the deck JSON's medium, else by format, same as "
+    "deck-forge's DeckSession: the Arena Brawl formats → digital, everything else → "
+    "paper. Decides the game the "
+    "scorecard reads, the currency (--budget USD vs --wildcards), the candidate "
+    "pool, and whether a null EDHREC rank condemns a card (ADR-0040 §4).",
+)
+@wildcards_option(
+    "Arena wildcard budget for a digital build, per rarity: "
+    "'mythic=1,rare=4,uncommon=8,common=8'. Omit = owned-only."
 )
 @click.option(
     "--paper-only/--no-paper-only",
@@ -96,6 +99,14 @@ def _ensure_ir() -> None:
     "omitted, so it never silently fights --medium.",
 )
 @click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="A card never to propose as an add (repeatable) — the CLI's form of "
+    "deck-forge's Reject: its slot goes to the next-ranked candidate.",
+)
+@meta_option("The tuner reads its card shares and core.")
+@click.option(
     "--output",
     "output",
     type=click.Path(),
@@ -103,39 +114,69 @@ def _ensure_ir() -> None:
     help="Write the JSON result here instead of stdout.",
 )
 def main(
-    deck_json: str,
-    hydrated_json: str,
-    bulk_data: str,
+    deck_json: Path,
+    bulk_data: Path | None,
     *,
     budget: float | None,
     max_swaps: int,
     shape_override: str | None,
     target_bracket: int | None,
     medium: str | None,
+    wildcards: dict[str, int] | None,
     paper_only: bool | None,
+    exclude: tuple[str, ...],
+    meta: str,
     output: str | None,
 ) -> None:
-    """Diagnose DECK_JSON + HYDRATED_JSON and (with --max-swaps) propose swaps."""
+    """Diagnose DECK_JSON and (with --max-swaps) propose swaps."""
     _ensure_ir()  # build the sidecar before tune()'s first ir_for lookup
-    hd = HydratedDeck.from_paths(deck_json, hydrated_json)
-    if hd.format not in _COMMANDER_FAMILY:
-        raise click.ClickException(
-            f"deck-tune is Commander-family only ({' / '.join(COMMANDER_FORMATS)}); "
-            f"got {hd.format!r} — 60-card constructed stays on the agent pipeline."
+    bulk_path = resolve_bulk_path(bulk_data)
+    hd = acquire_for_cli(deck_json, bulk_data)
+    fmt = hd.format
+    if target_bracket is not None and not fmt.has_commander:
+        click.echo(
+            f"Note: Commander brackets do not apply to {fmt.name}; --bracket ignored.",
+            err=True,
+        )
+    # The medium resolves as deck-forge's DeckSession and deck-rank resolve it
+    # (``resolve_deck_medium``: the flag, else the deck JSON's own ``medium``, else
+    # the format's default — the Arena Brawl formats default digital); tune() asks
+    # the Format for everything else the medium decides. Say which medium was
+    # inferred so a paper table isn't tuned as Arena (the medium decides the game
+    # the scorecard reads, the currency, the pool).
+    effective_medium = resolve_deck_medium(fmt, hd.deck, medium)
+    if medium is None and hd.deck.get("medium") is None and len(fmt.media) > 1:
+        other = next(m for m in fmt.media if m != effective_medium)
+        click.echo(
+            f"Note: --medium not given; tuning {fmt.name} as {effective_medium!r} "
+            f"(pass --medium {other} for the other).",
+            err=True,
+        )
+    if medium is not None and effective_medium != medium:
+        click.echo(
+            f"Note: {fmt.name} is not played in {medium!r}; "
+            f"using {effective_medium!r}.",
+            err=True,
+        )
+    if budget is not None and fmt.cost_mode(effective_medium) == "wildcards":
+        click.echo(
+            "Note: a digital build spends Arena wildcards, not USD — --budget is "
+            "ignored; pass --wildcards (e.g. rare=4,uncommon=8).",
+            err=True,
         )
 
-    # ADR-0040 §4 fix: infer medium the same way deck-forge's DeckSession does
-    # (the Arena Brawl formats default digital) so the digital null-rank fix
-    # actually engages on the CLI path — the ADR's own motivating benchmark
-    # was a Historic Brawl deck. paper_only threads consistently with the
-    # (inferred or explicit) medium unless the caller overrides it directly.
-    effective_medium = medium or _default_medium(hd.format)
-    effective_paper_only = (
-        paper_only if paper_only is not None else effective_medium != "digital"
-    )
-
-    bulk_path = Path(bulk_data)
-    search = functools.partial(card_search.search_cards, bulk_path)
+    # A pool-bounded deck (sealed / draft) searches its opened pool, never the bulk,
+    # and every pool card is owned (ADR-0055).
+    pool: dict[str, int] | None = None
+    if fmt.pool_bounded:
+        search = card_search.pool_search_fn(hd.deck_records(zones=("pool",)), fmt)
+        pool = {}
+        for entry, _rec in hd.entries(zones=("pool",)):
+            pool[entry["name"]] = pool.get(entry["name"], 0) + int(
+                entry.get("quantity", 1)
+            )
+    else:
+        search = functools.partial(card_search.search_cards, bulk_path)
     by_name = hd.by_name
 
     def combos_fn(deck: dict) -> dict:
@@ -143,15 +184,21 @@ def main(
             HydratedDeck.from_parsed(deck, by_name=by_name)
         )
 
+    meta_ctx = cli_meta_context(hd, effective_medium, meta)
     params = TuneParams(
         budget=budget,
         max_swaps=max(0, max_swaps),
         shape_override=shape_override,
-        paper_only=effective_paper_only,
-        medium=effective_medium,
+        paper_only=paper_only,
+        # The raw choice (flag, else the deck JSON's): tune() resolves it through
+        # the Format, to the same effective_medium.
+        medium=medium if medium is not None else hd.deck.get("medium"),
+        wildcard_budget=wildcards,
         target_bracket=target_bracket,
+        exclude=frozenset(exclude),
+        meta=meta_ctx,
     )
-    result = tune(hd, search_fn=search, params=params, combos_fn=combos_fn)
+    result = tune(hd, search_fn=search, params=params, combos_fn=combos_fn, pool=pool)
 
     text = json.dumps(result, indent=2)
     if output:

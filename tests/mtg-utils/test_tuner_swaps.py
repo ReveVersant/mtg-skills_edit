@@ -1,20 +1,56 @@
 """Swap engine: template-safety, role-over trims, and emerging-theme commits."""
 
-from mtg_utils._deck_forge.signal_specs import spec_for
-from mtg_utils._deck_forge.signals import Signal
+import pytest
+
+from mtg_utils._analysis.signal_specs import spec_for
+from mtg_utils._analysis.signals import Signal
 from mtg_utils._tuner.classify import CardClass
-from mtg_utils._tuner.metrics import top_issues
+from mtg_utils._tuner.issues import (
+    PROTECTION_SEARCH,
+    ROLE_SEARCH,
+    Sourcing,
+    _reliable_ramp,
+    top_issues,
+)
 from mtg_utils._tuner.swaps import (
-    _PROTECTION_SEARCH,
-    _ROLE_SEARCH,
+    SwapContext,
     _cut_why,
     _is_fixing,
-    _reliable_ramp,
-    _spec_for_issue,
     cut_candidates,
     propose_swaps,
 )
+from mtg_utils.testkit import test_card
 from mtg_utils.theme_presets import get_preset
+
+# Issues are built THROUGH the interface: ``Sourcing.issue`` decides each remedy from
+# the same focus / signals / budgets the test hands the swap engine — a test never
+# hand-sets a remedy.
+_ISSUE_FIELDS = ("role", "label", "subkind", "count", "advisory")
+
+
+def _issue(sourcing, fields):
+    return sourcing.issue(
+        fields["kind"],
+        severity=fields.get("severity", 0),
+        message=fields.get("message", ""),
+        **{k: fields[k] for k in _ISSUE_FIELDS if k in fields},
+    )
+
+
+def _swaps_for_issue_dicts(classes, issues, ctx):
+    sourcing = Sourcing(ctx.focus_result, ctx.deck_signals, ctx.budgets)
+    return propose_swaps(classes, [_issue(sourcing, i) for i in issues], ctx)
+
+
+def _top_issues_for(*, focus_r, template_r, deck_signals=(), **metrics):
+    """``issues.top_issues`` over the budgets the template rows came from."""
+    budgets = {**template_r["short"], **template_r["over"]}
+    return top_issues(
+        focus_r=focus_r,
+        template_r=template_r,
+        sourcing=Sourcing(focus_r, list(deck_signals), budgets),
+        **metrics,
+    )
 
 
 def _focus(viable=(), emerging=(), stranded=()):
@@ -53,6 +89,22 @@ def _cc(
     )
 
 
+def _real_cc(name, bucket, roles=(), served=(), edhrec_rank=1000):
+    """A real card from the testkit snapshot (ADR-0056) as a ``CardClass``, with
+    only its per-printing EDHREC rank overlaid."""
+    record = {**test_card(name), "edhrec_rank": edhrec_rank}
+    return CardClass(
+        name=name,
+        bucket=bucket,
+        roles=tuple(roles),
+        served=tuple(served),
+        dual_purpose=(bucket == "spine" and bool(served)),
+        cmc=float(record.get("cmc") or 0.0),
+        record=record,
+        edhrec_rank=edhrec_rank,
+    )
+
+
 def _band(current, lo, hi, **extra):
     dev = current - hi if current > hi else (current - lo if current < lo else 0)
     return {
@@ -72,36 +124,11 @@ def test_is_fixing_counts_basic_land_fetch():
     # the color you need, and a multi-type land-name fetch grabs 2+ types. _is_fixing read
     # only produced_mana, so it protected a strictly-worse 2-color rock while cutting the
     # any-basic fetcher that fixes all of the deck's colors.
-    kodama = _cc(
-        "Kodama's Reach",
-        "spine",
-        roles=("ramp",),
-        oracle=(
-            "Search your library for up to two basic land cards, reveal those cards, "
-            "put one onto the battlefield tapped and the other into your hand, then "
-            "shuffle."
-        ),
-    )
-    farseek = _cc(
-        "Farseek",
-        "spine",
-        roles=("ramp",),
-        oracle=(
-            "Search your library for a Plains, Island, Swamp, or Mountain card, put it "
-            "onto the battlefield tapped, then shuffle."
-        ),
-    )
-    rampant = _cc(
-        "Rampant Growth",
-        "spine",
-        roles=("ramp",),
-        oracle=(
-            "Search your library for a basic land card, put it onto the battlefield "
-            "tapped, then shuffle."
-        ),
-    )
-    signet = _cc("Golgari Signet", "spine", roles=("ramp",), produced=["B", "G"])
-    sol_ring = _cc("Sol Ring", "spine", roles=("ramp",), produced=["C"])
+    kodama = _real_cc("Kodama's Reach", "spine", roles=("ramp",))
+    farseek = _real_cc("Farseek", "spine", roles=("ramp",))
+    rampant = _real_cc("Rampant Growth", "spine", roles=("ramp",))
+    signet = _real_cc("Golgari Signet", "spine", roles=("ramp",))
+    sol_ring = _real_cc("Sol Ring", "spine", roles=("ramp",))
     assert _is_fixing(kodama) is True
     assert _is_fixing(farseek) is True
     assert _is_fixing(rampant) is True
@@ -109,21 +136,24 @@ def test_is_fixing_counts_basic_land_fetch():
     assert _is_fixing(sol_ring) is False  # colorless rock
 
 
+def test_is_fixing_reads_the_land_search_off_the_trees():
+    # Any land card (Sylvan Scrying) can find any land: fixing. A single basic land
+    # type ("a Forest card", Three Visits) is mono-color ramp. An opponent's
+    # compensation search (Path to Exile) isn't yours.
+    scrying = _real_cc("Sylvan Scrying", "spine", roles=("ramp",))
+    three_visits = _real_cc("Three Visits", "spine", roles=("ramp",))
+    path = _real_cc("Path to Exile", "spine", roles=("removal",))
+    assert _is_fixing(scrying) is True
+    assert _is_fixing(three_visits) is False
+    assert _is_fixing(path) is False
+
+
 def test_over_band_ramp_cut_keeps_basic_land_fetch_over_colorless_rock():
     # ramp over by 1; the cut must trim the redundant colorless rock, not the basic-land
     # fetch that fixes the deck's colors. Kodama is the LEAST-played (rank 900 vs 40) so
     # without the fix the play-rate tiebreak cuts it first — _is_fixing must override that.
-    kodama = _cc(
-        "Kodama's Reach",
-        "spine",
-        roles=("ramp",),
-        edhrec_rank=900,
-        oracle="Search your library for up to two basic land cards, put one onto the "
-        "battlefield tapped and the other into your hand, then shuffle.",
-    )
-    mind_stone = _cc(
-        "Mind Stone", "spine", roles=("ramp",), edhrec_rank=40, produced=["C"]
-    )
+    kodama = _real_cc("Kodama's Reach", "spine", roles=("ramp",), edhrec_rank=900)
+    mind_stone = _real_cc("Mind Stone", "spine", roles=("ramp",), edhrec_rank=40)
     budgets = {"ramp": _band(2, 0, 1), "lands": _band(36, 36, 38)}
     cuts = cut_candidates(
         [kodama, mind_stone], budgets=budgets, focus_verdict="FOCUSED", stranded=set()
@@ -178,28 +208,87 @@ def test_curve_fix_does_not_overshoot_a_full_role():
         "color_identity": [],
     }
 
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result={
-            "viable_avenues": [],
-            "stranded_avenues": [],
-            "verdict": "FOCUSED",
-        },
-        deck_signals=[],
-        search_fn=lambda **_: [dirty, clean],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result={
+                "viable_avenues": [],
+                "stranded_avenues": [],
+                "verdict": "FOCUSED",
+            },
+            deck_signals=[],
+            search_fn=lambda **_: [dirty, clean],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     # The clean finisher is chosen over the one that would push interaction over its band.
     assert out["swaps"][0]["add"]["name"] == "Big Wincon"
+
+
+def test_an_excluded_add_yields_its_slot_to_the_next_candidate():
+    """The builder's Reject (``SwapContext.exclude``): the rejected card is never
+    sourced, and the same issue is answered by the next-ranked candidate."""
+    classes = [
+        _cc("Filler One", "filler", cmc=4.0),
+        _cc("Filler Two", "filler", cmc=3.0),
+    ]
+    budgets = {"card_draw": _band(10, 10, 12)}
+    issue = {
+        "kind": "efficiency",
+        "subkind": "thin top-end",
+        "severity": 3,
+        "message": "curve: thin top-end",
+    }
+
+    def finisher(name):
+        return {
+            "name": name,
+            "type_line": "Sorcery",
+            "oracle_text": "You win the game.",
+            "cmc": 7.0,
+            "prices": {"usd": "1.00"},
+            "color_identity": [],
+        }
+
+    def ctx(exclude):
+        return SwapContext(
+            budgets=budgets,
+            focus_result={
+                "viable_avenues": [],
+                "stranded_avenues": [],
+                "verdict": "FOCUSED",
+            },
+            deck_signals=[],
+            search_fn=lambda **_: [finisher("First Pick"), finisher("Second Pick")],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+            exclude=exclude,
+        )
+
+    plain = _swaps_for_issue_dicts(classes, [issue], ctx(()))
+    assert [s["add"]["name"] for s in plain["swaps"]] == ["First Pick"]
+    rejected = _swaps_for_issue_dicts(classes, [issue], ctx({"First Pick"}))
+    assert [s["add"]["name"] for s in rejected["swaps"]] == ["Second Pick"]
+    assert rejected["swaps"][0]["cut"] == plain["swaps"][0]["cut"]
+    # Both rejected: the issue yields nothing, and the note says the rejection is why.
+    none = _swaps_for_issue_dicts(classes, [issue], ctx({"First Pick", "Second Pick"}))
+    assert none["swaps"] == []
+    assert "No alternative to First Pick, Second Pick" in none["note"]
+    assert "curve: thin top-end" in none["note"]
 
 
 def test_role_over_trims_the_over_role_not_a_floor_role():
@@ -225,20 +314,22 @@ def test_role_over_trims_the_over_role_not_a_floor_role():
         "prices": {"usd": "1.00"},
         "color_identity": [],
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
-        deck_signals=[],
-        search_fn=lambda **_: [add],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
+            deck_signals=[],
+            search_fn=lambda **_: [add],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     # Trims the pure removal, never the lone board wipe (which sits at its floor).
@@ -251,7 +342,7 @@ def test_role_over_trim_cuts_least_played_excess_not_a_staple():
     # the least-played card, never the staple — the pre-fix sort keyed on
     # served-count first, so it cut Sol Ring (0 avenues) over the fringe ramp.
     classes = [
-        _cc("Sol Ring", "spine", roles=["ramp"], served=(), cmc=1.0, edhrec_rank=1),
+        _real_cc("Sol Ring", "spine", roles=["ramp"], edhrec_rank=1),
         _cc(
             "Fringe Rock",
             "spine",
@@ -271,34 +362,38 @@ def test_role_over_trim_cuts_least_played_excess_not_a_staple():
         "prices": {"usd": "1.00"},
         "color_identity": [],
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
-        deck_signals=[],
-        search_fn=lambda **_: [add],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
+            deck_signals=[],
+            search_fn=lambda **_: [add],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["cut"]["name"] == "Fringe Rock"
 
 
 def test_role_search_specs_reference_only_real_presets():
-    # Regression: _ROLE_SEARCH["ramp"] used a nonexistent 'ramp' preset, which made
-    # card_search raise BadParameter and 500'd /api/tune for any ramp-short deck.
-    for spec in [*_ROLE_SEARCH.values(), _PROTECTION_SEARCH]:
+    # Regression: ROLE_SEARCH["ramp"] once named a 'ramp' preset that did not exist,
+    # which made card_search raise BadParameter and 500'd /api/tune for any ramp-short
+    # deck.
+    for spec in [*ROLE_SEARCH.values(), PROTECTION_SEARCH]:
         for preset in spec.get("preset_names", ()):
             get_preset(preset)  # raises KeyError on an unknown preset → test fails
-    # ramp has no theme_preset, so it must be sourced by oracle text, not a preset.
-    assert "ramp" not in _ROLE_SEARCH["ramp"].get("preset_names", ())
-    assert _ROLE_SEARCH["ramp"].get("oracle")
+    # ADR-0051: ramp is sourced by the SAME preset roles.is_ramp counts it by — never a
+    # hand-copied oracle regex that can drift from the role.
+    assert ROLE_SEARCH["ramp"]["preset_names"] == ("ramp",)
+    assert "oracle" not in ROLE_SEARCH["ramp"]
 
 
 def test_dead_weight_replaces_filler_with_synergy_not_engine_cards():
@@ -330,20 +425,22 @@ def test_dead_weight_replaces_filler_with_synergy_not_engine_cards():
         }
         for i in range(3)
     ]
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets={},
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: adds,
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=10,
-        top_heavy=False,
+        SwapContext(
+            budgets={},
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: adds,
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=10,
+            top_heavy=False,
+        ),
     )
     cut_names = {s["cut"]["name"] for s in out["swaps"]}
     # Only filler is cut — never the engine card that serves the plan.
@@ -367,15 +464,15 @@ def test_top_issues_flags_dead_weight_only_with_a_redeploy_target():
         "verdict": "FOCUSED",
         "stranded_avenues": [],
     }
-    kinds = {i["kind"] for i in top_issues(focus_r=heavy, **base)}
+    kinds = {i.kind for i in _top_issues_for(focus_r=heavy, **base)}
     assert "dead_weight" in kinds
     # A couple of off-theme cards is normal, not "dead weight".
     light = {**heavy, "filler": 1}
-    assert "dead_weight" not in {i["kind"] for i in top_issues(focus_r=light, **base)}
+    assert "dead_weight" not in {i.kind for i in _top_issues_for(focus_r=light, **base)}
     # No theme to deepen and no short role → advisory only, no swap issue.
     no_target = {**heavy, "viable_avenues": []}
     assert "dead_weight" not in {
-        i["kind"] for i in top_issues(focus_r=no_target, **base)
+        i.kind for i in _top_issues_for(focus_r=no_target, **base)
     }
 
 
@@ -389,7 +486,7 @@ def test_dead_weight_outranks_theme_refocus():
         "verdict": "SPREAD-THIN",
         "stranded_avenues": ["A", "B"],
     }
-    issues = top_issues(
+    issues = _top_issues_for(
         efficiency_r={"verdict": "ok"},
         focus_r=focus_r,
         template_r={"short": {}, "over": {}},
@@ -397,7 +494,7 @@ def test_dead_weight_outranks_theme_refocus():
         protection_r={"status": "ok"},
         commander_r={"misfit": False},
     )
-    kinds = [i["kind"] for i in issues]
+    kinds = [i.kind for i in issues]
     assert kinds.index("dead_weight") < kinds.index("spread_thin")
 
 
@@ -433,20 +530,22 @@ def test_dead_weight_cuts_fringe_theme_cards_keeps_played_ones():
         }
         for i in range(3)
     ]
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets={},
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: adds,
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=10,
-        top_heavy=False,
+        SwapContext(
+            budgets={},
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: adds,
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=10,
+            top_heavy=False,
+        ),
     )
     cut = {s["cut"]["name"] for s in out["swaps"]}
     assert {"Vanilla Beater", "Unranked Beater"} <= cut  # fringe theme cards upgraded
@@ -476,20 +575,22 @@ def test_add_prefers_higher_playrate_over_cheaper_chaff():
         "color_identity": [],
         "edhrec_rank": 40000,
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets={},
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: [chaff, staple],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets={},
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: [chaff, staple],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     # Equal synergy → the played staple wins over the cheaper but unplayed chaff.
     assert out["swaps"][0]["add"]["name"] == "Staple"
@@ -511,7 +612,7 @@ def test_dead_weight_fires_on_fringe_theme_cards_without_filler():
         "verdict": "FOCUSED",
         "stranded_avenues": [],
     }
-    assert "dead_weight" in {i["kind"] for i in top_issues(focus_r=fr, **base)}
+    assert "dead_weight" in {i.kind for i in _top_issues_for(focus_r=fr, **base)}
 
 
 def test_fill_pass_adds_without_cuts_to_grow_an_undersized_deck():
@@ -541,21 +642,23 @@ def test_fill_pass_adds_without_cuts_to_grow_an_undersized_deck():
         "color_identity": ["G"],
         "edhrec_rank": 100,
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: [a_land, *adds],
-        identity="G",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=100.0,
-        max_swaps=50,
-        top_heavy=False,
-        fill_slots=8,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: [a_land, *adds],
+            identity="G",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=100.0,
+            max_swaps=50,
+            top_heavy=False,
+            fill_slots=8,
+        ),
     )
     fills = [s for s in out["swaps"] if s["cut"] is None]
     assert len(fills) == 8  # filled exactly the open slots, with pure adds (no cut)
@@ -564,21 +667,23 @@ def test_fill_pass_adds_without_cuts_to_grow_an_undersized_deck():
 
 def test_fill_slots_zero_leaves_a_full_deck_untouched():
     # A complete deck (fill_slots=0) gets no fill adds — only the normal swap behavior.
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         [_cc("Filler", "filler", cmc=3.0)],
         [],
-        budgets={},
-        focus_result=_focus(),
-        deck_signals=[],
-        search_fn=lambda **_: [],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=100.0,
-        max_swaps=50,
-        top_heavy=False,
-        fill_slots=0,
+        SwapContext(
+            budgets={},
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=100.0,
+            max_swaps=50,
+            top_heavy=False,
+            fill_slots=0,
+        ),
     )
     assert out["swaps"] == []
 
@@ -593,10 +698,11 @@ def test_emerging_theme_proposes_a_commit_add():
         confidence="high",
     )
     label = spec_for(sig).label
-    issue = {"kind": "under_supported_theme", "label": label}
-    spec = _spec_for_issue(
-        issue, _focus(emerging=[{"label": label, "depth": 7, "cards": []}]), [sig]
+    sourcing = Sourcing(
+        _focus(emerging=[{"label": label, "depth": 7, "cards": []}]), [sig], {}
     )
+    remedy = sourcing.remedy_for("under_supported_theme", label=label)
+    spec = remedy.spec if remedy else None
     assert spec is not None  # resolves to the emerging theme's search → "commit" adds
 
 
@@ -624,24 +730,26 @@ def test_wildcard_budget_gates_adds_by_rarity():
         "message": "curve: thin top-end",
     }
     # Budget allows one rare but no mythic — the mythic must be skipped, the rare taken.
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(),
-        deck_signals=[],
-        search_fn=lambda **_: [
-            _finisher("Pricey Mythic", "mythic"),
-            _finisher("Fine Rare", "rare"),
-        ],
-        identity="",
-        fmt="historic_brawl",
-        paper_only=False,
-        owned={},
-        budget=None,
-        max_swaps=1,
-        top_heavy=False,
-        wildcard_budget={"mythic": 0, "rare": 1, "uncommon": 0, "common": 0},
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [
+                _finisher("Pricey Mythic", "mythic"),
+                _finisher("Fine Rare", "rare"),
+            ],
+            identity="",
+            fmt="historic_brawl",
+            paper_only=False,
+            owned={},
+            budget=None,
+            max_swaps=1,
+            top_heavy=False,
+            wildcard_budget={"mythic": 0, "rare": 1, "uncommon": 0, "common": 0},
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Fine Rare"
@@ -665,24 +773,26 @@ def test_wildcard_owned_is_free_even_at_zero_budget():
         "severity": 3,
         "message": "curve: thin top-end",
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(),
-        deck_signals=[],
-        search_fn=lambda **_: [
-            _finisher("Unowned Rare", "rare"),
-            _finisher("Owned Rare", "rare"),
-        ],
-        identity="",
-        fmt="historic_brawl",
-        paper_only=False,
-        owned={"Owned Rare": 1},
-        budget=None,
-        max_swaps=1,
-        top_heavy=False,
-        wildcard_budget={"mythic": 0, "rare": 0, "uncommon": 0, "common": 0},
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [
+                _finisher("Unowned Rare", "rare"),
+                _finisher("Owned Rare", "rare"),
+            ],
+            identity="",
+            fmt="historic_brawl",
+            paper_only=False,
+            owned={"Owned Rare": 1},
+            budget=None,
+            max_swaps=1,
+            top_heavy=False,
+            wildcard_budget={"mythic": 0, "rare": 0, "uncommon": 0, "common": 0},
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Owned Rare"
@@ -695,34 +805,37 @@ def test_wildcard_owned_is_free_even_at_zero_budget():
     }
 
 
-def test_reliable_ramp_excludes_conditional_and_opponent_mana():
+@pytest.mark.parametrize(
+    ("name", "reliable"),
+    [
+        # Genuine, unconditional ramp → sourced.
+        ("Arcane Signet", True),
+        # Every mana / Treasure ability gated on a condition (CR 602.5) → not
+        # sourced: metalcraft, a Dragon, formidable, oil counters, max speed, an
+        # opponent's turn, a creature that fought (a residue phase parks).
+        ("Mox Opal", False),
+        ("Mox Jasper", False),
+        ("Circle of Elders", False),
+        ("Tablet of Compleation", False),
+        ("Endrider Catalyzer", False),
+        ("Lavinia, Foil to Conspiracy", False),
+        ("Boxing Ring", False),
+        # No activation restriction: per its ruling Mox Amber can be activated with
+        # no legendary permanent (it then adds no mana).
+        ("Mox Amber", True),
+        # An ungated sibling ({T}: Add {G}) makes the card reliable ramp.
+        ("Fanatic of Rhonas", True),
+        ("Whisperer of the Wilds", True),
+        # The legendary-sorcery cast restriction gates no mana ability.
+        ("Kamahl's Druidic Vow", True),
+        # An Offer You Can't Refuse: the Treasures (and their mana) go to the opponent.
+        ("An Offer You Can't Refuse", False),
+    ],
+)
+def test_reliable_ramp_excludes_conditional_and_opponent_mana(name, reliable):
     """The tuner sources only ramp it can rely on: genuine producers that aren't gated
-    on board state, and never mana an opponent receives."""
-
-    def rock(oracle, type_line="Artifact"):
-        return {"type_line": type_line, "oracle_text": oracle}
-
-    # Genuine, unconditional ramp → sourced.
-    assert _reliable_ramp(rock("{T}: Add one mana of any color."))
-    # Mox Opal (metalcraft) / Mox Jasper (a Dragon): conditional rocks → not sourced.
-    assert not _reliable_ramp(
-        rock(
-            "Metalcraft — {T}: Add one mana of any color. Activate only if you "
-            "control three or more artifacts."
-        )
-    )
-    assert not _reliable_ramp(
-        rock("{T}: Add one mana of any color. Activate only if you control a Dragon.")
-    )
-    # An Offer You Can't Refuse: the Treasures (and their mana) go to the opponent.
-    assert not _reliable_ramp(
-        rock(
-            "Counter target noncreature spell. Its controller creates two Treasure "
-            "tokens. (They're artifacts with \"{T}, Sacrifice this token: Add one "
-            'mana of any color.")',
-            type_line="Instant",
-        )
-    )
+    on a condition, and never mana an opponent receives."""
+    assert _reliable_ramp(test_card(name)) is reliable
 
 
 def test_cut_candidates_null_rank_low_value_is_medium_aware():
@@ -788,20 +901,22 @@ def test_focused_role_fix_prefers_on_avenue_over_cheaper_off_avenue():
     # sort has no synergy term at all) and would win. At FOCUSED, the pricier
     # on-avenue candidate must win instead, since it's still in-budget.
     sig, label, classes, budgets, issue, off_avenue, on_avenue = _role_fix_scenario()
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: [off_avenue, on_avenue],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: [off_avenue, on_avenue],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Prolif Draw"
@@ -813,20 +928,22 @@ def test_focused_role_fix_labels_reason_when_nothing_is_on_avenue():
     # (cheapest) one still ships, but the reason says it's a fallback.
     sig, label, classes, budgets, issue, off_avenue, _on_avenue = _role_fix_scenario()
     off_avenue_b = _off_avenue_draw("Generic Draw B", cmc=2.0, rank=2000)
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: [off_avenue, off_avenue_b],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: [off_avenue, off_avenue_b],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Generic Draw"  # still best-ranked
@@ -844,20 +961,22 @@ def test_spread_thin_role_fix_keeps_efficiency_first_untouched():
         "stranded_avenues": [],
         "verdict": "SPREAD-THIN",
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=focus_result,
-        deck_signals=[sig],
-        search_fn=lambda **_: [off_avenue, on_avenue],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=focus_result,
+            deck_signals=[sig],
+            search_fn=lambda **_: [off_avenue, on_avenue],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Generic Draw"
@@ -873,20 +992,22 @@ def test_spine_led_role_fix_keeps_efficiency_first_untouched():
         "stranded_avenues": [],
         "verdict": "SPINE-LED",
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=focus_result,
-        deck_signals=[sig],
-        search_fn=lambda **_: [off_avenue, on_avenue],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=focus_result,
+            deck_signals=[sig],
+            search_fn=lambda **_: [off_avenue, on_avenue],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Generic Draw"
@@ -894,9 +1015,9 @@ def test_spine_led_role_fix_keeps_efficiency_first_untouched():
 
 
 def test_focused_role_over_not_gated_by_role_fix_guard():
-    # role_over is synergy_first already (not a Spine kind) — the ADR-0040
-    # guard (scoped to _SPINE_KINDS via role_fix=not synergy_first) must not
-    # change its existing behavior: best-synergy wins, no label.
+    # role_over's remedy is not a Spine fill (it ranks synergy-first) — the ADR-0040
+    # guard (scoped to ``Remedy.spine``) must not change its existing behavior:
+    # best-synergy wins, no label.
     classes = [
         _cc("Pure Removal", "spine", roles=["interaction"]),
         _cc("Lone Wrath", "spine", roles=["interaction", "board_wipe"]),
@@ -919,20 +1040,22 @@ def test_focused_role_over_not_gated_by_role_fix_guard():
         "prices": {"usd": "1.00"},
         "color_identity": [],
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets=budgets,
-        focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
-        deck_signals=[],
-        search_fn=lambda **_: [add],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=1,
-        top_heavy=False,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(viable=[{"label": "Main", "depth": 20, "cards": []}]),
+            deck_signals=[],
+            search_fn=lambda **_: [add],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     assert out["swaps"][0]["add"]["name"] == "Token Maker"
@@ -992,20 +1115,22 @@ def test_low_value_swap_cut_why_reflects_weak_grant_grade_end_to_end():
         "color_identity": [],
         "edhrec_rank": 200,
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         [weak_granter],
         [issue],
-        budgets={},
-        focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
-        deck_signals=[sig],
-        search_fn=lambda **_: [add],
-        identity="",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=50.0,
-        max_swaps=10,
-        top_heavy=False,
+        SwapContext(
+            budgets={},
+            focus_result=_focus(viable=[{"label": label, "depth": 20, "cards": []}]),
+            deck_signals=[sig],
+            search_fn=lambda **_: [add],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=10,
+            top_heavy=False,
+        ),
     )
     assert len(out["swaps"]) == 1
     why = out["swaps"][0]["cut"]["why"].lower()
@@ -1040,15 +1165,29 @@ def test_cut_candidates_granter_quality_gates_low_value():
     assert all(name != "Premium Granter" for _, name in got)
 
 
-def test_grant_covered_role_short_issue_has_no_spec():
-    # ADR-0040 §1: a role_short issue the top_issues advisory-downgrade flags
-    # grant_covered must resolve to no spec at all — the same "advisory, no swap
-    # fixes it" shape commander_misfit already uses (kind falls through to None).
-    covered = {"kind": "role_short", "role": "card_draw", "grant_covered": True}
-    assert _spec_for_issue(covered, _focus(), []) is None
-    # A normal (non-covered) role_short issue is unaffected — still actionable.
-    uncovered = {"kind": "role_short", "role": "card_draw"}
-    assert _spec_for_issue(uncovered, _focus(), []) == _ROLE_SEARCH["card_draw"]
+def test_a_grant_covered_role_sources_nothing_on_any_path():
+    # ADR-0040 §1: the three sourcing paths (the issue loop, the dead-weight
+    # redeploy, the fill pass) all read ONE answer — Sourcing — so a Grant-covered
+    # short role sources nothing anywhere, while its shortfall stays visible.
+    covered = Sourcing(
+        _focus(), [], {"card_draw": _band(0, 10, 12, grant_covered=True)}
+    )
+    assert covered.role_spec("card_draw") is None  # the fill pass
+    assert covered.remedy_for("role_short", role="card_draw") is None  # issue loop
+    assert covered.redeploy() is None  # the dead-weight redeploy
+    assert not covered.has_redeploy_target()
+    issue = covered.issue("role_short", role="card_draw", severity=10, message="m")
+    assert issue.advisory is True
+    assert issue.grant_covered is True
+    assert issue.remedy is None
+    # A normal (non-covered) short role is unaffected — still actionable everywhere.
+    plain = Sourcing(_focus(), [], {"card_draw": _band(0, 10, 12)})
+    assert plain.role_spec("card_draw") == ROLE_SEARCH["card_draw"]
+    assert (
+        plain.remedy_for("role_short", role="card_draw").spec
+        == (ROLE_SEARCH["card_draw"])
+    )
+    assert plain.redeploy() == ROLE_SEARCH["card_draw"]
 
 
 def test_propose_swaps_never_sources_a_grant_covered_role_short_issue():
@@ -1063,41 +1202,35 @@ def test_propose_swaps_never_sources_a_grant_covered_role_short_issue():
         "kind": "role_short",
         "role": "card_draw",
         "severity": 10,
-        "grant_covered": True,
+        # Coverage is read off the budgets row below, never hand-set on the issue.
         "message": "card draw short by 10 — covered by Sliver Weftwinder",
     }
-    draw_spell = {
-        "name": "Faithless Looting",
-        "type_line": "Sorcery",
-        "oracle_text": "Draw two cards, then discard two cards.",
-        "cmc": 1.0,
-        "prices": {"usd": "0.50"},
-        "color_identity": ["R"],
-    }
-    out = propose_swaps(
+    draw_spell = {**test_card("Faithless Looting"), "prices": {"usd": "0.50"}}
+    out = _swaps_for_issue_dicts(
         classes,
         [covered_issue],
-        budgets={"card_draw": _band(0, 10, 12, grant_covered=True)},
-        focus_result=_focus(),
-        deck_signals=[],
-        search_fn=lambda **_: [draw_spell],
-        identity="R",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=100.0,
-        max_swaps=10,
-        top_heavy=False,
+        SwapContext(
+            budgets={"card_draw": _band(0, 10, 12, grant_covered=True)},
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [draw_spell],
+            identity="R",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=100.0,
+            max_swaps=10,
+            top_heavy=False,
+        ),
     )
     assert out["swaps"] == []
 
 
 def test_dead_weight_never_sources_a_grant_covered_role():
-    # Verified-review Fix 4: `_dead_weight_spec`'s fallback (redeploy filler
-    # into the worst-short Spine role when there's no viable avenue to
-    # deepen) is a THIRD sourcing path the #98 advisory downgrade missed —
-    # the issue-driven `_spec_for_issue` role_short handling and the fill
-    # pass are both gated on `grant_covered`, but this fallback wasn't. A
+    # Verified-review Fix 4: the dead-weight redeploy (filler into the
+    # worst-short Spine role when there's no viable avenue to deepen) is a
+    # THIRD sourcing path the #98 advisory downgrade once missed — now all
+    # three read `Sourcing`, and this pins the end-to-end behaviour. A
     # grant-covered card_draw shortfall must never source a "fill card_draw"
     # dead-weight add.
     classes = [
@@ -1105,28 +1238,23 @@ def test_dead_weight_never_sources_a_grant_covered_role():
         _cc("Junk B", "filler", cmc=3.0),
     ]
     issue = {"kind": "dead_weight", "severity": 7, "count": 2, "message": "dead weight"}
-    draw_spell = {
-        "name": "Faithless Looting",
-        "type_line": "Sorcery",
-        "oracle_text": "Draw two cards, then discard two cards.",
-        "cmc": 1.0,
-        "prices": {"usd": "0.50"},
-        "color_identity": ["R"],
-    }
-    out = propose_swaps(
+    draw_spell = {**test_card("Faithless Looting"), "prices": {"usd": "0.50"}}
+    out = _swaps_for_issue_dicts(
         classes,
         [issue],
-        budgets={"card_draw": _band(0, 10, 12, grant_covered=True)},
-        focus_result=_focus(),  # no viable avenues -> main-theme search is empty
-        deck_signals=[],
-        search_fn=lambda **_: [draw_spell],
-        identity="R",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=100.0,
-        max_swaps=10,
-        top_heavy=False,
+        SwapContext(
+            budgets={"card_draw": _band(0, 10, 12, grant_covered=True)},
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [draw_spell],
+            identity="R",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=100.0,
+            max_swaps=10,
+            top_heavy=False,
+        ),
     )
     assert out["swaps"] == []
 
@@ -1152,8 +1280,8 @@ def test_top_issues_dead_weight_ignored_when_only_short_role_is_grant_covered():
     }
     covered_short = {"card_draw": _band(0, 10, 12, grant_covered=True)}
     kinds = {
-        i["kind"]
-        for i in top_issues(
+        i.kind
+        for i in _top_issues_for(
             focus_r=heavy, template_r={"short": covered_short, "over": {}}, **base
         )
     }
@@ -1161,8 +1289,8 @@ def test_top_issues_dead_weight_ignored_when_only_short_role_is_grant_covered():
     # A short role that ISN'T grant-covered still counts as a real target.
     uncovered_short = {"card_draw": _band(0, 10, 12)}
     kinds2 = {
-        i["kind"]
-        for i in top_issues(
+        i.kind
+        for i in _top_issues_for(
             focus_r=heavy, template_r={"short": uncovered_short, "over": {}}, **base
         )
     }
@@ -1173,35 +1301,165 @@ def test_fill_pass_skips_a_grant_covered_role():
     # A grant-covered role must not get pure fill-adds either (ADR-0040 §1 stops
     # the swap engine end to end) — only the OTHER short role gets filled.
     interaction_spell = {
-        "name": "Swords to Plowshares",
-        "type_line": "Instant",
-        "oracle_text": "Exile target creature.",
-        "cmc": 1.0,
+        **test_card("Swords to Plowshares"),
         "prices": {"usd": "1.00"},
-        "color_identity": ["W"],
         "edhrec_rank": 50,
     }
     budgets = {
         "card_draw": _band(0, 10, 12, grant_covered=True),
         "interaction": _band(0, 10, 12),
     }
-    out = propose_swaps(
+    out = _swaps_for_issue_dicts(
         [_cc("Filler", "filler", cmc=3.0)],
         [],
-        budgets=budgets,
-        focus_result=_focus(),
-        deck_signals=[],
-        search_fn=lambda **_: [interaction_spell],
-        identity="W",
-        fmt="commander",
-        paper_only=True,
-        owned={},
-        budget=100.0,
-        max_swaps=50,
-        top_heavy=False,
-        fill_slots=10,
+        SwapContext(
+            budgets=budgets,
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [interaction_spell],
+            identity="W",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=100.0,
+            max_swaps=50,
+            top_heavy=False,
+            fill_slots=10,
+        ),
     )
     fills = [s for s in out["swaps"] if s["cut"] is None]
     assert fills  # interaction still gets filled
     assert all(s["add"]["name"] != "Faithless Looting" for s in fills)
     assert all("card draw" not in s["reason"].lower() for s in fills)
+
+
+# ── ADR-0030: the proposer respects the target bracket's Game Changer ceiling ───
+
+
+def _gc_scenario(room, *, cut_is_game_changer=False):
+    """A protection-short deck whose best add is a Game Changer, with a plain
+    alternative behind it; ``room`` is the bracket's remaining Game Changer headroom."""
+    filler = _cc("Dead Card", "filler", cmc=5.0)
+    filler.record["game_changer"] = cut_is_game_changer
+    staple = {
+        "name": "Staple Game Changer",
+        "type_line": "Instant",
+        "oracle_text": "",
+        "cmc": 1.0,
+        "edhrec_rank": 5,
+        "game_changer": True,
+        "prices": {"usd": "1.00"},
+        "color_identity": [],
+    }
+    plain = {**staple, "name": "Plain Protection", "cmc": 2.0, "game_changer": False}
+    issue = {"kind": "protection_short", "severity": 3, "message": "protection"}
+    out = _swaps_for_issue_dicts(
+        [filler],
+        [issue],
+        SwapContext(
+            budgets={},
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [staple, plain],
+            identity="",
+            fmt="commander",
+            paper_only=True,
+            owned={},
+            budget=50.0,
+            max_swaps=1,
+            top_heavy=False,
+            game_changer_room=room,
+        ),
+    )
+    return [s["add"]["name"] for s in out["swaps"]]
+
+
+def test_no_target_bracket_means_no_game_changer_ceiling():
+    assert _gc_scenario(None) == ["Staple Game Changer"]
+
+
+def test_a_game_changer_is_never_proposed_past_the_bracket_ceiling():
+    # ADR-0030: "The swap proposer respects the ceiling (won't propose a Game-Changer
+    # add that breaches the target)" — the next-best legal add ships instead.
+    assert _gc_scenario(0) == ["Plain Protection"]
+    assert _gc_scenario(1) == ["Staple Game Changer"]
+
+
+def test_a_deck_over_the_ceiling_cannot_cut_its_way_into_a_new_game_changer():
+    # Two over the ceiling (room -2): cutting ONE Game Changer leaves the deck still one
+    # over, so the freed slot must not buy a Game Changer add. A clamped room (0) once
+    # read that cut as +1 headroom and proposed one.
+    assert _gc_scenario(-2, cut_is_game_changer=True) == ["Plain Protection"]
+    # One under after the cut (room 0 → 1)… but the add is picked BEFORE the cut is
+    # secured, so a swap never spends room its own cut would free.
+    assert _gc_scenario(0, cut_is_game_changer=True) == ["Plain Protection"]
+
+
+# ── Ownership: each added copy is free only when Format.copies_short covers it ───
+
+
+def _fill(owned, *, wildcard_budget=None, budget=None, slots=4):
+    """Pure fill adds of one candidate — Swords to Plowshares, a four-of here — into
+    ``slots`` open slots of a constructed build short on interaction."""
+    candidate = {
+        **test_card("Swords to Plowshares"),
+        "rarity": "uncommon",
+        "prices": {"usd": "1.00"},
+        "edhrec_rank": 50,
+    }
+    out = _swaps_for_issue_dicts(
+        [_cc("Filler", "filler", cmc=3.0)],
+        [],
+        SwapContext(
+            budgets={"interaction": _band(0, 10, 12)},
+            focus_result=_focus(),
+            deck_signals=[],
+            search_fn=lambda **_: [candidate],
+            identity="W",
+            fmt="historic",
+            paper_only=wildcard_budget is None,
+            owned=owned,
+            budget=budget,
+            max_swaps=50,
+            top_heavy=False,
+            fill_slots=slots,
+            wildcard_budget=wildcard_budget,
+            medium="paper" if wildcard_budget is None else "digital",
+            max_copies=4,
+        ),
+    )
+    return [s for s in out["swaps"] if s["cut"] is None]
+
+
+_NO_WILDCARDS = {"mythic": 0, "rare": 0, "uncommon": 0, "common": 0}
+
+
+def test_owned_covers_only_the_copies_you_own():
+    # One owned copy pays for the first add only; the second copy is a wildcard (none
+    # left) or a purchase (owned-only pass), so the fill stops at one.
+    assert len(_fill({"Swords to Plowshares": 1}, wildcard_budget=_NO_WILDCARDS)) == 1
+    assert len(_fill({"Swords to Plowshares": 2})) == 2
+
+
+def test_an_arena_playset_covers_every_copy():
+    fills = _fill({"Swords to Plowshares": 4}, wildcard_budget=_NO_WILDCARDS)
+    assert len(fills) == 4
+
+
+def test_a_crafted_copy_never_reads_as_owned():
+    # Two owned, two crafted: the swap's ``owned`` follows the same coverage the purse
+    # charged, so the third and fourth copies say "not owned" (they cost a wildcard).
+    fills = _fill(
+        {"Swords to Plowshares": 2},
+        wildcard_budget={**_NO_WILDCARDS, "uncommon": 2},
+    )
+    assert [
+        (f["add"]["copy"], f["add"]["owned"], f["add"]["covered_by"]) for f in fills
+    ] == [
+        (1, True, "owned"),
+        (2, True, "owned"),
+        (3, False, None),
+        (4, False, None),
+    ]
+    # Each add serves its shortfall (the copy it costs), which the UI sums.
+    assert [f["add"]["copies_short"] for f in fills] == [0, 0, 1, 1]

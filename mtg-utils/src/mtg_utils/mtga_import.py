@@ -69,12 +69,10 @@ Arena-id resolution notes:
   cleanest way to handle the newest Alchemy / Universes Beyond sets
   where Scryfall's ``arena_id`` field is still null because the
   upstream ingestion hasn't caught up yet.
-- Arena grants unlimited copies of the six "free" basic land types
-  (``Island``, ``Mountain``, ``Plains``, ``Forest``, ``Swamp``, ``Wastes``),
-  so the importer unconditionally injects them at quantity 99 regardless
-  of what the collection source reported. Snow-covered basics are
-  collected normally and are not injected — if the user owns them, they
-  come through via arena-id resolution.
+- Arena grants unlimited copies of the six basic land types; the importer
+  records nothing for them, because the ownership rule (``Format.coverage``,
+  ADR-0058) already counts them as owned. Snow-Covered basics are collected
+  normally and come through via arena-id resolution.
 """
 
 from __future__ import annotations
@@ -87,13 +85,17 @@ import re
 import shutil
 import sys
 import tempfile
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
 
 from mtg_utils._sidecar import atomic_write_json
-from mtg_utils.bulk_loader import load_bulk_cards
+from mtg_utils.arena_card_db import player_log_path
+from mtg_utils.card_pool import CardPool
+from mtg_utils.formats import ARENA_PLAYSET, FORMATS
 
 # The exact anchor string that marks a login-time API response in the
 # Arena log. The StartHook response carries ``InventoryInfo`` (wildcards
@@ -107,32 +109,10 @@ _UNITY_LOG_PREFIX = re.compile(
     r"\[UnityCrossThreadLogger\]\s*(\d+/\d+/\d+\s+\d+:\d+:\d+\s+[AP]M)",
 )
 
-# The six basic land types that Arena grants in unlimited quantities.
-# Snow basics are NOT in this list — they are collected normally on
-# Arena and only appear in the output when the log reports them.
-_FREE_BASICS = ("Island", "Mountain", "Plains", "Forest", "Swamp", "Wastes")
-
-# Arena's deckbuilding cap on per-card copies. Any card can be placed
-# in a deck at most 4 times (except for basic lands and the
-# "any number allowed" cards like Hare Apparent, Persistent Petitioners,
-# Shadowborn Apostle, Relentless Rats, Rat Colony, Seven Dwarves).
-# Arena's internal ownership model also caps at 4 per oracle card —
-# once you own 4 physical copies from any combination of printings,
-# additional acquisitions don't give you more usable copies. Used by
-# ``_resolve_collection`` when aggregating per-printing counts up to
-# per-oracle-name totals.
-_ARENA_PLAYSET_CAP = 4
-
-# The in-game deck size for each supported format. Used to stamp a
-# cosmetic ``format`` / ``deck_size`` field on the collection output so
-# it structurally matches what ``parse-deck`` produces — no downstream
-# script reads these fields from the collection side.
-_FORMAT_DECK_SIZES = {
-    "commander": 100,
-    "brawl": 60,
-    "historic_brawl": 100,
-    "competitive_brawl": 100,
-}
+# Per-printing counts aggregate up to per-name totals capped at
+# ``formats.ARENA_PLAYSET``: once you own four copies from any mix of printings,
+# more give you no more usable copies (``Format.coverage`` owns what four means
+# for a deck).
 
 # Freshness thresholds. These are nudges, not gates — the importer
 # still emits its output when a warning fires. The 48h mtime window is
@@ -157,28 +137,12 @@ def _default_log_path() -> Path:
     players who run it under Wine/Proton need to supply ``--log-path``
     explicitly since we can't know where their Wine prefix lives.
     """
-    if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Logs"
-            / "Wizards Of The Coast"
-            / "MTGA"
-            / "Player.log"
-        )
+    path = player_log_path()
+    if path is not None:
+        return path
     if sys.platform == "win32":
-        user_profile = os.environ.get("USERPROFILE")
-        if not user_profile:
-            msg = "Could not determine %USERPROFILE% — pass --log-path explicitly."
-            raise click.UsageError(msg)
-        return (
-            Path(user_profile)
-            / "AppData"
-            / "LocalLow"
-            / "Wizards Of The Coast"
-            / "MTGA"
-            / "Player.log"
-        )
+        msg = "Could not determine %USERPROFILE% — pass --log-path explicitly."
+        raise click.UsageError(msg)
     msg = (
         f"Auto-detecting Player.log is not supported on {sys.platform!r} "
         f"(MTG Arena is Windows/macOS only). If you run MTGA under "
@@ -293,6 +257,29 @@ def _parse_timestamp_prefix(line: str) -> datetime | None:
         return None
 
 
+def _start_hooks(text: str) -> Iterator[tuple[dict, datetime | None]]:
+    """Each parseable ``<== StartHook`` blob in a log buffer, oldest first, with
+    its local timestamp prefix (on the anchor line or the one before it). A
+    broken blob is skipped, never fatal."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _START_HOOK_ANCHOR not in line:
+            i += 1
+            continue
+        ts = _parse_timestamp_prefix(line)
+        if ts is None and i > 0:
+            ts = _parse_timestamp_prefix(lines[i - 1])
+        extracted = _extract_json_blob(lines, i)
+        if extracted is None:
+            i += 1
+            continue
+        parsed, end_idx = extracted
+        yield parsed, ts
+        i = end_idx + 1
+
+
 def _scan_log(
     text: str,
 ) -> tuple[dict | None, dict | None, datetime | None]:
@@ -312,37 +299,69 @@ def _scan_log(
     Returning the raw dict here keeps the scanner agnostic about how
     the collection is derived — useful for future alternative strategies.
     """
-    lines = text.splitlines()
-    latest_decks: dict | None = None
-    latest_inventory: dict | None = None
-    latest_timestamp: datetime | None = None
+    scan = _scan_text(text)
+    return scan.decks, scan.inventory, scan.decks_time
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if _START_HOOK_ANCHOR not in line:
-            i += 1
-            continue
-        # Timestamp prefix may be on this line or the preceding line.
-        ts = _parse_timestamp_prefix(line)
-        if ts is None and i > 0:
-            ts = _parse_timestamp_prefix(lines[i - 1])
-        extracted = _extract_json_blob(lines, i)
-        if extracted is None:
-            # Move past this anchor and keep scanning.
-            i += 1
-            continue
-        parsed, end_idx = extracted
+
+@dataclass
+class _LogScan:
+    """The latest ``Decks`` and ``InventoryInfo`` blobs a scan found, each with its
+    StartHook's local time and (across log files) the file it came from."""
+
+    decks: dict | None = None
+    decks_time: datetime | None = None
+    decks_source: Path | None = None
+    inventory: dict | None = None
+    inventory_time: datetime | None = None
+    inventory_source: Path | None = None
+
+
+def _scan_text(text: str) -> _LogScan:
+    """One log buffer's latest ``Decks`` and ``InventoryInfo``, latest-wins for
+    each independently (see :func:`_scan_log`)."""
+    scan = _LogScan()
+    for parsed, ts in _start_hooks(text):
         decks = parsed.get("Decks")
         if isinstance(decks, dict) and decks:
-            latest_decks = decks
-            latest_timestamp = ts
+            scan.decks, scan.decks_time = decks, ts
         inventory = parsed.get("InventoryInfo")
         if isinstance(inventory, dict):
-            latest_inventory = inventory
-        i = end_idx + 1
+            scan.inventory, scan.inventory_time = inventory, ts
+    return scan
 
-    return latest_decks, latest_inventory, latest_timestamp
+
+def _log_candidates(log_path: Path) -> tuple[Path, Path]:
+    """The logs to read, in order: ``Player.log``, then the ``Player-prev.log``
+    Arena rotates the last session into (the fallback when the current log has no
+    login yet)."""
+    return (log_path, log_path.with_name("Player-prev.log"))
+
+
+def _scan_logs(log_path: Path, *, strict: bool = False) -> _LogScan:
+    """Each field from the first of :func:`_log_candidates` that holds it, with
+    the file it came from. An unreadable or missing fallback log is skipped; so
+    is an unreadable ``log_path`` unless ``strict``, which re-raises its
+    ``OSError`` for the caller to word."""
+    scan = _LogScan()
+    for i, candidate in enumerate(_log_candidates(log_path)):
+        if scan.decks is not None and scan.inventory is not None:
+            break
+        if i and not candidate.is_file():
+            continue
+        try:
+            text = _read_log_text(candidate)
+        except OSError:
+            if strict and not i:
+                raise
+            continue
+        found = _scan_text(text)
+        if scan.decks is None and found.decks is not None:
+            scan.decks, scan.decks_time = found.decks, found.decks_time
+            scan.decks_source = candidate
+        if scan.inventory is None and found.inventory is not None:
+            scan.inventory, scan.inventory_time = found.inventory, found.inventory_time
+            scan.inventory_source = candidate
+    return scan
 
 
 def _is_int_like(value: object) -> bool:
@@ -430,7 +449,13 @@ def _collection_from_decks(decks: dict | None) -> dict[str, int]:
 
 
 def _build_arena_id_index(bulk_path: Path) -> dict[int, list[dict]]:
-    """Return ``{arena_id: [{name, set, collector_number}, ...]}`` from bulk data.
+    """:func:`arena_id_index` over the card pool at *bulk_path* (ADR-0046)."""
+    return arena_id_index(CardPool.load(bulk_path))
+
+
+def arena_id_index(pool: CardPool) -> dict[int, list[dict]]:
+    """Return ``{arena_id: [{name, set, collector_number}, ...]}`` from the pool's
+    ``by_arena_id`` index.
 
     An Arena id can map to multiple card names when an Alchemy rebalance
     shares its id with the paper version (``A-Teferi, Time Raveler`` /
@@ -438,36 +463,35 @@ def _build_arena_id_index(bulk_path: Path) -> dict[int, list[dict]]:
     importer can emit all variants — in Historic Brawl, both forms are
     legal unless explicitly banned, and the user can choose either.
 
-    Each entry also carries the bulk printing's ``set`` (lowercase) and
+    Each entry also carries the printing's ``set`` (lowercase) and
     ``collector_number`` (string) — ``None`` when the record lacks them —
     so ``_resolve_collection`` can retain per-printing quantities instead
     of collapsing them into the name-level total. Names are deduplicated
-    (two Scryfall printings of the same card can share an id) while
-    preserving first-seen order.
+    (two printings of the same card can share an id) while preserving
+    first-seen order.
     """
-    cards = load_bulk_cards(bulk_path)
     index: dict[int, list[dict]] = {}
-    for card in cards:
-        arena_id = card.get("arena_id")
-        if not isinstance(arena_id, int):
-            continue
-        name = card.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        bucket = index.setdefault(arena_id, [])
-        if any(entry["name"] == name for entry in bucket):
-            continue
-        set_code = card.get("set")
-        collector = card.get("collector_number")
-        bucket.append(
-            {
-                "name": name,
-                "set": set_code.lower() if isinstance(set_code, str) else None,
-                "collector_number": (
-                    str(collector) if collector not in (None, "") else None
-                ),
-            },
-        )
+    for arena_id, cards in pool.by_arena_id.items():
+        bucket: list[dict] = []
+        for card in cards:
+            name = card.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if any(entry["name"] == name for entry in bucket):
+                continue
+            set_code = card.get("set")
+            collector = card.get("collector_number")
+            bucket.append(
+                {
+                    "name": name,
+                    "set": set_code.lower() if isinstance(set_code, str) else None,
+                    "collector_number": (
+                        str(collector) if collector not in (None, "") else None
+                    ),
+                },
+            )
+        if bucket:
+            index[arena_id] = bucket
     return index
 
 
@@ -587,7 +611,7 @@ def _resolve_collection(
 
     1. Sum quantities across every arena_id that resolves to the
        same oracle name.
-    2. Cap the total at ``_ARENA_PLAYSET_CAP`` (4). Acquiring
+    2. Cap the total at ``ARENA_PLAYSET`` (4). Acquiring
        beyond 4 total is possible in Arena (pack rewards can push
        you past the cap) but not useful for deckbuilding.
 
@@ -619,7 +643,7 @@ def _resolve_collection(
                 set_code = entry.get("set")
                 collector = entry.get("collector_number")
             prior = totals.get(name, 0)
-            totals[name] = min(prior + count, _ARENA_PLAYSET_CAP)
+            totals[name] = min(prior + count, ARENA_PLAYSET)
             if set_code and collector:
                 bucket = printings.setdefault(name, {})
                 key = (set_code, collector)
@@ -640,28 +664,6 @@ def _resolve_collection(
             ]
         cards.append(card)
     return cards, unresolved
-
-
-def _inject_free_basics(cards: list[dict]) -> list[dict]:
-    """Ensure every free basic land appears with quantity ≥ 99.
-
-    Arena grants unlimited basics, so the user effectively owns them
-    regardless of what the collection source reported (the Decks
-    reconstruction omits basics the user has never put in a deck,
-    and the Untapped CSV reports true owned quantities rather than
-    Arena's unlimited grant). Injecting quantity 99 lets
-    ``price-check``'s Arena 4-cap substitution treat basics as
-    infinite supply. Snow basics are NOT injected — the user has
-    to actually own those.
-    """
-    by_name = {entry["name"]: entry for entry in cards}
-    for basic in _FREE_BASICS:
-        existing = by_name.get(basic)
-        if existing is None:
-            by_name[basic] = {"name": basic, "quantity": 99}
-        else:
-            existing["quantity"] = max(int(existing["quantity"]), 99)
-    return sorted(by_name.values(), key=lambda entry: entry["name"].lower())
 
 
 def _extract_wildcards(inventory: dict) -> dict[str, int]:
@@ -687,12 +689,37 @@ def _extract_wildcards(inventory: dict) -> dict[str, int]:
     }
 
 
+def read_arena_wildcards(log_path: Path | None = None) -> dict | None:
+    """The player's wildcard counts from Arena's log (``log_path``, else the
+    platform's ``Player.log``; :func:`_log_candidates` order, the fallback
+    ``mtga-import`` itself reads): ``{"wildcards": {mythic, rare, uncommon,
+    common}, "captured_local": <that login's local time or None>}``, or ``None``
+    when no log is found or readable or none holds ``InventoryInfo``. Never
+    raises — deck-forge's wildcard-budget seed treats the counts as optional.
+    Local file reads only."""
+    path = log_path if log_path is not None else player_log_path()
+    if path is None:
+        return None
+    try:
+        scan = _scan_logs(path)
+        if scan.inventory is None:
+            return None
+        wildcards = _extract_wildcards(scan.inventory)
+    except (OSError, TypeError, ValueError):
+        return None
+    captured = scan.inventory_time
+    return {
+        "wildcards": wildcards,
+        "captured_local": captured.isoformat() if captured else None,
+    }
+
+
 def _check_bulk_freshness(bulk_path: Path) -> str | None:
     """Return a WARN message if bulk data is older than ``_BULK_STALE_HOURS``.
 
     Returns ``None`` when the bulk data is fresh enough. Missing/unreadable
-    files are handled by the caller — ``load_bulk_cards`` will raise its
-    own clear error in that case.
+    files are handled by the caller — ``CardPool.load`` raises its own clear
+    error in that case.
     """
     try:
         mtime = bulk_path.stat().st_mtime
@@ -750,7 +777,7 @@ def _build_collection_json(
     total_cards = sum(int(entry["quantity"]) for entry in cards)
     return {
         "format": format,
-        "deck_size": _FORMAT_DECK_SIZES.get(format, 100),
+        "deck_size": FORMATS[format].deck_size,
         "commanders": [],
         "cards": cards,
         "total_cards": total_cards,
@@ -856,8 +883,8 @@ def _chown_outputs_to_sudo_user(*paths: Path | None) -> None:
     "bulk_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
-    help="Path to Scryfall default-cards.json (required — used to "
-    "resolve Arena card IDs to card names).",
+    help="Card-data bulk: MTGJSON AllPrintings.json from download-mtgjson "
+    "(required — used to resolve Arena card IDs to card names).",
 )
 @click.option(
     "--log-path",
@@ -878,7 +905,10 @@ def _chown_outputs_to_sudo_user(*paths: Path | None) -> None:
 @click.option(
     "--format",
     "format_",
-    type=click.Choice(sorted(_FORMAT_DECK_SIZES), case_sensitive=False),
+    # An Arena collection: only the formats Arena hosts can stamp it.
+    type=click.Choice(
+        sorted(n for n, f in FORMATS.items() if f.is_arena), case_sensitive=False
+    ),
     default="historic_brawl",
     help="Cosmetic format stamp for the collection JSON. Downstream "
     "scripts read their own --format flag; this field is purely "
@@ -1017,47 +1047,25 @@ def main(
 
     if log_path is not None:
         try:
-            log_text = _read_log_text(log_path)
+            scan = _scan_logs(log_path, strict=log_required)
         except FileNotFoundError as exc:
-            if log_required:
-                msg = f"Could not read Player.log at {log_path}: {exc}"
-                raise click.UsageError(msg) from exc
-            log_text = None
+            msg = f"Could not read Player.log at {log_path}: {exc}"
+            raise click.UsageError(msg) from exc
         except PermissionError as exc:
-            if log_required:
-                msg = (
-                    f"Could not read Player.log at {log_path}: {exc}. "
-                    f"If MTG Arena is running on an older Windows client, "
-                    f"quit Arena and re-run."
-                )
-                raise click.UsageError(msg) from exc
-            log_text = None
-
-        if log_text is not None:
-            decks, inventory, snapshot_time = _scan_log(log_text)
-
-        # Player-prev.log fallback — only scan if we're missing something.
-        if log_path is not None and (decks is None or inventory is None):
-            prev_path = log_path.with_name("Player-prev.log")
-            if prev_path.exists():
-                try:
-                    prev_text = _read_log_text(prev_path)
-                except (PermissionError, FileNotFoundError):
-                    prev_text = None
-                if prev_text is not None:
-                    prev_decks, prev_inventory, prev_time = _scan_log(prev_text)
-                    if decks is None and prev_decks is not None:
-                        decks = prev_decks
-                        snapshot_time = prev_time
-                        collection_log_source = prev_path
-                    if inventory is None and prev_inventory is not None:
-                        inventory = prev_inventory
-                        inventory_source = prev_path
+            msg = (
+                f"Could not read Player.log at {log_path}: {exc}. "
+                f"If MTG Arena is running on an older Windows client, "
+                f"quit Arena and re-run."
+            )
+            raise click.UsageError(msg) from exc
+        decks, inventory, snapshot_time = scan.decks, scan.inventory, scan.decks_time
+        collection_log_source = scan.decks_source or log_path
+        inventory_source = scan.inventory_source or log_path
 
     if log_required and decks is None and inventory is None:
         prev_suffix = (
             " or Player-prev.log"
-            if log_path is not None and log_path.with_name("Player-prev.log").exists()
+            if log_path is not None and _log_candidates(log_path)[1].exists()
             else ""
         )
         log_name = log_path.name if log_path is not None else "Player.log"
@@ -1122,9 +1130,10 @@ def main(
         resolved_cards = []
         unresolved_ids = []
 
-    # Inject free basics.
-    cards_with_basics = _inject_free_basics(resolved_cards)
-    collection_json = _build_collection_json(cards_with_basics, format=format_)
+    # Basic lands are not injected: the ownership rule (``Format.coverage``) already
+    # treats Arena's free basics as owned, so collection.json lists only what the
+    # log or CSV reported.
+    collection_json = _build_collection_json(resolved_cards, format=format_)
 
     # Wildcards output (only when InventoryInfo was found).
     wildcards_path = output_dir / "wildcards.json"

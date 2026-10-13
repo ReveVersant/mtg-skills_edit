@@ -99,7 +99,7 @@ Unimplemented recovery becomes a substrate-wide overlay stage that
   one two-face `split` gap ("Fast // Furious"'s "Furious" face); adventure,
   transform, modal_dfc, flip, and prepare are fully covered by phase. The bulk
   (MTGJSON) record is the text source of record for a phase-missing face:
-  `_ir_lookup.trees_for` synthesizes one additional **zero-unit ConceptTree**
+  `_card_ir.trees.trees_for` synthesizes one additional **zero-unit ConceptTree**
   per phase-missing face when its production caller threads the bulk record
   in (`units=()`, `oracle` set to the bulk face's text verbatim,
   `card_types`/`card_subtypes`/`card_supertypes`/`cmc`/`power` parsed from the
@@ -160,4 +160,51 @@ grammar rules and deleted.
   and their `synth_*` lane reads deleted, key promotions and pinned tests
   intact, before the per-key grind resumes on the new mechanism.
 
-*Amended 2026-07-10 (twice); original decision revised in place.*
+**Current state (2026-09-13).** The effect-like marker arms are gone (re-expressed as
+grammar rules, their lane reads deleted — ADR-0037 archived). The sentence above that
+"the `synth_*` marker namespace retires across all three classes" is narrowed: it holds
+for effect clauses (classes 1–3), NOT for the reference arms this ADR itself kept.
+A cares-about reference ("wants cloning", "cares about death") is not an effect, so no
+effect concept exists for it to become; its synthesized `synth_<key>` concept IS its
+vocabulary. Consequently a lane that reads a structural arm OR a reference-arm concept
+(91 of 279 lanes at the 2026-09-12 review) is the stable design, not a pending
+retirement — the review's "tabulate the two-arm lanes" candidate is closed on that
+basis (the 95 reference concepts and their 208 reads stay imperative, per ADR-0014's
+locality argument).
+
+**Amended at the phase v0.104.0 bump (2026-10-09).** Phase began failing closed:
+it parks a whole effect it can't fully parse as an `Unimplemented` residue. 15
+verb tokens joined the allowlist (reanimate, place_counter, destroy, exile,
+gain_control, tap, untap, scry, spell_copy, counter_move, cast_from_zone, clone,
+sacrifice, mill, lose_game). A recovered node carries no typed target, so the seam
+now also reads the clause once (`recovery.read_clause`) and decorates the node:
+`scope` (the side the clause names), `subject` (type words plus the
+`CLAUSE_MARKS` — self, yours/theirs, player recipient, any target, mass, card,
+power-scaled, many, another chooser …; some only count when they attach to the
+token's own verb, `TokenRule.object_verb`; `OtherPlayer`, in each row's own words,
+`TokenRule.other_player`) and `zones`. Lanes test those fields; no lane reads a
+recovered clause's text. Rows opt in (`TokenRule.reads_clause`); a row whose
+`subject` or scope keeps its own meaning writes the reading to the node's `clause`
+field instead (`TokenRule.into_clause`: `make_token`, whose `subject` is the
+token's own types — its reading names them, `TokenRule.type_noun` — and `discard` /
+`lose_life`, whose overlay scope stays); a lane reads either through
+`ConceptNode.reading`. The seam also refuses a replacement clause
+("would … instead") unless the row says the replacement's effect is the verb's
+(`in_replacements`: discard, roll_die, coin_flip). `bump-phase-pin` reports each
+token's and mark's corpus fire count and flags 0 as retire-ready.
+
+Later the same day, the pre-v0.104.0 rows' lane-side clause reads (draw
+direction, discard direction, damage reach, make_token's resource kinds) moved
+onto those marks with no population change, and recovery reached two places it
+skipped. A compound clause recovers each instruction (`recover_concepts`: "you
+lose 1 life and you draw an additional card" is a lose_life and a draw, both
+decorations of the one residue node; the purity fingerprint counts each node
+once). A granted ability's body is recovered by the stage too and served by the
+shared granted walk (`iter_nested_granted_effect_concepts` reads the stage's memo
+on the body; the substrate never imports the overlay). A later instruction joined by "and" /
+"then" keeps the earlier one's subject (a third-person verb is another player's),
+and its "it" names the card only when nothing earlier could be "it". Nine
+second-verb and granted-body ledger rows retired. A key carried by a later verb
+the grammar doesn't tag ("It gains haste") stays a ledger row (ADR-0048).
+
+*Amended 2026-07-10 (twice), 2026-09-13 and 2026-10-09 (twice); original decision revised in place.*

@@ -31,14 +31,19 @@ export const api = {
     post("/api/deck/add", { name, zone, qty }),
   remove: (name, zone = "cards", qty = 1) =>
     post("/api/deck/remove", { name, zone, qty }),
+  // Move copies between zones in one step (main deck ⇄ sideboard, promote to
+  // commander, reveal as companion); every rule runs before the session changes.
+  move: (name, from_zone, to_zone, qty = 1) =>
+    post("/api/deck/move", { name, from_zone, to_zone, qty }),
   balanceLands: () => post("/api/deck/balance-lands", {}),
-  // Trim excess basics back down to the recommended land count (FLOOD remedy).
+  // Trim excess basics back down to the land band's top (FLOOD remedy).
   // Backend endpoint ships in the deck-forge land-model pass; the button is wired now.
   trimLands: () => post("/api/deck/trim-lands", {}),
   setFormat: (format) => post("/api/deck/format", { format }),
   // Paper vs digital (Brawl / Historic Brawl) — drives the collection slot + cost mode.
   setMedium: (medium) => post("/api/deck/medium", { medium }),
-  // 60 or 100 cards (paper Historic Brawl only).
+  // A Commander-family choice (60 or 100 for paper Historic Brawl) or a constructed
+  // target over the format's floor (an 80-card Yorion deck).
   setDeckSize: (deck_size) => post("/api/deck/deck-size", { deck_size }),
   presets: () => get("/api/presets"),
   combos: () => get("/api/combos"),
@@ -59,8 +64,15 @@ export const api = {
   buildsNew: (format = "commander", name = "Untitled") =>
     post("/api/builds/new", { format, name }),
   // Import an existing list (paste or uploaded file text) as a NEW build (ADR-0017).
-  importDeck: (text, format = "commander", name = null) =>
-    post("/api/builds/import", { text, format, name }),
+  // pool_only (sealed / draft): the whole list is the opened pool, no deck yet.
+  importDeck: (text, format = "commander", name = null, pool_only = false) =>
+    post("/api/builds/import", { text, format, name, pool_only }),
+  // What a set holds (removal by rarity, sweepers, evasion, the biggest bodies).
+  setScan: (code) => get(`/api/set-scan?code=${encodeURIComponent(code)}`),
+  // Seed a first 40 from a sealed / draft pool in the chosen colours; undo puts
+  // back the deck the last seed replaced (one level).
+  seedBuild: (colors) => post("/api/deck/seed", { colors }),
+  undoSeed: () => post("/api/deck/seed/undo", {}),
   // Import a collection into a slot (paper | arena) — derived ownership (ADR-0018).
   importCollection: (text, slot) =>
     post("/api/collection/import", { text, slot }),
@@ -76,6 +88,31 @@ export const api = {
   // The deterministic Tune surface (ADR-0023): diagnose + budgeted swap proposals.
   // Pure deterministic core — works with no session attached.
   tune: (body) => post("/api/tune", body),
+  // The Meta panel (ADR-0059): the arena-meta cache for this build's Arena queue.
+  // GET reads only the cache; refresh fetches from Untapped (seconds — a 409 names
+  // what to do, `sign_in` when the saved session is missing or expired); login
+  // opens the visible sign-in browser on the hub's machine.
+  // `wildcards` is the cleaned wildcardBudget (whole numbers ≥ 0).
+  meta: ({ archetype = "", ranks = "platinum+", wildcards = null } = {}) => {
+    const q = new URLSearchParams({ ranks });
+    if (archetype) q.set("archetype", archetype);
+    if (wildcards)
+      q.set(
+        "wildcards",
+        Object.entries(wildcards)
+          .map(([k, n]) => `${k}=${n}`)
+          .join(","),
+      );
+    return get(`/api/meta?${q}`);
+  },
+  // force=false: fetch only when the cache is stale (the panel's on-open check).
+  metaRefresh: ({ force = true } = {}) =>
+    post("/api/meta/refresh", { previous: false, force }),
+  metaLogin: () => post("/api/meta/login", {}),
+  // The player's Arena wildcard counts from the hub machine's Player.log
+  // ({ wildcards: {mythic, rare, uncommon, common} | null, source, captured_local })
+  // — the wildcard budget's once-per-session seed.
+  arenaWildcards: () => get("/api/arena-wildcards"),
 
   // Raise a reasoning request and long-poll for the session-agent's answer.
   // Resolves to {result} | {offline: true} | {slow: true} | {error}.

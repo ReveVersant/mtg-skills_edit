@@ -8,20 +8,19 @@ adoption is worth making.
 **Decision.**
 
 - **Transport.** deck-wizard consumes the tuner through a new thin `deck-tune` CLI
-  adapter (`deck-tune <deck.json> <hydrated.json> [--budget --max-swaps --shape
+  adapter (`deck-tune <deck.json> [--bulk-data] [--budget --max-swaps --shape
   --bracket]` → scorecard + swaps JSON) — the CLI analogue of deck-forge's
   `POST /api/tune` Transport adapter (ADR-0013). It injects `card_search` as
-  `search_fn` and `combo-search` as `combos_fn`. **Commander / Brawl / Historic Brawl
-  only** — it hard-refuses 60-card constructed, because the tuner is commander-shaped
-  (the Command Zone template at `budgets.COMMANDER_TEMPLATE`, the Burgess land target,
-  and `commander_fit` have no constructed meaning; a 60-card Burn deck would get a
-  misleading scorecard).
+  `search_fn` and `combo-search` as `combos_fn`. Every format family (ADR-0054):
+  the template and every floor are the deck's family's, and the Commander-only
+  axes (commander fit, the bracket gate) are omitted from a 60-card or limited
+  scorecard rather than reported empty.
 
 - **The tuner becomes IR-backed.** `tune()` resolved its deck signals through the regex
   path (`rank_deck_signals(...)` with no `ir_for` at `tune.py`) — the one signal-
   extraction hole left after ADR-0027. Resolve `ir_for` **internally** at that call (no
   signature change; the candidate-scoring paths — `score_candidate`, `rank_candidates`,
-  `role_of` — already self-resolve via `_deck_forge._ir_lookup.ir_for`). Provisioning
+  `role_of` — already self-resolve via `_card_ir.compat_lookup.ir_for`). Provisioning
   the Card IR sidecar is **load-bearing**: with no sidecar, *every* signal path — not
   just the patched one — returns `None` and degrades to regex, so the `deck-tune`
   adapter must `ensure_card_ir()` (best-effort, warn-and-fall-back) before running.
@@ -60,8 +59,8 @@ adoption is worth making.
   cube-wizard all declare it).
 - **Role bands stay Shape-scaled.** This adds no bracket-scaled role density — ADR-0024
   stands; the bracket axis is ADR-0030.
-- **60-card constructed stays agent-driven.** Extending the tuner to a constructed
-  template is a future effort, not this one.
+- **Every family is the tuner's.** The constructed and limited templates live in
+  `_analysis/budgets.py` beside the Command Zone one (ADR-0054, ADR-0055).
 
 **Why this is the right call.** ADR-0023's whole rationale — deck-wizard's tuner is slow
 and expensive because mechanical work is routed through an LLM; fix it once and share it
@@ -72,7 +71,7 @@ free, and there is no second tuning system.
 
 **Consequences.** ADR-0023's deferred caveat — graduating the signal engine out of
 `_deck_forge` to a neutral home — now triggers, since `_tuner` (which deck-wizard now
-reaches) imports `_deck_forge.signals`. Tracked as a follow-up, not done here.
+reaches) imports `_deck_forge.signals`. Tracked as a follow-up — done by ADR-0050 (`_analysis.signals`).
 
 **What this stops re-suggesting.** Don't re-add agent-driven mechanical role-counting /
 drafting to deck-wizard Step 6 — the tuner owns it. Don't describe the spine as leaving

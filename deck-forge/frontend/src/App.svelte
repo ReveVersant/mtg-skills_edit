@@ -1,13 +1,20 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api, connectEvents } from "./lib/api.js";
-  import { applySnapshot, connected, agentAttached } from "./lib/store.js";
+  import {
+    applySnapshot,
+    connected,
+    agentAttached,
+    isDigital,
+    seedWildcardBudget,
+  } from "./lib/store.js";
   import Header from "./components/Header.svelte";
   import LeftTabs from "./components/LeftTabs.svelte";
   import Avenues from "./components/Avenues.svelte";
   import DeckList from "./components/DeckList.svelte";
   import ForgeFriend from "./components/ForgeFriend.svelte";
   import StatusBar from "./components/StatusBar.svelte";
+  import BusyBar from "./components/BusyBar.svelte";
   import CardPreview from "./components/CardPreview.svelte";
   import ManaGateModal from "./components/ManaGateModal.svelte";
   import ImportDialog from "./components/ImportDialog.svelte";
@@ -30,6 +37,10 @@
     // eslint-disable-next-line no-useless-assignment
     prevAttached = a;
   }
+
+  // The first digital build of the session seeds the wildcard budget from the
+  // player's own Arena wildcards (a no-op after the first ask).
+  $: if ($isDigital) seedWildcardBudget(api.arenaWildcards);
 
   async function refreshAgent() {
     const r = await api.agentStatus();
@@ -59,6 +70,7 @@
 
 <div class="shell">
   <Header />
+  <BusyBar />
 
   <main class="bench" class:rail-collapsed={railCollapsed}>
     <section class="col find-col"><LeftTabs /></section>

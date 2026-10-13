@@ -4,8 +4,8 @@ Codegen'd from ``tests/fixtures/phase_mirror_schema.json`` by
 ``mtg_utils._card_ir.mirror.codegen`` (run via ``build-card-ir-substrate``).
 
 Part of the generated typed-mirror package (see this directory's
-``__init__.py``). This module holds content keys ``<root>`` ..
-``MoreThanMeetsTheEye`` (73 keys).
+``__init__.py``). This module holds content keys ``<root>`` .. ``Mobilize`` (73
+keys).
 
 Class naming: ``S_<ckey>`` for a struct shape, ``T_<ckey>__<tag>`` for a tagged
 shape, ``U_<ckey>`` for the union of all tagged shapes at one content_key.
@@ -23,7 +23,7 @@ from mtg_utils._card_ir.mirror.runtime import (
 )
 
 if TYPE_CHECKING:
-    from mtg_utils._card_ir.mirror.generated.g02_morph import (
+    from mtg_utils._card_ir.mirror.generated.g02_modifyactivationlimi import (
         S_abilities,
         U_additional_cost,
     )
@@ -34,20 +34,19 @@ if TYPE_CHECKING:
         U_amount,
         U_casting_restrictions,
     )
-    from mtg_utils._card_ir.mirror.generated.g04_chooser import (
+    from mtg_utils._card_ir.mirror.generated.g04_characteristics import (
         S_cleave_variant,
     )
     from mtg_utils._card_ir.mirror.generated.g05_conditional_enter_wi import (
         U_cost,
-        U_costs,
     )
-    from mtg_utils._card_ir.mirror.generated.g06_count import (
+    from mtg_utils._card_ir.mirror.generated.g06_costs import (
+        U_costs,
         U_count,
         U_data,
         U_deck_copy_limit,
-        U_dynamic_count,
     )
-    from mtg_utils._card_ir.mirror.generated.g07_effect import (
+    from mtg_utils._card_ir.mirror.generated.g07_dynamic_count import (
         U_effect,
     )
     from mtg_utils._card_ir.mirror.generated.g08_else_ability import (
@@ -55,39 +54,40 @@ if TYPE_CHECKING:
         U_filter,
         U_filters,
     )
-    from mtg_utils._card_ir.mirror.generated.g09_land_filter import (
+    from mtg_utils._card_ir.mirror.generated.g09_journal import (
         S_legalities,
         S_metadata,
         S_modal,
+        U_keyword,
         U_mana_cost,
         U_mana_reduction,
         U_materials,
         U_once_per_turn,
     )
-    from mtg_utils._card_ir.mirror.generated.g10_owner import (
+    from mtg_utils._card_ir.mirror.generated.g10_optional_player import (
         U_parse_warnings,
         U_power,
     )
-    from mtg_utils._card_ir.mirror.generated.g11_properties import (
+    from mtg_utils._card_ir.mirror.generated.g11_prop import (
         U_properties,
     )
     from mtg_utils._card_ir.mirror.generated.g12_qty import (
-        S_reduction,
         U_qty,
     )
-    from mtg_utils._card_ir.mirror.generated.g13_reference import (
+    from mtg_utils._card_ir.mirror.generated.g13_redirect_to import (
+        S_reduction,
         S_replacements,
         S_requirement,
         S_rulings,
-        S_static_abilities,
         U_sacrifice_filter,
         U_solve_condition,
         U_source_filter,
         U_spell_filter,
-        U_strive_cost,
     )
-    from mtg_utils._card_ir.mirror.generated.g14_sub_ability import (
+    from mtg_utils._card_ir.mirror.generated.g14_static_abilities import (
+        S_static_abilities,
         S_triggers,
+        U_strive_cost,
         U_target,
         U_toughness,
     )
@@ -136,6 +136,12 @@ class S_Root(TypedMirrorNode):
     rulings: list[S_rulings] = MISSING
     solve_condition: U_solve_condition = MISSING
     strive_cost: U_strive_cost = MISSING
+
+
+@dataclass(frozen=True)
+class S_ActivateAsInstant(TypedMirrorNode):
+    cost_category: str
+    keyword: U_keyword
 
 
 @dataclass(frozen=True)
@@ -194,6 +200,12 @@ class S_CantCastDuring(TypedMirrorNode):
 
 
 @dataclass(frozen=True)
+class S_CantCauseForcedAction(TypedMirrorNode):
+    actions: list[object]
+    cause: str
+
+
+@dataclass(frozen=True)
 class S_CantPayCost(TypedMirrorNode):
     cost: str | MirrorVariant
     who: str
@@ -242,6 +254,7 @@ class S_DefilerCostReduction(TypedMirrorNode):
     color: str
     life_cost: int
     mana_reduction: U_mana_reduction
+    reach: str
 
 
 @dataclass(frozen=True)
@@ -284,6 +297,7 @@ class S_ExileCastPermission(TypedMirrorNode):
     timing: str
     enters_with_counter: str = MISSING
     extra_cost: S_extra_cost = MISSING
+    grantee: str = MISSING
     grants_flash: bool = MISSING
     mana_spend_permission: str = MISSING
 
@@ -295,6 +309,13 @@ class S_GraveyardCastPermission(TypedMirrorNode):
     enters_with_counter: str = MISSING
     extra_cost: S_extra_cost = MISSING
     graveyard_destination_replacement: str = MISSING
+    pool: str = MISSING
+    required_cast_keyword: str = MISSING
+
+
+@dataclass(frozen=True)
+class S_ImmediatePriorSelectedCardOwner(TypedMirrorNode):
+    pass
 
 
 @dataclass(frozen=True)
@@ -334,20 +355,6 @@ class S_MaxUntapPerType(TypedMirrorNode):
     max: int
 
 
-@dataclass(frozen=True)
-class S_ModifyActivationLimit(TypedMirrorNode):
-    keyword: str
-    new_limit: int
-
-
-@dataclass(frozen=True)
-class S_ModifyCost(TypedMirrorNode):
-    amount: U_amount
-    mode: str
-    spell_filter: U_spell_filter | None
-    dynamic_count: U_dynamic_count = MISSING
-
-
 # --- tagged shapes (discriminated enum nodes) ---
 
 
@@ -374,15 +381,15 @@ class T_Bestow__NonMana(TypedMirrorNode):
 
 
 @dataclass(frozen=True)
-class T_Blitz__Cost(TypedMirrorNode):
-    _tag: ClassVar[str | None] = "Cost"
-    generic: int
-    shards: list[object]
+class T_Blitz__Mana(TypedMirrorNode):
+    _tag: ClassVar[str | None] = "Mana"
+    data: U_data
 
 
 @dataclass(frozen=True)
-class T_Blitz__SelfManaCost(TypedMirrorNode):
-    _tag: ClassVar[str | None] = "SelfManaCost"
+class T_Blitz__NonMana(TypedMirrorNode):
+    _tag: ClassVar[str | None] = "NonMana"
+    data: U_data
 
 
 @dataclass(frozen=True)
@@ -891,18 +898,11 @@ class T_Mobilize__Ref(TypedMirrorNode):
     qty: U_qty
 
 
-@dataclass(frozen=True)
-class T_MoreThanMeetsTheEye__Cost(TypedMirrorNode):
-    _tag: ClassVar[str | None] = "Cost"
-    generic: int
-    shards: list[object]
-
-
 # --- discriminated-union aliases (one per tagged content_key) ---
 
 type U_ActivateTagged = T_ActivateTagged__Equip | T_ActivateTagged__PowerUp
 type U_Bestow = T_Bestow__Mana | T_Bestow__NonMana
-type U_Blitz = T_Blitz__Cost | T_Blitz__SelfManaCost
+type U_Blitz = T_Blitz__Mana | T_Blitz__NonMana
 type U_Bloodthirst = T_Bloodthirst__Fixed | T_Bloodthirst__X
 type U_Buyback = T_Buyback__Mana | T_Buyback__NonMana
 type U_Cleave = T_Cleave__Cost
@@ -979,4 +979,3 @@ type U_Mayhem = T_Mayhem__Cost | T_Mayhem__SelfManaCost
 type U_Megamorph = T_Megamorph__Cost
 type U_Miracle = T_Miracle__Cost | T_Miracle__SelfManaCostReduced
 type U_Mobilize = T_Mobilize__Fixed | T_Mobilize__Ref
-type U_MoreThanMeetsTheEye = T_MoreThanMeetsTheEye__Cost

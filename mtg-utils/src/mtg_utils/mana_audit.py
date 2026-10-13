@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import click
 
+from mtg_utils._analysis.roles import DeckMana, is_ramp
 from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
 from mtg_utils.card_classify import (
     color_sources,
     count_color_pips,
     is_land,
-    is_ramp,
 )
 from mtg_utils.commander_cost import effective_commander_cost
-from mtg_utils.format_config import get_format_config
-from mtg_utils.hydrated_deck import HydratedDeck
+from mtg_utils.deck_cli import acquire_for_cli, bulk_data_option
+from mtg_utils.hydrated_deck import HydratedDeck, sidecar_path
 
 # Constructed mana base constants (60-card formats)
 _CONSTRUCTED_BASELINE_LANDS = 24
@@ -27,6 +26,18 @@ _CONSTRUCTED_MAX_CURVE_ADJ = 2
 _CONSTRUCTED_MIN_LANDS = 20
 _CONSTRUCTED_MAX_LANDS = 27
 _CONSTRUCTED_FAIL_TOLERANCE = 2
+# Limited mana base constants (40-card sealed / draft): 17 of 40 is the norm every
+# primer agrees on, one fewer for a low curve or real land-fetch ramp, one more for
+# a top-heavy pool — a tight band, not the constructed formula scaled down (which
+# would call the 17-land default over-landed).
+_LIMITED_BASELINE_LANDS = 17
+_LIMITED_LOW_CMC = 2.5
+_LIMITED_HIGH_CMC = 3.5
+_LIMITED_RAMP_FOR_CUT = 3
+_LIMITED_MIN_LANDS = 16
+_LIMITED_MAX_LANDS = 18
+# The flood line sits this far above the band's top (deck-forge CONTEXT: Flood line).
+FLOOD_MARGIN = 2
 
 
 def burgess_formula(*, colors: int, commander_cmc: int, deck_size: int = 100) -> int:
@@ -61,13 +72,51 @@ def land_band(
     return (min(burgess, karsten), max(burgess, karsten))
 
 
-def land_band_status(*, land_count: int, floor: int) -> str:
-    """PASS/FAIL gate over the deck-specific land band (ADR-0041).
+def limited_land_target(*, ramp_count: int, avg_cmc: float, deck_size: int = 40) -> int:
+    """The limited land target: 17 per 40, minus one for a low curve (avg MV < 2.5)
+    or for real ramp (three or more land-fetch / mana producers — the ADR-0051 ramp
+    read, which already counts a land put onto the battlefield), plus one for a high
+    curve (avg MV > 3.5), clamped to 16-18 and scaled to the deck's size."""
+    base = _LIMITED_BASELINE_LANDS
+    if (
+        avg_cmc > 0 and avg_cmc < _LIMITED_LOW_CMC
+    ) or ramp_count >= _LIMITED_RAMP_FOR_CUT:
+        base -= 1
+    elif avg_cmc > _LIMITED_HIGH_CMC:
+        base += 1
+    base = max(_LIMITED_MIN_LANDS, min(_LIMITED_MAX_LANDS, base))
+    return round(base * deck_size / 40)
 
-    FAILs only below ``floor``; at or above it — including above the band's
-    top — is PASS. The band's top is a reference for "comfortably more than
-    enough," not a second failure or warning line."""
-    return "FAIL" if land_count < floor else "PASS"
+
+def land_band_readout(
+    *, land_count: int, floor: int, top: int, warn_below_top: bool
+) -> dict:
+    """The ONE land-band readout every surface reads (ADR-0041, finished):
+    ``{floor, top, flood, count, status}``.
+
+    ``floor`` is the hard gate — ``FAIL`` only below it. ``top`` is the target /
+    comfortable maximum; ``flood`` is ``top + FLOOD_MARGIN``, above which the deck
+    is over-landed and the status is the advisory ``FLOOD`` (never a gate — an
+    all-lands combo deck is a legitimate build). Between floor and top a
+    Commander-family deck is ``PASS`` (the top is a reference, not a line) while
+    60-card constructed reads ``WARN`` (``warn_below_top``): the recommended count
+    is a target it is a little short of. Only ``FAIL`` gates anything downstream."""
+    flood = top + FLOOD_MARGIN
+    if land_count < floor:
+        status = "FAIL"
+    elif warn_below_top and land_count < top:
+        status = "WARN"
+    elif land_count > flood:
+        status = "FLOOD"
+    else:
+        status = "PASS"
+    return {
+        "floor": floor,
+        "top": top,
+        "flood": flood,
+        "count": land_count,
+        "status": status,
+    }
 
 
 def constructed_land_target(
@@ -90,28 +139,6 @@ def constructed_land_target(
         base += max(-cap, min(cap, curve_adj))
     base = max(_CONSTRUCTED_MIN_LANDS, min(_CONSTRUCTED_MAX_LANDS, base))
     return round(base * deck_size / 60)
-
-
-def land_count_status(
-    *,
-    land_count: int,
-    recommended: int,
-    burgess: int,
-) -> str:
-    """Return PASS/WARN/FAIL status for land count against a two-threshold gate.
-
-    Falling below ``burgess`` (the hard floor) is FAIL. Meeting it but below
-    ``recommended`` is WARN. Meeting or exceeding ``recommended`` is PASS.
-
-    Generic two-threshold gate, now used only by the 60-card constructed
-    formula (``constructed_land_target``'s tolerance band) — the
-    commander-family gate reads ``land_band_status`` instead (ADR-0041),
-    whose band FAILs only below its floor and never emits WARN."""
-    if land_count < burgess:
-        return "FAIL"
-    if land_count < recommended:
-        return "WARN"
-    return "PASS"
 
 
 def _mana_cost_for_pips(card: dict) -> str:
@@ -236,7 +263,7 @@ def reconcile_basic_lands(
     drop below the current count — so it tops a short deck up to the floor AND
     rebalances the basics of a deck already at/above it (swapping over- for
     under-produced colors, net-zero count). Pass an explicit ``target_total`` to aim
-    elsewhere: the 'Trim lands' FLOOD remedy passes the *recommended* count, below the
+    elsewhere: the 'Trim lands' FLOOD remedy passes the band's *top*, below the
     current one, so the same color-demand allocation removes the over-produced basics
     down to target. Only the standard basics are managed; nonbasic lands (duals, fixing,
     snow basics) are treated as fixed production the basics fill in around — so a deck
@@ -244,7 +271,7 @@ def reconcile_basic_lands(
     audit = mana_audit(hd)
     land_count = audit["land_count"]
     if target_total is None:
-        target_total = max(land_count, audit["land_count_floor"])
+        target_total = max(land_count, audit["land_band"]["floor"])
 
     current: dict[str, int] = {}
     for entry in hd.cards:
@@ -333,10 +360,14 @@ def _commander_stats(
 
 
 def _scan_entries(
-    all_entries: list[dict], card_lookup: Mapping[str, dict]
+    all_entries: list[dict],
+    card_lookup: Mapping[str, dict],
+    *,
+    deck_mana: DeckMana | None = None,
 ) -> tuple[int, int, list[float], list[dict], dict[str, int], dict[str, int]]:
     """Scan all entries and return (land_count, ramp_count, nonland_cmcs,
-    pip_cards, land_color_production, rock_colors)."""
+    pip_cards, land_color_production, rock_colors). Ramp is judged under
+    ``commander`` (a rock whose mana is dead for it isn't ramp)."""
     land_count = 0
     ramp_count = 0
     nonland_cmcs: list[float] = []
@@ -357,7 +388,7 @@ def _scan_entries(
             nonland_cmcs.extend([card.get("cmc", 0.0)] * qty)
             pip_cards.extend([card] * qty)
 
-        if is_ramp(card):
+        if is_ramp(card, deck_mana=deck_mana):
             ramp_count += qty
             if not is_land(card):
                 _add_color_sources(rock_colors, color_sources(card), qty)
@@ -392,12 +423,11 @@ def mana_audit(hd: HydratedDeck) -> dict:
     """Run a full mana base audit on the deck."""
     card_lookup = hd.by_name
 
-    config = get_format_config(hd.deck)
-    # Honor an explicit deck-size on the deck (e.g. a 60-card paper Historic Brawl, or
-    # an 80-card Yorion deck) so the Burgess/Karsten/constructed land math scales to the
-    # real size — falling back to the format default when the deck doesn't declare one.
-    deck_size = hd.deck.get("deck_size") or config["deck_size"]
-    has_commander = config.get("has_commander", True)
+    # ``hd.format`` already carries the deck's explicit size (a 60-card paper Historic
+    # Brawl, an 80-card Yorion deck, a 40-card limited pool) so the Burgess/Karsten/
+    # constructed land math scales to the real size.
+    deck_size = hd.format.deck_size
+    has_commander = hd.format.has_commander
 
     commanders = hd.commanders
     # Only analyze mainboard cards (sideboard doesn't affect mana base)
@@ -421,63 +451,95 @@ def mana_audit(hd: HydratedDeck) -> dict:
         pip_cards,
         land_color_production,
         rock_colors,
-    ) = _scan_entries(all_entries, card_lookup)
+    ) = _scan_entries(all_entries, card_lookup, deck_mana=hd.deck_mana)
 
     avg_cmc = round(sum(nonland_cmcs) / len(nonland_cmcs), 2) if nonland_cmcs else 0.0
 
-    if has_commander:
+    def commander_band() -> tuple[int, int, dict]:
         burgess_result = burgess_formula(
             colors=colors, commander_cmc=commander_cmc, deck_size=deck_size
         )
         karsten_result = karsten_adjustment(ramp_count=ramp_count, deck_size=deck_size)
-        # ADR-0041: ONE deck-specific band — [Karsten-adjusted floor, raw
-        # Burgess] — replaces treating raw Burgess alone as the hard floor
-        # (which could exceed the static template's ceiling on a heavy-ramp,
-        # high-color/high-CMC deck with no land count able to satisfy both).
-        floor, recommended = land_band(
+        # ADR-0041: ONE deck-specific band — the lower of Karsten and raw
+        # Burgess is the floor, the higher the top (see ``land_band``) —
+        # replaces treating raw Burgess alone as the hard floor (which could
+        # exceed the static template's ceiling on a heavy-ramp, high-color /
+        # high-CMC deck with no land count able to satisfy both).
+        floor, top = land_band(
             colors=colors,
             commander_cmc=commander_cmc,
             ramp_count=ramp_count,
             deck_size=deck_size,
         )
-        lc_status = land_band_status(land_count=land_count, floor=floor)
-        formula_info = {
-            "burgess_formula": {
-                "colors": colors,
-                # ADR-0044: the effective commander cost (affordable turn), which
-                # equals the printed mana value unless the commander's own
-                # cost-reduction operand was modelled — see ``commander_cost``.
-                "commander_cmc": commander_cmc,
-                "printed_cmc": commander_cost["printed"],
-                "result": burgess_result,
+        return (
+            floor,
+            top,
+            {
+                "burgess_formula": {
+                    "colors": colors,
+                    # ADR-0044: the effective commander cost (affordable turn), which
+                    # equals the printed mana value unless the commander's own
+                    # cost-reduction operand was modelled — see ``commander_cost``.
+                    "commander_cmc": commander_cmc,
+                    "printed_cmc": commander_cost["printed"],
+                    "result": burgess_result,
+                },
+                "commander_cost": commander_cost,
+                "karsten_adjustment": {
+                    "ramp_count": ramp_count,
+                    "result": karsten_result,
+                },
             },
-            "commander_cost": commander_cost,
-            "karsten_adjustment": {"ramp_count": ramp_count, "result": karsten_result},
-            "land_band": {"floor": floor, "top": recommended},
-        }
-    else:
-        constructed_target = constructed_land_target(
-            ramp_count=ramp_count,
-            avg_cmc=avg_cmc,
-            deck_size=deck_size,
         )
-        recommended = constructed_target
+
+    def limited_band() -> tuple[int, int, dict]:
+        # Sealed / draft: the 17-of-40 norm, a tight 16-18 band (ADR-0055) — the
+        # floor never drops below the band's own minimum — never the constructed
+        # formula scaled down (which reads 17 lands as over-landed).
+        top = limited_land_target(
+            ramp_count=ramp_count, avg_cmc=avg_cmc, deck_size=deck_size
+        )
+        floor = max(round(_LIMITED_MIN_LANDS * deck_size / 40), top - 1)
+        return (
+            floor,
+            top,
+            {
+                "limited_land_target": {
+                    "ramp_count": ramp_count,
+                    "avg_cmc": avg_cmc,
+                    "result": top,
+                }
+            },
+        )
+
+    def constructed_band() -> tuple[int, int, dict]:
+        top = constructed_land_target(
+            ramp_count=ramp_count, avg_cmc=avg_cmc, deck_size=deck_size
+        )
         # The 20-land clamp is a 60-card figure; scale it like the target
-        # so a 40-card limited deck isn't held to a 60-card floor.
+        # so a deck labelled with a constructed format at another size isn't held
+        # to a 60-card floor.
         min_lands = round(_CONSTRUCTED_MIN_LANDS * deck_size / 60)
-        floor = max(min_lands, recommended - _CONSTRUCTED_FAIL_TOLERANCE)
-        lc_status = land_count_status(
-            land_count=land_count,
-            recommended=recommended,
-            burgess=floor,
-        )
-        formula_info = {
-            "constructed_land_target": {
-                "ramp_count": ramp_count,
-                "avg_cmc": avg_cmc,
-                "result": constructed_target,
+        floor = max(min_lands, top - _CONSTRUCTED_FAIL_TOLERANCE)
+        return (
+            floor,
+            top,
+            {
+                "constructed_land_target": {
+                    "ramp_count": ramp_count,
+                    "avg_cmc": avg_cmc,
+                    "result": top,
+                }
             },
-        }
+        )
+
+    # One band per family, dispatched the way the templates and calibrations are.
+    bands = {
+        "commander": commander_band,
+        "limited": limited_band,
+        "constructed": constructed_band,
+    }
+    floor, top, formula_info = bands[hd.format.family]()
 
     pips = pip_demand(pip_cards)
     total_pips = sum(pips.values())
@@ -488,13 +550,17 @@ def mana_audit(hd: HydratedDeck) -> dict:
     )
 
     cb = color_balance(pips, land_color_production, land_count)
+    # ONE band for every deck (Commander family AND constructed): the budgets row,
+    # the gate, the flood line and the SPA readout all read this and nothing else.
+    band = land_band_readout(
+        land_count=land_count, floor=floor, top=top, warn_below_top=not has_commander
+    )
+    gate_status = "PASS" if band["status"] == "FLOOD" else band["status"]
 
     return {
         "land_count": land_count,
-        "recommended_land_count": recommended,
-        "land_count_floor": floor,
+        "land_band": band,
         **formula_info,
-        "land_count_status": lc_status,
         "ramp_count": ramp_count,
         "avg_cmc": avg_cmc,
         "pip_demand": pips,
@@ -504,7 +570,7 @@ def mana_audit(hd: HydratedDeck) -> dict:
         "rock_color_pct": _pct_dict(rock_colors, sum(rock_colors.values())),
         "color_balance_status": cb["status"],
         "color_balance_flags": cb["flags"],
-        "overall_status": _overall_status([lc_status, cb["status"]]),
+        "overall_status": _overall_status([gate_status, cb["status"]]),
     }
 
 
@@ -517,22 +583,27 @@ def _render_single_audit(audit: dict) -> list[str]:
     lines.append(f"mana-audit: {status} — {land_count} lands ({colors_str} deck)")
     lines.append("")
 
-    constructed = audit.get("constructed_land_target")
+    # A size-minimum family (constructed or limited) carries one target block; the
+    # Commander family carries Burgess + Karsten.
+    target_block = audit.get("constructed_land_target") or audit.get(
+        "limited_land_target"
+    )
     burgess = audit.get("burgess_formula") or {}
-    if constructed:
+    band = audit.get("land_band") or {}
+    if target_block:
         lines.append(
             f"Land count: {land_count} "
-            f"(target: {constructed.get('result', '?')}, "
-            f"status: {audit.get('land_count_status', '?')})"
+            f"(target: {band.get('top', '?')}, floor: {band.get('floor', '?')}, "
+            f"flood: {band.get('flood', '?')}, status: {band.get('status', '?')})"
         )
     else:
-        band = audit.get("land_band") or {}
         lines.append(
             f"Land count: {land_count} "
             f"(band: {band.get('floor', '?')}-{band.get('top', '?')}, "
+            f"flood: {band.get('flood', '?')}, "
             f"Burgess: {burgess.get('result', '?')}, "
             f"Karsten: {audit.get('karsten_adjustment', {}).get('result', '?')}, "
-            f"status: {audit.get('land_count_status', '?')})"
+            f"status: {band.get('status', '?')})"
         )
     for block in (audit.get("commander_cost") or {}).get("commanders", ()):
         if block.get("status") == "modelled":
@@ -606,12 +677,11 @@ def _default_output_path(*args: object) -> Path:
 
 @click.command()
 @click.argument("deck_path", type=click.Path(exists=True, path_type=Path))
-@click.argument("hydrated_path", type=click.Path(exists=True, path_type=Path))
+@bulk_data_option
 @click.option(
     "--compare",
-    nargs=2,
     type=click.Path(exists=True, path_type=Path),
-    metavar="<new-deck-json> <new-hydrated-json>",
+    metavar="<new-deck-json>",
     default=None,
     help="Compare against another deck version.",
 )
@@ -624,28 +694,18 @@ def _default_output_path(*args: object) -> Path:
 )
 def main(
     deck_path: Path,
-    hydrated_path: Path,
-    compare: tuple[Path, Path] | None,
+    bulk_data: Path | None,
+    compare: Path | None,
     output_path: Path | None,
 ) -> None:
-    """Audit a deck's mana base for land count and color balance."""
-    deck_content = deck_path.read_text(encoding="utf-8")
-    hydrated_content = hydrated_path.read_text(encoding="utf-8")
-    deck = json.loads(deck_content)
-    hydrated = json.loads(hydrated_content)
+    """Audit DECK_PATH's mana base for land count and color balance."""
+    hd = acquire_for_cli(deck_path, bulk_data)
 
     if compare:
-        new_deck_path, new_hydrated_path = compare
-        new_deck_content = new_deck_path.read_text(encoding="utf-8")
-        new_hydrated_content = new_hydrated_path.read_text(encoding="utf-8")
-        new_deck = json.loads(new_deck_content)
-        new_hydrated = json.loads(new_hydrated_content)
-
-        primary = mana_audit(HydratedDeck.from_parsed(deck, records=hydrated))
+        new_deck_path = compare
+        primary = mana_audit(hd)
         primary["source"] = deck_path.name
-        comparison = mana_audit(
-            HydratedDeck.from_parsed(new_deck, records=new_hydrated)
-        )
+        comparison = mana_audit(acquire_for_cli(new_deck_path, bulk_data))
         comparison["source"] = new_deck_path.name
 
         result = {
@@ -659,15 +719,17 @@ def main(
         }
         if output_path is None:
             output_path = _default_output_path(
-                deck_content,
-                hydrated_content,
-                new_deck_content,
-                new_hydrated_content,
+                deck_path.read_text(encoding="utf-8"),
+                sidecar_path(deck_path),
+                new_deck_path.read_text(encoding="utf-8"),
+                sidecar_path(new_deck_path),
             )
     else:
-        result = mana_audit(HydratedDeck.from_parsed(deck, records=hydrated))
+        result = mana_audit(hd)
         if output_path is None:
-            output_path = _default_output_path(deck_content, hydrated_content)
+            output_path = _default_output_path(
+                deck_path.read_text(encoding="utf-8"), sidecar_path(deck_path)
+            )
 
     output_path = output_path.resolve()
     atomic_write_json(output_path, result)

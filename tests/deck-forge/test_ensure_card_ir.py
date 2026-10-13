@@ -30,29 +30,27 @@ from unittest import mock
 import pytest
 
 from mtg_utils import _phase
+from mtg_utils._analysis.lanes import SERVED_SIGNAL_KEYS
 from mtg_utils._card_ir.load import (
     card_ir_dir,
     clear_memory_cache,
     crosswalk_sidecar_path,
 )
-from mtg_utils._card_ir.mirror.build import fixtures_dir
 from mtg_utils._deck_forge import production
-from mtg_utils._deck_forge.lanes import SERVED_SIGNAL_KEYS
+from mtg_utils.testkit import test_card, test_phase_records
 
-# Llanowar Elves' real oracle_id, borrowed from the committed crosswalk fixture.
-_CROSSWALK_OID = "68954295-54e3-4303-a6bc-fc4547a4e3a3"
+# Llanowar Elves' real oracle_id, off its snapshot record.
+_CROSSWALK_OID = test_card("Llanowar Elves")["oracle_id"]
 
 
 @lru_cache(maxsize=1)
 def _crosswalk_card_data() -> dict:
-    """A real, schema-valid phase record (Llanowar Elves, borrowed verbatim
-    from the committed crosswalk fixture). ``strict_load_card`` enforces
-    ``extra=forbid`` plus required-field checks, so a hand-rolled minimal stub
-    drifts and is silently dropped — this ensure test needs a real record, not
-    a synthetic one."""
-    path = fixtures_dir() / "crosswalk_fixture_cards.json"
-    cards = json.loads(path.read_text())["cards"]
-    return {"llanowar elves": cards["Llanowar Elves"]}
+    """A real, schema-valid phase record (Llanowar Elves, verbatim from the
+    card snapshot). ``strict_load_card`` enforces ``extra=forbid`` plus
+    required-field checks, so a hand-rolled minimal stub drifts and is silently
+    dropped — this ensure test needs a real record, not a synthetic one."""
+    (rec,) = test_phase_records("Llanowar Elves")
+    return {"llanowar elves": rec}
 
 
 def _phase_card_data_path(cache_root):  # noqa: ARG001 — env-derived, kept for call symmetry
