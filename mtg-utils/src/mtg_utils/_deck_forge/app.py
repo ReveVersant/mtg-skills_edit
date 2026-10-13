@@ -358,7 +358,6 @@ def build_app(
     # Host) and non-browser clients (curl, tests — no Origin/Referer) pass.
     from urllib.parse import urlparse
 
-    from starlette.requests import Request
     from starlette.responses import JSONResponse as _JSONResponse
 
     safe_methods = {"GET", "HEAD", "OPTIONS"}

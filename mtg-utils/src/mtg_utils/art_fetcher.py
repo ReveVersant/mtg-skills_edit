@@ -1436,7 +1436,8 @@ def default_http_cache() -> Path:
     Fork change: the fallback is the user cache home, not world-readable ``/tmp``
     (avoids a predictable shared-temp path and symlink races)."""
     return Path(
-        os.environ.get("MTG_SKILLS_CACHE_DIR") or (Path.home() / ".cache" / "mtg-skills")
+        os.environ.get("MTG_SKILLS_CACHE_DIR")
+        or (Path.home() / ".cache" / "mtg-skills")
     )
 
 

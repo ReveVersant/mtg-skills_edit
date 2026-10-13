@@ -16,7 +16,6 @@ from mtg_utils.card_classify import extract_price, finish_price
 from mtg_utils.card_pool import CardPool, NoBulkError
 from mtg_utils.deck import OWNED_ZONES, deck_entries
 from mtg_utils.deck_cli import bulk_data_option
-from mtg_utils.fx import aud_per_usd, usd_to_aud
 from mtg_utils.formats import (
     DIGITAL,
     FORMATS,
@@ -25,6 +24,7 @@ from mtg_utils.formats import (
     get_format,
     resolve_deck_medium,
 )
+from mtg_utils.fx import aud_per_usd, usd_to_aud
 from mtg_utils.names import normalize_card_name
 from mtg_utils.ownership import printing_index, special_requests
 from mtg_utils.scryfall_lookup import (
