@@ -539,6 +539,8 @@ Common claim types and their verification:
 | Replacement effect interaction with another replacement | `Skill(rules-lawyer, ...)` |
 | Layer reasoning (continuous effects) | `Skill(rules-lawyer, ...)` |
 | Commander zone behavior (903.9a / 903.9b) | `rules-lookup --rule 903.9a` then `--rule 903.9b` |
+| Protection stopping an *ability* (a planeswalker's minus, an activated or triggered ability) | `rules-lookup --rule 702.16b` then `--rule 113.7`: protection stops targeting by abilities whose **source** has the quality, so a colored permanent's ability is stopped by protection from that color even though the ability itself has no color |
+| A permanent losing all abilities (Tishana's Tidebinder, Humility, Darksteel Mutation) | `rules-lookup --rule 613.1f` then `--rule 604.2`: every static ability it had stops applying the moment it loses them, so anything that static ability was keeping alive (retained mana, a "doesn't empty" clause, a counter rule) ends too; escalate to `Skill(rules-lawyer, ...)` if a replacement effect is involved |
 
 Record each claim + its CR citation in your working notes — the draft
 step quotes the verbatim CR text.
@@ -712,6 +714,32 @@ purpose Agent with this exact charter:
 > the prose beneath it. These are the most common survivors of a fix
 > round, because a correction gets applied in one location only.
 >
+> **Two claim classes get a lookup every time, never a read-through,**
+> because they survive audit rounds more than any other:
+>
+> - **Protection against an ability.** A claim that protection from a
+>   color (or type) does or does not stop a planeswalker's loyalty
+>   ability, an activated ability, or a triggered ability. Verify with
+>   CR 702.16b and CR 113.7: protection stops targeting by abilities
+>   whose *source* has the quality. An ability has no color of its own;
+>   the question is only what the source is. Also check what the
+>   protection does NOT stop (untargeted effects, damage from a
+>   colorless source, Auras and Equipment per CR 702.16c-d).
+> - **A permanent losing all abilities.** When the guide says a card
+>   strips a permanent's abilities (a Tidebinder, Humility, a Mutation),
+>   trace the consequence through CR 613.1f and CR 604.2: every static
+>   ability it had stops applying at that moment, so any state that
+>   static ability was holding open (retained mana, a "doesn't empty"
+>   clause, counters that stay) ends with it. A guide that notes the
+>   ability loss but not what it empties has an error, not an omission.
+>
+> **Text that a previous fix round changed is new text.** If the guide
+> you were given has been audited before, the sentences a repair
+> rewrote are the likeliest place for an error now: a correction that
+> cites a rule it misreads, or that moves a wrong claim onto a different
+> card, is the commonest error in a second round. Give a cited rule in a
+> repaired sentence the same lookup you would give an uncited claim.
+>
 > Do NOT propose strategic / deck-tuning changes. Your scope is rules
 > verification, arithmetic, and internal consistency.
 
@@ -737,7 +765,11 @@ routinely introduce fresh errors:**
    memory of what the audit said. A correction that cites the wrong rule
    — or over-applies a right one, e.g. invoking CR 302.6 summoning
    sickness against a noncreature artifact — is a new error introduced by
-   the repair.
+   the repair. The same goes for a repair that keeps the claim and swaps
+   the card: "Plate doesn't stop that, Boots does" is a second claim
+   about a second card, and it needs its own lookup (CR 702.16b: it is
+   the *source's* quality that matters, so protection from a color does
+   stop a colored planeswalker's loyalty ability).
 
 If the subagent reports zero errors and zero unsupported claims, present
 the guide. Otherwise fix and **dispatch another round with the same
@@ -780,7 +812,8 @@ Iteration is user-driven and in-place:
 | `edhrec-lookup` 404s | Obscure commander not on EDHREC | Fall back to `card-search` by mechanic keywords; omit community-comparison callouts |
 | `rules-lookup --term <X>` returns no match | Bad query | Try a synonym; widen to `--grep`; if still nothing, escalate to `Skill(rules-lawyer, ...)` |
 | Rules Audit subagent reports >10 errors | First-draft was sloppy on rules | Revise; keep dispatching rounds until one is clean. If round 2 still reports errors, treat as a SKILL.md bug, name the class of claim that slipped, and surface it to the user |
-| A fix round introduces new errors | Correction applied in one section only, or a citation added from memory | Grep for every surface of a changed claim before moving on; re-read any rule you cite while fixing |
+| A fix round introduces new errors | Correction applied in one section only, a citation added from memory, or a wrong claim moved onto a different card | Grep for every surface of a changed claim before moving on; re-read any rule you cite while fixing; treat a repaired sentence as an uncited claim in the next round |
+| Audit passes a protection or ability-loss claim that is wrong | Reasoned from the ability's own color instead of its source's (CR 702.16b, 113.7), or noted an ability loss without tracing what the lost static ability was holding open (CR 613.1f, 604.2) | Both classes are named in the charter as lookup-every-time; check the charter wasn't trimmed |
 | Audit confirms a combo's arithmetic that is actually wrong | Charter let the agent verify citations without re-deriving numbers | The charter requires independent re-derivation and multi-iteration simulation of any loop — check it wasn't trimmed |
 | User asks for a 60-card constructed deck | Out of scope | Decline + redirect to `/deck-wizard` |
 
